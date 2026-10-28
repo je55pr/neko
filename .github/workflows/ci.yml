@@ -1,0 +1,33 @@
+name: Build and tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Build Neko
+        if: ${{ hashFiles('Neko.csproj') != '' }}
+        run: dotnet build Neko.csproj --configuration Release
+      - name: Audit public source
+        run: node scripts/check-public-source.cjs
+      - name: Run core tests
+        if: ${{ hashFiles('tests/Neko.Core.Tests/Neko.Core.Tests.csproj') != '' }}
+        run: dotnet test tests/Neko.Core.Tests/Neko.Core.Tests.csproj --configuration Release
+      - name: Run JavaScript tests
+        if: ${{ hashFiles('tests/**/*.test.cjs') != '' }}
+        run: node --test
