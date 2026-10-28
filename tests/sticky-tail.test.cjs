@@ -22,8 +22,10 @@ test('browser layout scrolls cannot clear followTail',()=>{
 });
 
 test('only intentional navigation can release sticky following',()=>{
+ const end='const boardHotPanels=hotPanels.get(activeBoardId);';
+ assert(ui.includes(end),'Expected panel-navigation handler end marker');
  const block=ui.split("messages.addEventListener('pointerdown',event=>{")[1]
-  .split('const recovered=hotPanels.get')[0];
+  .split(end)[0];
  assert.match(block,/view\.pointerScrolling=true/);
  assert.match(block,/messages\.addEventListener\('touchmove'/);
  assert.match(block,/\['ArrowUp','PageUp','Home'\]/);
