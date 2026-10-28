@@ -9,6 +9,7 @@
   const singleOutgoing=new Map();
   const singleSuppressedDraft=new Map();
   const singleToolGroupCache=new Map();
+  const singleActivityOpen=new Set();
   let singleFollowTail=true;
   let singleNeedsInitialTail=true;
   let singleTailQueued=false;
@@ -60,7 +61,7 @@
       line:Number.isInteger(event.lineno)?event.lineno:0,
       column:Number.isInteger(event.colno)?event.colno:0
     });
-  });
+  },true);
   window.addEventListener('unhandledrejection',event=>{
     send('ui-diagnostic',{
       code:'unhandled_rejection',
@@ -664,7 +665,8 @@
     const groups=state?.project?.projects || [];
     const projectNames=new Map(groups.map(x=>[x.id,x.name]));
     const signature=[library.revision,library.loading,library.loaded,
-      library.error,library.hasMore,library.total,state?.selectedId,query,
+      library.error,library.hasMore,library.total,state?.selectedId,
+      !!state?.project?.visible,query,
       groups.map(x=>x.id+':'+x.name).join(','),libraryDisplayLimit].join('|');
     if(signature===lastLibraryKey)return;
     lastLibraryKey=signature;
@@ -1333,6 +1335,12 @@
     const activity=document.createElement('article');
     activity.className='message activity '+kind;
     const detail=document.createElement('details');
+    if(item.id && singleActivityOpen.has(item.id))detail.open=true;
+    detail.addEventListener('toggle',()=>{
+      if(!item.id)return;
+      if(detail.open)singleActivityOpen.add(item.id);
+      else singleActivityOpen.delete(item.id);
+    });
     const title=document.createElement('summary');
     title.textContent=(kind==='thinking'?'◈ ':kind==='tool_call'?'⌘ ':'▣ ')+
       (item.title||kind.replace('_',' '));
@@ -1375,7 +1383,10 @@
       window.__nekoWorkspace?.receive(next);
       return;
     }
-    if(previousId!==selected)singleToolGroupCache.clear();
+    if(previousId!==selected){
+      singleToolGroupCache.clear();
+      singleActivityOpen.clear();
+    }
     if(previousId!==selected &&
        typeof previousId==='string' && previousId.startsWith('local-draft-') &&
        selected && singleOutgoing.has(previousId) &&
@@ -1403,6 +1414,7 @@
       next.cardPreview.live=incoming;
     }
     const p=next.project || {};
+    renderLibrary();
     $('projectSync').disabled=!!p.refreshingCatalog;
     $('refresh').disabled=!!p.visible && !!p.refreshingCatalog;
     $('refresh').textContent='↻ Refresh';
