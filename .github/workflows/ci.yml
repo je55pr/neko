@@ -23,11 +23,17 @@ jobs:
       - name: Build Neko
         if: ${{ hashFiles('Neko.csproj') != '' }}
         run: dotnet build Neko.csproj --configuration Release
+      - name: Build offline desktop shell
+        if: ${{ hashFiles('src/Neko.App/Neko.csproj') != '' }}
+        run: dotnet build src/Neko.App/Neko.csproj --configuration Release
       - name: Audit public source
         run: node scripts/check-public-source.cjs
       - name: Run core tests
         if: ${{ hashFiles('tests/Neko.Core.Tests/Neko.Core.Tests.csproj') != '' }}
         run: dotnet test tests/Neko.Core.Tests/Neko.Core.Tests.csproj --configuration Release
+      - name: Run offline desktop shell tests
+        if: ${{ hashFiles('tests/Neko.App.Tests/Neko.App.Tests.csproj') != '' }}
+        run: dotnet test tests/Neko.App.Tests/Neko.App.Tests.csproj --configuration Release
       - name: Run JavaScript tests
         if: ${{ hashFiles('tests/**/*.test.cjs') != '' }}
         run: node --test
