@@ -14,7 +14,8 @@ namespace Neko;
 /// Optional, standards-based chat-completions adapter. This does NOT use
 /// browser session cookies or the frozen application's private transport.
 /// </summary>
-internal sealed class ConfiguredChatProvider : IConversationProvider, IDisposable
+internal sealed class ConfiguredChatProvider :
+    IConversationProvider, IPreparedConversationProvider, IDisposable
 {
     private sealed class Conversation(string id,string title)
     {
@@ -63,16 +64,26 @@ internal sealed class ConfiguredChatProvider : IConversationProvider, IDisposabl
                 new VisibleConversation(id,chat.Title,chat.Messages.ToArray()));
     }
 
-    public async Task<SendReceipt> CreateAsync(string text,CancellationToken cancellation)
+    public Task<SendReceipt> CreateAsync(string text,CancellationToken cancellation)
     {
-        if(string.IsNullOrWhiteSpace(text))
+        var prepared=OutboundMessagePreparation.ForNew(text);
+        return prepared.Message is null
+            ?Task.FromResult(new SendReceipt(SendDisposition.Rejected,"invalid_submission"))
+            :CreatePreparedAsync(prepared.Message,cancellation);
+    }
+
+    public async Task<SendReceipt> CreatePreparedAsync(
+        PreparedOutboundMessage submission,CancellationToken cancellation)
+    {
+        if(!OutboundMessagePreparation.IsValid(submission) ||
+           !submission.CreatesConversation)
             return new SendReceipt(SendDisposition.Rejected,"invalid_submission");
         var id=Guid.NewGuid().ToString("D");
-        var chat=new Conversation(id,text.Trim().Length>70?
-            text.Trim()[..70]:text.Trim());
+        var trimmed=submission.Text.Trim();
+        var chat=new Conversation(id,trimmed.Length>70?trimmed[..70]:trimmed);
         if(!_chats.TryAdd(id,chat))
             return new SendReceipt(SendDisposition.Rejected,"creation_conflict");
-        var receipt=await BeginSendAsync(chat,text,cancellation);
+        var receipt=await BeginSendAsync(chat,submission,cancellation);
         if(receipt.Disposition==SendDisposition.Rejected)
             _chats.TryRemove(id,out _);
         // Keep the local conversation identifier available for inspection
@@ -83,16 +94,27 @@ internal sealed class ConfiguredChatProvider : IConversationProvider, IDisposabl
 
     public Task<SendReceipt> SendAsync(string id,string text,CancellationToken cancellation)
     {
-        if(!_chats.TryGetValue(id,out var chat))
+        var prepared=OutboundMessagePreparation.ForExisting(id,text);
+        return prepared.Message is null
+            ?Task.FromResult(new SendReceipt(SendDisposition.Rejected,"invalid_submission"))
+            :SendPreparedAsync(prepared.Message,cancellation);
+    }
+
+    public Task<SendReceipt> SendPreparedAsync(
+        PreparedOutboundMessage submission,CancellationToken cancellation)
+    {
+        if(!OutboundMessagePreparation.IsValid(submission) ||
+           submission.ConversationId is null)
+            return Task.FromResult(new SendReceipt(SendDisposition.Rejected,"invalid_submission"));
+        if(!_chats.TryGetValue(submission.ConversationId,out var chat))
             return Task.FromResult(new SendReceipt(SendDisposition.Rejected,"unknown_conversation"));
-        return BeginSendAsync(chat,text,cancellation);
+        return BeginSendAsync(chat,submission,cancellation);
     }
 
     private async Task<SendReceipt> BeginSendAsync(
-        Conversation chat,string text,CancellationToken cancellation)
+        Conversation chat,PreparedOutboundMessage submission,CancellationToken cancellation)
     {
-        if(string.IsNullOrWhiteSpace(text)||text.Length>24000)
-            return new SendReceipt(SendDisposition.Rejected,"invalid_submission");
+        var text=submission.Text;
         CancellationTokenSource source;
         object[] history;
         lock(chat.Gate)
@@ -150,7 +172,7 @@ internal sealed class ConfiguredChatProvider : IConversationProvider, IDisposabl
 
         lock(chat.Gate)
             chat.Messages.Add(new VisibleConversationMessage(
-                Guid.NewGuid().ToString("D"),VisibleMessageRole.User,text));
+                submission.ClientMessageId,VisibleMessageRole.User,text));
         _=ConsumeStreamAsync(chat,source,response);
         return new SendReceipt(SendDisposition.Accepted);
     }

@@ -35,12 +35,23 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
         }
     }
 
-    public async Task<SendReceipt> SendAsync(
+    public Task<SendReceipt> SendAsync(
         string conversationId,string text,CancellationToken cancellation=default)
     {
-        if(string.IsNullOrWhiteSpace(conversationId)||string.IsNullOrWhiteSpace(text))
-            return new SendReceipt(SendDisposition.Rejected,"invalid_submission");
+        var prepared=OutboundMessagePreparation.ForExisting(conversationId,text);
+        return prepared.Message is null
+            ?Task.FromResult(Rejected("invalid_submission"))
+            :SendAsync(prepared.Message,cancellation);
+    }
+
+    public async Task<SendReceipt> SendAsync(
+        PreparedOutboundMessage submission,CancellationToken cancellation=default)
+    {
+        if(!OutboundMessagePreparation.IsValid(submission) ||
+           submission.ConversationId is null)
+            return Rejected("invalid_submission");
         cancellation.ThrowIfCancellationRequested();
+        var conversationId=submission.ConversationId;
         Session session;
         lock(_gate)
         {
@@ -55,7 +66,9 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
         SendReceipt receipt;
         try
         {
-            receipt=await provider.SendAsync(conversationId,text,cancellation);
+            receipt=provider is IPreparedConversationProvider prepared
+                ?await prepared.SendPreparedAsync(submission,cancellation)
+                :await provider.SendAsync(conversationId,submission.Text,cancellation);
         }
         catch(OperationCanceledException) when(cancellation.IsCancellationRequested)
         {
@@ -117,10 +130,20 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
         return receipt;
     }
 
-    public async Task<SendReceipt> CreateAsync(
+    public Task<SendReceipt> CreateAsync(
         string text,CancellationToken cancellation=default)
     {
-        if(string.IsNullOrWhiteSpace(text))
+        var prepared=OutboundMessagePreparation.ForNew(text);
+        return prepared.Message is null
+            ?Task.FromResult(Rejected("invalid_submission"))
+            :CreateAsync(prepared.Message,cancellation);
+    }
+
+    public async Task<SendReceipt> CreateAsync(
+        PreparedOutboundMessage submission,CancellationToken cancellation=default)
+    {
+        if(!OutboundMessagePreparation.IsValid(submission) ||
+           !submission.CreatesConversation)
             return Rejected("invalid_submission");
         cancellation.ThrowIfCancellationRequested();
         lock(_gate)
@@ -132,7 +155,9 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
         SendReceipt receipt;
         try
         {
-            receipt=await provider.CreateAsync(text,cancellation);
+            receipt=provider is IPreparedConversationProvider prepared
+                ?await prepared.CreatePreparedAsync(submission,cancellation)
+                :await provider.CreateAsync(submission.Text,cancellation);
         }
         catch(OperationCanceledException) when(cancellation.IsCancellationRequested)
         {
