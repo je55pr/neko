@@ -18,14 +18,37 @@ public partial class MainWindow : Window
     private bool _ready;
     private int _revision;
 
-    public MainWindow()
+    private static string DefaultProfileDirectory()=>
+        Path.Combine(Environment.GetFolderPath(
+            Environment.SpecialFolder.LocalApplicationData),"NekoOfflineShell");
+
+    // The ordinary desktop launch keeps the configured provider unchanged.
+    public MainWindow():this(LocalProviderConfiguration.Load(),
+        DefaultProfileDirectory()) {}
+
+    /// <summary>
+    /// An explicitly constructed local host may supply its own provider.
+    /// The window owns and disposes the supplied provider when it closes.
+    /// No external assemblies are discovered or loaded by Neko.
+    /// </summary>
+    public MainWindow(IConversationProvider provider):
+        this(provider,DefaultProfileDirectory()) {}
+
+    // Isolated board state for deterministic integration tests.
+    internal MainWindow(IConversationProvider provider,string profileDirectory):
+        this((provider??throw new ArgumentNullException(nameof(provider)),
+            "Conversation provider supplied by host."),profileDirectory) {}
+
+    private MainWindow((IConversationProvider Provider,string Status) configured,
+        string profileDirectory)
     {
+        if(string.IsNullOrWhiteSpace(profileDirectory) ||
+           !Path.IsPathFullyQualified(profileDirectory))
+            throw new ArgumentException("Expected an absolute profile directory.",
+                nameof(profileDirectory));
         InitializeComponent();
-        _profileDirectory=Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "NekoOfflineShell");
+        _profileDirectory=Path.GetFullPath(profileDirectory);
         _boards=new OfflineBoardStore(_profileDirectory);
-        var configured=LocalProviderConfiguration.Load();
         _provider=configured.Provider;
         ProviderStatus.Text=configured.Status;
         _workspace=new ConversationWorkspaceHost(_provider,_boards);
