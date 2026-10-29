@@ -24,6 +24,9 @@ internal sealed class ConversationWorkspaceHost : IDisposable
         public bool HistoryLoading { get; set; }
         public bool StopPending { get; set; }
         public bool StopUncertain { get; set; }
+        // Kept locally until acknowledgement or explicit reconciliation.
+        // Neither a UI animation nor old history proves delivery.
+        public PreparedOutboundMessage? PendingSubmission { get; set; }
         public LiveReply? Live { get; set; }
     }
 
@@ -52,6 +55,7 @@ internal sealed class ConversationWorkspaceHost : IDisposable
     private string _newChatError = "";
     private bool _newChatUncertain;
     private string _createdChatId = "";
+    private PreparedOutboundMessage? _pendingCreation;
     public event Action? Changed;
 
     public ConversationWorkspaceHost(IConversationProvider provider,OfflineBoardStore boards)
@@ -219,9 +223,20 @@ internal sealed class ConversationWorkspaceHost : IDisposable
     public async Task SendAsync(string? id,string? text)
     {
         if(string.IsNullOrWhiteSpace(id)||string.IsNullOrWhiteSpace(text))return;
+        PreparedOutboundMessage submission;
         lock(_gate)
         {
-            if(!_panels.TryGetValue(id,out var p) || p.Sending || p.Uncertain)return;
+            if(!_panels.TryGetValue(id,out var p) ||
+               p.Sending || p.Generating || p.Uncertain)return;
+            var prepared=OutboundMessagePreparation.ForExisting(id,text);
+            if(prepared.Message is null)
+            {
+                p.Status="Not sent: invalid_submission";
+                Notify();
+                return;
+            }
+            submission=prepared.Message;
+            p.PendingSubmission=submission;
             p.Sending=true;
             p.Generating=true;
             p.Live=null;
@@ -229,7 +244,7 @@ internal sealed class ConversationWorkspaceHost : IDisposable
         }
         Notify();
         SendReceipt receipt;
-        try { receipt=await _commands.SendAsync(id,text,_lifetime.Token); }
+        try { receipt=await _commands.SendAsync(submission,_lifetime.Token); }
         catch(OperationCanceledException)
         {
             lock(_gate)
@@ -248,6 +263,8 @@ internal sealed class ConversationWorkspaceHost : IDisposable
             if(!_panels.TryGetValue(id,out var p))return;
             p.Sending=false;
             p.Uncertain=receipt.Disposition==SendDisposition.Uncertain;
+            if(receipt.Disposition==SendDisposition.Rejected)
+                p.PendingSubmission=null;
             if(receipt.Disposition!=SendDisposition.Accepted)p.Generating=false;
             p.Status=receipt.Disposition switch
             {
@@ -265,14 +282,24 @@ internal sealed class ConversationWorkspaceHost : IDisposable
     public async Task CreateAsync(string? text)
     {
         if(string.IsNullOrWhiteSpace(text))return;
+        PreparedOutboundMessage submission;
         lock(_gate)
         {
             if(_creating||_newChatUncertain)return;
+            var prepared=OutboundMessagePreparation.ForNew(text);
+            if(prepared.Message is null)
+            {
+                _newChatError="Not sent: invalid_submission";
+                Notify();
+                return;
+            }
+            submission=prepared.Message;
+            _pendingCreation=submission;
             _creating=true;_createdChatId="";_newChatError="";
         }
         Notify();
         SendReceipt receipt;
-        try {receipt=await _commands.CreateAsync(text,_lifetime.Token);}
+        try {receipt=await _commands.CreateAsync(submission,_lifetime.Token);}
         catch(OperationCanceledException)
         {
             lock(_gate)
@@ -288,9 +315,15 @@ internal sealed class ConversationWorkspaceHost : IDisposable
         {
             _creating=false;
             _newChatUncertain=receipt.Disposition==SendDisposition.Uncertain;
+            if(receipt.Disposition==SendDisposition.Rejected)
+                _pendingCreation=null;
             if(receipt.Disposition is SendDisposition.Accepted or SendDisposition.Uncertain &&
                !string.IsNullOrWhiteSpace(receipt.ConversationId))
+            {
                 _createdChatId=receipt.ConversationId;
+                if(receipt.Disposition==SendDisposition.Accepted)
+                    _pendingCreation=null;
+            }
             else _newChatError=receipt.Disposition==SendDisposition.Uncertain?
                 "Creation uncertain. Check provider history before retrying.":
                 "New conversation unavailable: "+SafeReason(receipt.Reason);

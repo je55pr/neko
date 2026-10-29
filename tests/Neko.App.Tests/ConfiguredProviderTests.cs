@@ -84,6 +84,37 @@ public sealed class ConfiguredProviderTests
         Assert.Equal("second",messages[2].GetProperty("content").GetString());
     }
 
+
+    [Fact]
+    public async Task PreparedMessageIdentityIsPreservedThroughNativeAdapter()
+    {
+        var handler=new SseHandler();
+        using var provider=Provider(handler);
+        var first=OutboundMessagePreparation.ForNew("  Keep spaces\r\n").Message!;
+        var created=await provider.CreatePreparedAsync(first,CancellationToken.None);
+        Assert.Equal(SendDisposition.Accepted,created.Disposition);
+        var history=await provider.ReadAsync(created.ConversationId!,CancellationToken.None);
+        var user=Assert.Single(history!.Messages,m=>m.Role==VisibleMessageRole.User);
+        Assert.Equal(first.ClientMessageId,user.Id);
+        Assert.Equal(first.Text,user.Text);
+        using var payload=JsonDocument.Parse(handler.SentJson!);
+        var posted=payload.RootElement.GetProperty("messages")[0].GetProperty("content").GetString();
+        Assert.Equal(first.Text,posted);
+        Assert.DoesNotContain(first.ClientMessageId,handler.SentJson);
+    }
+
+    [Fact]
+    public async Task RejectedLocalSubmissionNeverContactsEndpoint()
+    {
+        var handler=new SseHandler();
+        using var provider=Provider(handler);
+        var invalid=OutboundMessagePreparation.ForNew("hello").Message!
+            with {ClientMessageId="invalid"};
+        var receipt=await provider.CreatePreparedAsync(invalid,CancellationToken.None);
+        Assert.Equal(SendDisposition.Rejected,receipt.Disposition);
+        Assert.Equal(0,handler.Requests);
+    }
+
     [Fact]
     public void PlaintextRemoteEndpointIsRejected()
     {
