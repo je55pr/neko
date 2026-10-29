@@ -1,3 +1,4 @@
+using System.IO;
 using System.Reflection;
 using System.Windows;
 using Neko;
@@ -17,13 +18,15 @@ public sealed class ExternalProviderHostTests
     [Fact]
     public void ExplicitProviderIsActuallyUsedAndDisposedOnWindowClose()
     {
+        var profile=Path.Combine(Path.GetTempPath(),
+            "NekoHostTest-"+Guid.NewGuid().ToString("N"));
         Exception? failure=null;
         var thread=new Thread(() =>
         {
             try
             {
                 var provider=new ProbeProvider();
-                var window=new MainWindow(provider);
+                var window=new MainWindow(provider,profile);
                 try
                 {
                     // Observe the actual workspace, not merely the constructor.
@@ -45,12 +48,20 @@ public sealed class ExternalProviderHostTests
             }
             catch(Exception ex){failure=ex;}
         });
+        thread.IsBackground=true;
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
-        Assert.True(thread.Join(TimeSpan.FromSeconds(15)),
-            "The STA provider handoff test did not finish.");
-        if(failure is not null)
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        try
+        {
+            Assert.True(thread.Join(TimeSpan.FromSeconds(15)),
+                "The STA provider handoff test did not finish.");
+            if(failure is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+        finally
+        {
+            if(Directory.Exists(profile))Directory.Delete(profile,true);
+        }
     }
 
     [Fact]
@@ -66,6 +77,7 @@ public sealed class ExternalProviderHostTests
             }
             catch(Exception ex){failure=ex;}
         });
+        thread.IsBackground=true;
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
         Assert.True(thread.Join(TimeSpan.FromSeconds(15)));
