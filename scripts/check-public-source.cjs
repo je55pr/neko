@@ -14,6 +14,20 @@ const forbiddenNames=[
 ].map(parts=>parts.join('').toLowerCase());
 
 const modelName=['g','p','t'].join('');
+// Provider names are permitted only in the explicit adapter area and its
+// matching tests. This does NOT exempt endpoint, credential, path, account,
+// internal-module or unique-identifier checks in those files.
+const providerFolder=['Chat','G','p','t'].join('');
+const publishedProviderFile=relative=>{
+  const clean=relative.replace(/\\/g,'/');
+  const sources=['src/Neko.App','tests/Neko.App.Tests'];
+  return sources.some(base=>{
+    const prefix=base+'/Providers/'+providerFolder+'/';
+    return clean.startsWith(prefix) &&
+      /^[a-z0-9._/-]+\.cs$/i.test(clean.slice(prefix.length));
+  });
+};
+
 const identifyingPatterns=[
   {label:'provider name variant',re:new RegExp(
     String.raw`(?:chat[\s_.-]*${modelName}|open[\s_.-]*ai)`,'i')},
@@ -31,11 +45,15 @@ const identifyingPatterns=[
 function inspect(relative,content){
   const problems=[];
   const candidate=relative.toLowerCase();
+  const adapter=publishedProviderFile(relative);
   for(const name of forbiddenNames){
+    if(adapter && (name===forbiddenNames[0]||name===forbiddenNames[1]))continue;
     if(candidate.includes(name))problems.push('identifying filename');
     if(content.toLowerCase().includes(name))problems.push('identifying source term');
   }
   for(const rule of identifyingPatterns){
+    if(adapter && (rule.label==='provider name variant'||
+                   rule.label==='provider model identifier'))continue;
     if(rule.re.test(relative))problems.push(rule.label+' in filename');
     if(rule.re.test(content))problems.push(rule.label+' in source');
   }

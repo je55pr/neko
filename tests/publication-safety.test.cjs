@@ -30,3 +30,26 @@ test('generic source and local virtual host are allowed',()=>{
   assert.deepEqual(inspect('tests/neutral.test.cjs',
     'public interface IConversationProvider { }'),[]);
 });
+
+test('named provider adapters are allowed only in their isolated area',()=>{
+  const provider=['Chat','G','p','t'].join('');
+  const relative='src/Neko.App/Providers/'+provider+'/RequestPreparation.cs';
+  const tests='tests/Neko.App.Tests/Providers/'+provider+'/RequestPreparationTests.cs';
+  const source='internal class '+provider+'RequestBuilder {}';
+  assert.deepEqual(inspect(relative,source),[]);
+  assert.deepEqual(inspect(tests,source),[]);
+  assert(inspect('src/Neko.Core/RequestBuilder.cs',source).length>0);
+  assert(inspect('src/Neko.App/RequestBuilder.cs',source).length>0);
+});
+
+test('isolated provider adapters still reject secrets and private endpoints',()=>{
+  const provider=['Chat','G','p','t'].join('');
+  const relative='src/Neko.App/Providers/'+provider+'/RequestPreparation.cs';
+  const key=['sk','-','x'.repeat(45)].join('');
+  const endpoint=['/backend','-api/f/conversation'].join('');
+  assert(inspect(relative,key).length>0);
+  assert(inspect(relative,endpoint).length>0);
+  assert(inspect(relative,['oai','-','private'].join('')).length>0);
+  const uuid=['12345678','1234','1234','abcd','123456789abc'].join('-');
+  assert(inspect(relative,uuid).length>0);
+});
