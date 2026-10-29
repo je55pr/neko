@@ -16,7 +16,7 @@ const forbiddenNames=[
 const modelName=['g','p','t'].join('');
 const identifyingPatterns=[
   {label:'provider name variant',re:new RegExp(
-    String.raw`\b(?:chat[\s_.-]*${modelName}|open[\s_.-]*ai)\b`,'i')},
+    String.raw`(?:chat[\s_.-]*${modelName}|open[\s_.-]*ai)`,'i')},
   {label:'provider model identifier',re:new RegExp(
     String.raw`\b${modelName}\b`,'i')},
   {label:'local user path',re:/(?:[a-z]:\\users\\|\/users\/)[^\s'"<>]+/i},
@@ -49,8 +49,9 @@ function check(){
   try{
     files=execFileSync(gitPath,['ls-files','-z'],{cwd:root})
       .toString('utf8').split('\0').filter(Boolean);
-  }catch{
-    console.error('Source audit requires a Git worktree.');
+  }catch(error){
+    console.error('Cannot enumerate tracked source: status '+
+      (error.status??'unknown')+', code '+(error.code??'none'));
     return 2;
   }
   let count=0;

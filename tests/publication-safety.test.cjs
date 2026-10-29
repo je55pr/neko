@@ -9,9 +9,10 @@ test('published names are checked as well as file content',()=>{
 });
 
 test('spaced and hyphenated provider names are rejected',()=>{
-  assert(inspect('generic.txt',['Chat',' G','P','T'].join('')).length>0);
-  assert(inspect('generic.txt',['open','-ai'].join('')).length>0);
-  assert(inspect(['src/open','_ai-core.cs'].join(''),'').length>0);
+  assert(inspect('generic.txt',['Chat',' G','P','T'].join('')).includes('provider name variant in source'));
+  assert(inspect('generic.txt',['open','-ai'].join('')).includes('provider name variant in source'));
+  assert(inspect(['src/open','_ai-core.cs'].join(''),'').includes('provider name variant in filename'));
+  assert(inspect('generic.txt',['class IsOpen','_AIUrl {}'].join('')).includes('provider name variant in source'));
 });
 
 test('embedded credentials and unique IDs are rejected without logging secrets',()=>{
