@@ -13,7 +13,8 @@ internal static class NativeConversationRequestPreparation
     private static readonly TimeSpan MaxObservedReplyAge=TimeSpan.FromMinutes(5);
     private static readonly TimeSpan MaxModelAge=TimeSpan.FromMinutes(5);
     private static readonly Regex ModelPattern=new(
-        "^[a-zA-Z0-9_.-]{1,90}$",RegexOptions.CultureInvariant);
+        "^[a-zA-Z0-9_.-]{1,90}$",RegexOptions.CultureInvariant,
+        TimeSpan.FromMilliseconds(100));
 
     internal enum ParentEvidenceSource
     {
@@ -178,7 +179,8 @@ internal static class NativeConversationRequestPreparation
         return model.ThinkingEffort is null ||
             (model.ThinkingEffort.Length<=48 &&
              Regex.IsMatch(model.ThinkingEffort,
-                "^[a-zA-Z0-9_.-]+$",RegexOptions.CultureInvariant));
+                "^[a-zA-Z0-9_.-]+$",RegexOptions.CultureInvariant,
+                TimeSpan.FromMilliseconds(100)));
     }
 
     private static bool Fresh(

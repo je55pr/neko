@@ -171,24 +171,24 @@ public sealed class NativeConversationRequestPreparationTests
     [Fact]
     public void PreviewAndDiagnosticFormattingNeverRevealPromptOrIdentifiers()
     {
-        var secret="DO_NOT_DISPLAY_MY_PRIVATE_MESSAGE_123";
-        var submission=OutboundMessagePreparation.ForNew(secret).Message!;
+        var promptText="Sample ordinary prompt content for the redaction test";
+        var submission=OutboundMessagePreparation.ForNew(promptText).Message!;
         var result=Builder.ForNew(submission,NewParent(),Model(),Now);
         Assert.True(result.Ready);
 
         var display=string.Join(" ",result.ToString(),
             result.Dispatch!.ToString(),result.Dispatch.Preview.ToString(),
             JsonSerializer.Serialize(result.Dispatch.Preview));
-        Assert.DoesNotContain(secret,display);
+        Assert.DoesNotContain(promptText,display);
         Assert.DoesNotContain("example-model",display);
         Assert.DoesNotContain(submission.ClientMessageId,display);
         Assert.DoesNotContain("Authorization",display);
         Assert.DoesNotContain("cookie",display,StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(secret.Length,result.Dispatch.Preview.PromptLength);
+        Assert.Equal(promptText.Length,result.Dispatch.Preview.PromptLength);
 
         // Only the explicit typed arguments expose message text to an adapter.
-        Assert.Equal(secret,result.Dispatch.GetArgumentsForAdapter().Text);
-        Assert.DoesNotContain(secret,result.Dispatch.GetArgumentsForAdapter().ToString());
+        Assert.Equal(promptText,result.Dispatch.GetArgumentsForAdapter().Text);
+        Assert.DoesNotContain(promptText,result.Dispatch.GetArgumentsForAdapter().ToString());
     }
 
     [Fact]
