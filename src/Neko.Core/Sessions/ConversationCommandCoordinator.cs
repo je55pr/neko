@@ -11,11 +11,13 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
         public bool Sending;
         public bool Stopping;
         public bool DeliveryUncertain;
+        public bool StopUncertain;
         public SendReceipt? LastSend;
     }
 
     public sealed record State(
-        bool Sending,bool Stopping,bool DeliveryUncertain,SendReceipt? LastSend);
+        bool Sending,bool Stopping,bool DeliveryUncertain,SendReceipt? LastSend,
+        bool StopUncertain=false);
 
     private readonly object _gate=new();
     private readonly Dictionary<string,Session> _sessions=new(StringComparer.Ordinal);
@@ -26,9 +28,10 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
     {
         lock(_gate)
         {
-            var session=GetOrCreate(conversationId);
+            if(!_sessions.TryGetValue(conversationId,out var session))
+                return new State(false,false,false,null);
             return new State(session.Sending,session.Stopping,
-                session.DeliveryUncertain,session.LastSend);
+                session.DeliveryUncertain,session.LastSend,session.StopUncertain);
         }
     }
 
@@ -44,6 +47,7 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
             session=GetOrCreate(conversationId);
             if(session.Sending)return Rejected("send_in_progress");
             if(session.Stopping)return Rejected("stop_in_progress");
+            if(session.StopUncertain)return Rejected("previous_stop_uncertain");
             if(session.DeliveryUncertain)
                 return Rejected("previous_delivery_uncertain");
             session.Sending=true;
@@ -87,6 +91,8 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
                 return new StopReceipt(StopDisposition.NotActive,"send_in_progress");
             if(session.Stopping)
                 return new StopReceipt(StopDisposition.NotActive,"stop_in_progress");
+            if(session.StopUncertain)
+                return new StopReceipt(StopDisposition.Uncertain,"previous_stop_uncertain");
             session.Stopping=true;
         }
         StopReceipt receipt;
@@ -102,7 +108,12 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
         {
             receipt=new StopReceipt(StopDisposition.Uncertain,"stop_unknown");
         }
-        lock(_gate)session.Stopping=false;
+        lock(_gate)
+        {
+            session.Stopping=false;
+            if(receipt.Disposition==StopDisposition.Uncertain)
+                session.StopUncertain=true;
+        }
         return receipt;
     }
 
@@ -147,10 +158,24 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
         if(string.IsNullOrWhiteSpace(conversationId))return false;
         lock(_gate)
         {
-            var session=GetOrCreate(conversationId);
+            if(!_sessions.TryGetValue(conversationId,out var session))return false;
             if(session.Sending||session.Stopping)return false;
             if(!session.DeliveryUncertain)return false;
             session.DeliveryUncertain=false;
+            return true;
+        }
+    }
+
+    // Only a caller with authoritative provider state may clear this latch.
+    public bool ConfirmStopReconciled(string conversationId)
+    {
+        if(string.IsNullOrWhiteSpace(conversationId))return false;
+        lock(_gate)
+        {
+            if(!_sessions.TryGetValue(conversationId,out var session) ||
+               session.Sending || session.Stopping || !session.StopUncertain)
+                return false;
+            session.StopUncertain=false;
             return true;
         }
     }

@@ -193,6 +193,107 @@ public sealed class ConversationCommandCoordinatorTests
     }
 
     [Fact]
+    public void ReadAndReconcileDoNotAllocateUnknownSessions()
+    {
+        var coordinator=new ConversationCommandCoordinator(new Provider());
+        for(var i=0;i<100;i++)
+        {
+            var id="unknown-"+i;
+            Assert.Equal(new ConversationCommandCoordinator.State(
+                false,false,false,null),coordinator.GetState(id));
+            Assert.False(coordinator.ConfirmReconciled(id));
+            Assert.False(coordinator.ConfirmStopReconciled(id));
+        }
+        var sessions=typeof(ConversationCommandCoordinator)
+            .GetField("_sessions",System.Reflection.BindingFlags.NonPublic|
+                System.Reflection.BindingFlags.Instance)!
+            .GetValue(coordinator);
+        Assert.Empty((System.Collections.IDictionary)sessions!);
+    }
+
+    [Fact]
+    public async Task UncertainStopIsLatchedAndDoesNotLeakProviderErrors()
+    {
+        var provider=new Provider {
+            OnStop=(_,_)=>throw new IOException("private provider diagnostic")
+        };
+        var coordinator=new ConversationCommandCoordinator(provider);
+        var first=await coordinator.StopAsync("id");
+        Assert.Equal(StopDisposition.Uncertain,first.Disposition);
+        Assert.Equal("stop_unknown",first.Reason);
+        Assert.True(coordinator.GetState("id").StopUncertain);
+        var retry=await coordinator.StopAsync("id");
+        Assert.Equal(StopDisposition.Uncertain,retry.Disposition);
+        Assert.Equal("previous_stop_uncertain",retry.Reason);
+        Assert.Equal("previous_stop_uncertain",
+            (await coordinator.SendAsync("id","new")).Reason);
+        Assert.Equal(1,provider.StopCalls);
+        Assert.Equal(0,provider.SendCalls);
+        Assert.False(coordinator.ConfirmReconciled("id"));
+        Assert.True(coordinator.ConfirmStopReconciled("id"));
+        Assert.False(coordinator.ConfirmStopReconciled("id"));
+        provider.OnStop=(_,_)=>Task.FromResult(new StopReceipt(StopDisposition.Requested));
+        Assert.Equal(StopDisposition.Requested,(await coordinator.StopAsync("id")).Disposition);
+    }
+
+    [Fact]
+    public async Task CancelledStopRequiresReconciliation()
+    {
+        var provider=new Provider();
+        var pending=new TaskCompletionSource<StopReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        provider.OnStop=(_,_)=>pending.Task;
+        var coordinator=new ConversationCommandCoordinator(provider);
+        using var cancellation=new CancellationTokenSource();
+        var task=coordinator.StopAsync("id",cancellation.Token);
+        Assert.False(coordinator.ConfirmStopReconciled("id"));
+        cancellation.Cancel();
+        pending.SetCanceled(cancellation.Token);
+        var result=await task;
+        Assert.Equal(StopDisposition.Uncertain,result.Disposition);
+        Assert.Equal("stop_unknown",result.Reason);
+        Assert.True(coordinator.GetState("id").StopUncertain);
+    }
+
+    [Fact]
+    public async Task CancelledCreationLatchesUntilReconciled()
+    {
+        var provider=new Provider();
+        var pending=new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        provider.OnCreate=(_,_)=>pending.Task;
+        var coordinator=new ConversationCommandCoordinator(provider);
+        using var cancellation=new CancellationTokenSource();
+        var task=coordinator.CreateAsync("hello",cancellation.Token);
+        Assert.False(coordinator.ConfirmCreationReconciled());
+        cancellation.Cancel();
+        pending.SetCanceled(cancellation.Token);
+        var result=await task;
+        Assert.Equal(SendDisposition.Uncertain,result.Disposition);
+        Assert.Equal("delivery_unknown",result.Reason);
+        Assert.Equal("previous_creation_uncertain",
+            (await coordinator.CreateAsync("again")).Reason);
+        Assert.True(coordinator.ConfirmCreationReconciled());
+        Assert.False(coordinator.ConfirmCreationReconciled());
+    }
+
+    [Fact]
+    public async Task SendCannotBeReconciledWhileInFlight()
+    {
+        var provider=new Provider();
+        var pending=new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        provider.OnSend=(_,_,_)=>pending.Task;
+        var coordinator=new ConversationCommandCoordinator(provider);
+        var task=coordinator.SendAsync("id","hi");
+        Assert.False(coordinator.ConfirmReconciled("id"));
+        pending.SetResult(new SendReceipt(SendDisposition.Uncertain,"delivery_unknown"));
+        await task;
+        Assert.True(coordinator.ConfirmReconciled("id"));
+        Assert.False(coordinator.ConfirmReconciled("id"));
+    }
+
+    [Fact]
     public async Task InvalidInputDoesNotDispatchToProvider()
     {
         var provider=new Provider();
