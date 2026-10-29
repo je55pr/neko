@@ -1,7 +1,64 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path');
+const vm=require('node:vm');
 const workspace=fs.readFileSync(path.join(__dirname,'..','src','ui','NekoWorkspace.js'),'utf8');
+
+
+function isolatedLiveRenderer(){
+ const source=workspace.split('function applyLive(view,update)')[1]
+   .split('function receive(next)')[0];
+ return vm.runInNewContext('function applyLive(view,update)'+source+';applyLive',{
+   placeLiveActivity(){},
+   applyActivities(){},
+   updateAwaitingReply(){},
+   showMarkdown(element,text){element.text=text;},
+   followLatest(){}
+ });
+}
+
+function sampleView(){
+ return {
+  live:{hidden:false},
+  liveBody:{
+    text:'NEKO UI ACK',
+    replaceChildren(){this.text='';}
+  },
+  lastLive:'old-snapshot',
+  currentLiveId:'old-assistant-id',
+  lastNonEmptyLive:{id:'old-assistant-id',text:'NEKO UI ACK'},
+  savedAssistantById:new Map([['old-assistant-id',{}]]),
+  overview:{textContent:''},
+  lastInfo:{},
+  initialTail:false,
+  followTail:false,
+  pending:null
+ };
+}
+
+test('a live reply is removed when saved history takes ownership',()=>{
+ const applyLive=isolatedLiveRenderer();
+ const view=sampleView();
+ applyLive(view,null);
+ assert.equal(view.live.hidden,true);
+ assert.equal(view.liveBody.text,'');
+ assert.equal(view.currentLiveId,'');
+ assert.equal(view.lastLive,'');
+ assert.equal(view.lastNonEmptyLive,null);
+});
+
+test('a later live reply renders normally after saved-history handoff',()=>{
+ const applyLive=isolatedLiveRenderer();
+ const view=sampleView();
+ applyLive(view,null);
+ applyLive(view,{
+   messageId:'next-assistant-id',text:'A new answer',completed:false,
+   error:'',activities:[]
+ });
+ assert.equal(view.live.hidden,false);
+ assert.equal(view.liveBody.text,'A new answer');
+ assert.equal(view.currentLiveId,'next-assistant-id');
+});
 
 test('a saved message ID alone cannot hide streamed public reply text',()=>{
  const render=workspace.split('function renderHistory(view,info)')[1]

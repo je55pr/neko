@@ -1443,7 +1443,17 @@
     else if(hasHistory)followLatest(view);
   }
   function applyLive(view,update){
-    if(!update)return;
+    if(!update){
+      // Saved history may have replaced the completed live reply. The
+      // reusable live node survives renderHistory(), so hide and clear it
+      // explicitly instead of leaving a second assistant bubble behind.
+      view.live.hidden=true;
+      view.liveBody.replaceChildren();
+      view.currentLiveId='';
+      view.lastLive='';
+      view.lastNonEmptyLive=null;
+      return;
+    }
     view.currentLiveId=update.messageId||'';
     placeLiveActivity(view,update);
     if(update.text?.trim())
