@@ -75,8 +75,10 @@ internal sealed class ConfiguredChatProvider : IConversationProvider, IDisposabl
         var receipt=await BeginSendAsync(chat,text,cancellation);
         if(receipt.Disposition==SendDisposition.Rejected)
             _chats.TryRemove(id,out _);
-        return receipt with {ConversationId=receipt.Disposition==
-            SendDisposition.Accepted?id:null};
+        // Keep the local conversation identifier available for inspection
+        // even if the first submission's delivery is uncertain.
+        return receipt with {ConversationId=receipt.Disposition is
+            SendDisposition.Accepted or SendDisposition.Uncertain?id:null};
     }
 
     public Task<SendReceipt> SendAsync(string id,string text,CancellationToken cancellation)

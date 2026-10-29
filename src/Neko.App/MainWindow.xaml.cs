@@ -162,8 +162,10 @@ public partial class MainWindow : Window
                 case "panel-new-chat-reset":
                     // Never clear uncertain delivery without authoritative evidence.
                     break;
-                // All other actions are unsupported, not silently mapped to
-                // provider operations they cannot perform.
+                default:
+                    // Unsupported bridge actions are inert. Never translate an
+                    // unknown command into a provider operation.
+                    break;
             }
         }
         catch(JsonException) { }

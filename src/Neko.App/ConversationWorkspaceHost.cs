@@ -23,6 +23,7 @@ internal sealed class ConversationWorkspaceHost : IDisposable
         public bool Uncertain { get; set; }
         public bool HistoryLoading { get; set; }
         public bool StopPending { get; set; }
+        public bool StopUncertain { get; set; }
         public LiveReply? Live { get; set; }
     }
 
@@ -89,7 +90,7 @@ internal sealed class ConversationWorkspaceHost : IDisposable
                     }).ToArray(),
                     p.HistoryRevision,p.Draft,p.Status,p.Authorized,
                     p.Sending,p.Generating,p.Uncertain,p.HistoryLoading,
-                    p.StopPending,p.Live
+                    p.StopPending,p.StopUncertain,p.Live
                 }).ToArray(),
                 capacity=OfflineBoardStore.MaxPanelsPerBoard,
                 creatingChat=_creating,newChatError=_newChatError,
@@ -229,7 +230,19 @@ internal sealed class ConversationWorkspaceHost : IDisposable
         Notify();
         SendReceipt receipt;
         try { receipt=await _commands.SendAsync(id,text,_lifetime.Token); }
-        catch(OperationCanceledException){return;}
+        catch(OperationCanceledException)
+        {
+            lock(_gate)
+                if(_panels.TryGetValue(id,out var p))
+                {
+                    p.Sending=false;
+                    p.Generating=false;
+                    p.Uncertain=true;
+                    p.Status="Delivery unconfirmed after cancellation. Do not retry.";
+                }
+            Notify();
+            return;
+        }
         lock(_gate)
         {
             if(!_panels.TryGetValue(id,out var p))return;
@@ -260,12 +273,22 @@ internal sealed class ConversationWorkspaceHost : IDisposable
         Notify();
         SendReceipt receipt;
         try {receipt=await _commands.CreateAsync(text,_lifetime.Token);}
-        catch(OperationCanceledException){return;}
+        catch(OperationCanceledException)
+        {
+            lock(_gate)
+            {
+                _creating=false;
+                _newChatUncertain=true;
+                _newChatError="Creation unconfirmed after cancellation. Do not retry.";
+            }
+            Notify();
+            return;
+        }
         lock(_gate)
         {
             _creating=false;
             _newChatUncertain=receipt.Disposition==SendDisposition.Uncertain;
-            if(receipt.Disposition==SendDisposition.Accepted &&
+            if(receipt.Disposition is SendDisposition.Accepted or SendDisposition.Uncertain &&
                !string.IsNullOrWhiteSpace(receipt.ConversationId))
                 _createdChatId=receipt.ConversationId;
             else _newChatError=receipt.Disposition==SendDisposition.Uncertain?
@@ -273,7 +296,8 @@ internal sealed class ConversationWorkspaceHost : IDisposable
                 "New conversation unavailable: "+SafeReason(receipt.Reason);
         }
         Notify();
-        if(!string.IsNullOrWhiteSpace(_createdChatId))
+        if(receipt.Disposition==SendDisposition.Accepted &&
+           !string.IsNullOrWhiteSpace(_createdChatId))
         {
             var id=_createdChatId;
             lock(_gate)
@@ -291,7 +315,11 @@ internal sealed class ConversationWorkspaceHost : IDisposable
     {
         if(string.IsNullOrWhiteSpace(id))return;
         lock(_gate)
-            if(_panels.TryGetValue(id,out var p))p.StopPending=true;
+        {
+            if(!_panels.TryGetValue(id,out var p) || p.StopPending || p.StopUncertain)
+                return;
+            p.StopPending=true;
+        }
         Notify();
         try
         {
@@ -300,6 +328,7 @@ internal sealed class ConversationWorkspaceHost : IDisposable
                 if(_panels.TryGetValue(id,out var p))
                 {
                     p.StopPending=false;
+                    p.StopUncertain=receipt.Disposition==StopDisposition.Uncertain;
                     p.Status=receipt.Disposition switch
                     {
                         StopDisposition.Uncertain=>"Stop uncertain. Refresh history to verify.",
@@ -308,7 +337,16 @@ internal sealed class ConversationWorkspaceHost : IDisposable
                     };
                 }
         }
-        catch(OperationCanceledException){}
+        catch(OperationCanceledException)
+        {
+            lock(_gate)
+                if(_panels.TryGetValue(id,out var p))
+                {
+                    p.StopPending=false;
+                    p.StopUncertain=true;
+                    p.Status="Stop unconfirmed after cancellation.";
+                }
+        }
         Notify();
     }
 
@@ -316,8 +354,11 @@ internal sealed class ConversationWorkspaceHost : IDisposable
     {
         if(id is null)return;
         await RefreshPanelAsync(id);
-        // A read alone cannot establish whether a lost send was delivered.
-        // Reconciliation must use authoritative, correlated provider evidence.
+        // Display history is not correlated proof of this submission.
+        // Never clear the coordinator's uncertainty latch here.
+        lock(_gate)
+            if(_panels.TryGetValue(id,out var p) && p.Uncertain)
+                p.Status="History refreshed; delivery remains unconfirmed. Do not retry.";
         Notify();
     }
 
@@ -342,7 +383,13 @@ internal sealed class ConversationWorkspaceHost : IDisposable
                 lock(_gate)
                 {
                     if(!_panels.TryGetValue(id,out var p))continue;
-                    if(update.Kind!=PublicUpdateKind.Final)continue;
+                    if(update.Kind!=PublicUpdateKind.Final ||
+                       update.Operation is not (
+                           PublicUpdateOperation.Start or
+                           PublicUpdateOperation.Replace or
+                           PublicUpdateOperation.Append or
+                           PublicUpdateOperation.Complete or
+                           PublicUpdateOperation.Fail))continue;
                     var live=p.Live;
                     if(live is null || live.MessageId!=update.MessageId)
                         live=p.Live=new LiveReply { MessageId=update.MessageId };
@@ -356,6 +403,9 @@ internal sealed class ConversationWorkspaceHost : IDisposable
                         case PublicUpdateOperation.Fail:
                             live.Error="Generation failed.";p.Generating=false;
                             p.Status="Generation failed.";break;
+                        default:
+                            // Unknown operations must not mutate panel state.
+                            continue;
                     }
                     if(live.Text.Length>1_000_000)live.Text=live.Text[..1_000_000];
                     live.Sequence++;
