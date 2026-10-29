@@ -1,5 +1,4 @@
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using System.Windows;
 using Neko;
 
@@ -76,29 +75,27 @@ public sealed class ExternalProviderHostTests
 
     private sealed class ProbeProvider:IConversationProvider,IDisposable
     {
+        private readonly DisconnectedConversationProvider _fallback=new();
         public int BrowseCount {get;private set;}
         public bool Disposed {get;private set;}
         public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(
             CancellationToken cancellation)
         {
             BrowseCount++;
-            return Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
+            return _fallback.BrowseAsync(cancellation);
         }
         public Task<VisibleConversation?> ReadAsync(string id,CancellationToken cancellation)=>
-            Task.FromResult<VisibleConversation?>(null);
+            _fallback.ReadAsync(id,cancellation);
         public Task<SendReceipt> CreateAsync(string text,CancellationToken cancellation)=>
-            Task.FromResult(new SendReceipt(SendDisposition.Rejected));
+            _fallback.CreateAsync(text,cancellation);
         public Task<SendReceipt> SendAsync(string id,string text,
             CancellationToken cancellation)=>
-            Task.FromResult(new SendReceipt(SendDisposition.Rejected));
+            _fallback.SendAsync(id,text,cancellation);
         public Task<StopReceipt> StopAsync(string id,CancellationToken cancellation)=>
-            Task.FromResult(new StopReceipt(StopDisposition.NotActive));
-        public async IAsyncEnumerable<PublicConversationUpdate> WatchAsync(
-            string id,[EnumeratorCancellation]CancellationToken cancellation)
-        {
-            await Task.CompletedTask;
-            yield break;
-        }
+            _fallback.StopAsync(id,cancellation);
+        public IAsyncEnumerable<PublicConversationUpdate> WatchAsync(
+            string id,CancellationToken cancellation)=>
+            _fallback.WatchAsync(id,cancellation);
         public void Dispose()=>Disposed=true;
     }
 }
