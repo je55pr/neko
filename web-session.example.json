@@ -1,0 +1,12 @@
+{
+  "provider": "web-session",
+  "homeUrl": "https://your-provider.example/",
+  "profileDirectory": "C:\\Path\\To\\Existing\\WebViewProfile",
+  "routePrefix": "/conversation/",
+  "composerSelector": "form [contenteditable='true']",
+  "submitSelector": "form button[type='submit']",
+  "userMessageSelector": "[data-role='user']",
+  "assistantMessageSelector": "[data-role='assistant']",
+  "activeGenerationSelector": "button[aria-label='Stop']",
+  "experimentalBrowserSend": false
+}

@@ -293,7 +293,14 @@ internal sealed class ConfiguredChatProvider :
 
 internal static class LocalProviderConfiguration
 {
-    internal sealed record Settings(string Provider,string Endpoint,string Model,string ApiKey);
+    internal sealed record Settings(
+        string Provider,string? Endpoint=null,string? Model=null,string? ApiKey=null,
+        string? HomeUrl=null,string? ProfileDirectory=null,
+        string? RoutePrefix=null,string? ComposerSelector=null,
+        string? SubmitSelector=null,string? UserMessageSelector=null,
+        string? AssistantMessageSelector=null,
+        bool ExperimentalBrowserSend=false,
+        string? ActiveGenerationSelector=null);
 
     internal static (IConversationProvider Provider,string Status) Load()
     {
@@ -313,11 +320,30 @@ internal static class LocalProviderConfiguration
             var settings=JsonSerializer.Deserialize<Settings>(
                 File.ReadAllText(path),
                 new JsonSerializerOptions{PropertyNameCaseInsensitive=true});
+            if(settings?.Provider=="web-session")
+            {
+                if(!Uri.TryCreate(settings.HomeUrl,UriKind.Absolute,out var home))
+                    throw new InvalidDataException();
+                var config=new WebSessionConversationProvider.Settings(
+                    home,settings.ProfileDirectory??"",
+                    settings.RoutePrefix??"",
+                    settings.ComposerSelector??"",
+                    settings.SubmitSelector??"",
+                    settings.UserMessageSelector??"",
+                    settings.AssistantMessageSelector??"",
+                    settings.ExperimentalBrowserSend,
+                    settings.ActiveGenerationSelector);
+                return (new WebSessionConversationProvider(config),
+                    settings.ExperimentalBrowserSend
+                        ?"Experimental browser send enabled. Verification required."
+                        :"Browser session configured. Sending disabled by default.");
+            }
             if(settings?.Provider!="chat-completions" ||
                !Uri.TryCreate(settings.Endpoint,UriKind.Absolute,out var endpoint))
                 throw new InvalidDataException();
             return (new ConfiguredChatProvider(new HttpClient(),endpoint,
-                settings.Model,settings.ApiKey),"Chat-completions provider configured");
+                settings.Model??"",settings.ApiKey??""),
+                "Chat-completions provider configured");
         }
         catch(Exception)
         {
