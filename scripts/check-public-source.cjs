@@ -13,9 +13,12 @@ const forbiddenNames=[
   ['sk','-proj-']
 ].map(parts=>parts.join('').toLowerCase());
 
+const modelName=['g','p','t'].join('');
 const identifyingPatterns=[
-  {label:'provider name variant',re:/\b(?:chat[\s_.-]*g[p]t|open[\s_.-]*ai)\b/i},
-  {label:'provider model identifier',re:/\bg[p]t\b/i},
+  {label:'provider name variant',re:new RegExp(
+    String.raw`\b(?:chat[\s_.-]*${modelName}|open[\s_.-]*ai)\b`,'i')},
+  {label:'provider model identifier',re:new RegExp(
+    String.raw`\b${modelName}\b`,'i')},
   {label:'local user path',re:/(?:[a-z]:\\users\\|\/users\/)[^\s'"<>]+/i},
   {label:'email address',re:/\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/i},
   {label:'secret-like credential',re:/\b(?:sk[-_]|gho_|ghu_|ghs_)[a-z0-9_-]{24,}\b/i},
@@ -40,9 +43,11 @@ function inspect(relative,content){
 }
 
 function check(){
+  const gitPath=process.platform==='win32'
+    ?'C:\\Program Files\\Git\\cmd\\git.exe':'/usr/bin/git';
   let files;
   try{
-    files=execFileSync('git',['ls-files','-z'],{cwd:root})
+    files=execFileSync(gitPath,['ls-files','-z'],{cwd:root})
       .toString('utf8').split('\0').filter(Boolean);
   }catch{
     console.error('Source audit requires a Git worktree.');
