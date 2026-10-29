@@ -18,14 +18,25 @@ public partial class MainWindow : Window
     private bool _ready;
     private int _revision;
 
-    public MainWindow()
+    // The ordinary desktop launch keeps the configured provider unchanged.
+    public MainWindow():this(LocalProviderConfiguration.Load()) {}
+
+    /// <summary>
+    /// An explicitly constructed local host may supply its own provider.
+    /// The window owns and disposes the supplied provider when it closes.
+    /// No external assemblies are discovered or loaded by Neko.
+    /// </summary>
+    public MainWindow(IConversationProvider provider):
+        this((provider??throw new ArgumentNullException(nameof(provider)),
+            "Conversation provider supplied by host.")) {}
+
+    private MainWindow((IConversationProvider Provider,string Status) configured)
     {
         InitializeComponent();
         _profileDirectory=Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "NekoOfflineShell");
         _boards=new OfflineBoardStore(_profileDirectory);
-        var configured=LocalProviderConfiguration.Load();
         _provider=configured.Provider;
         ProviderStatus.Text=configured.Status;
         _workspace=new ConversationWorkspaceHost(_provider,_boards);
