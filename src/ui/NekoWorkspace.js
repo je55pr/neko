@@ -1019,7 +1019,7 @@
           (view.attached||[]).map(item=>item.name));
         // A previous answer may still be visible only as a live bubble.
         // This outgoing user message belongs after that older answer.
-        view.pending.priorLiveId=view.currentLiveId||'';
+        view.pending.priorLiveId=priorLiveId(view);
         view.suppressedDraft=text;
         draft.value='';
         drawPending(view);
@@ -1376,6 +1376,9 @@
         'Tools are running. No final assistant reply has arrived yet.':
         'Tool activity is saved, but no final assistant reply is available yet.';
   }
+  function priorLiveId(view){
+    return view.currentLiveId||view.lastCompletedLiveId||'';
+  }
   function renderHistory(view,info){
     if(view.rev===info.historyRevision)return;
     view.rev=info.historyRevision;
@@ -1444,17 +1447,31 @@
   }
   function applyLive(view,update){
     if(!update){
-      // Saved history may have replaced the completed live reply. The
-      // reusable live node survives renderHistory(), so hide and clear it
-      // explicitly instead of leaving a second assistant bubble behind.
+      // A completed answer without a visible saved counterpart remains the
+      // only copy. Preserve it when a later send clears backend live state.
+      // This is presentation continuity, not send/delivery confirmation.
+      const unsavedCompleted=!!(view.lastLiveCompleted &&
+        view.currentLiveId && view.lastNonEmptyLive?.id===view.currentLiveId &&
+        view.lastNonEmptyLive.text?.trim() &&
+        !view.savedAssistantById?.has(view.currentLiveId));
+      if(unsavedCompleted){
+        view.live.hidden=false;
+        return;
+      }
+      // Saved history owns the answer now. Remove only the duplicate live
+      // bubble, retaining its ID for the *next* outgoing reconciliation.
       view.live.hidden=true;
       view.liveBody.replaceChildren();
       view.currentLiveId='';
       view.lastLive='';
       view.lastNonEmptyLive=null;
+      view.lastLiveCompleted=false;
       return;
     }
     view.currentLiveId=update.messageId||'';
+    view.lastLiveCompleted=!!update.completed;
+    if(update.completed && update.messageId)
+      view.lastCompletedLiveId=update.messageId;
     placeLiveActivity(view,update);
     if(update.text?.trim())
       view.overview.textContent=update.text.replace(/[#*`>_\[\]]/g,'').slice(-300);

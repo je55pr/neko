@@ -60,6 +60,44 @@ test('a later live reply renders normally after saved-history handoff',()=>{
  assert.equal(view.currentLiveId,'next-assistant-id');
 });
 
+
+function isolatedPriorLiveId(){
+ const match=workspace.match(/function priorLiveId\(view\)\s*\{[^}]*\}/);
+ assert.ok(match,'Prior-message reconciliation helper is missing');
+ return vm.runInNewContext(match[0]+';priorLiveId');
+}
+
+test('completed unsaved reply survives a later send clearing live state',()=>{
+ const applyLive=isolatedLiveRenderer();
+ const view=sampleView();
+ view.savedAssistantById.clear();
+ applyLive(view,{
+   messageId:'old-assistant-id',text:'NEKO UI ACK',completed:true,
+   error:'',activities:[]
+ });
+ applyLive(view,null);
+ assert.equal(view.live.hidden,false);
+ assert.equal(view.liveBody.text,'NEKO UI ACK');
+ assert.equal(view.currentLiveId,'old-assistant-id');
+});
+
+test('saved handoff retains preceding live ID for future reconciliation',()=>{
+ const applyLive=isolatedLiveRenderer();
+ const priorLiveId=isolatedPriorLiveId();
+ const view=sampleView();
+ applyLive(view,{
+   messageId:'old-assistant-id',text:'NEKO UI ACK',completed:true,
+   error:'',activities:[]
+ });
+ applyLive(view,null);
+ assert.equal(view.live.hidden,true);
+ assert.equal(view.currentLiveId,'');
+ assert.equal(priorLiveId(view),'old-assistant-id');
+ view.currentLiveId='new-assistant-id';
+ assert.equal(priorLiveId(view),'new-assistant-id');
+ assert.match(workspace,/view\.pending\.priorLiveId=priorLiveId\(view\)/);
+});
+
 test('a saved message ID alone cannot hide streamed public reply text',()=>{
  const render=workspace.split('function renderHistory(view,info)')[1]
    .split('function applyLive(view,update)')[0];
