@@ -79,6 +79,38 @@ public sealed class PreparedMessageHostTests
     }
 
     [Fact]
+    public async Task RejectedPreparedSendRestoresIdleStateAndKeepsDraft()
+    {
+        var path=TemporaryFolder();
+        try
+        {
+            var provider=new Provider {NextSend=SendDisposition.Rejected};
+            using var host=new ConversationWorkspaceHost(
+                provider,new OfflineBoardStore(path));
+            var id=Guid.NewGuid().ToString("D");
+            await host.OpenPanelAsync(id);
+            host.SetDraft(id,"draft retained");
+            await host.SendAsync(id,"draft retained");
+            using var snapshot=JsonDocument.Parse(JsonSerializer.Serialize(host.Snapshot()));
+            var panel=Assert.Single(snapshot.RootElement.GetProperty("panels").EnumerateArray());
+            Assert.False(panel.GetProperty("Sending").GetBoolean());
+            Assert.False(panel.GetProperty("Generating").GetBoolean());
+            Assert.False(panel.GetProperty("Uncertain").GetBoolean());
+            Assert.Equal("draft retained",panel.GetProperty("Draft").GetString());
+            var panels=(System.Collections.IDictionary)
+                typeof(ConversationWorkspaceHost).GetField("_panels",
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.NonPublic)!.GetValue(host)!;
+            var panelObject=panels[id]!;
+            Assert.Null(panelObject.GetType().GetProperty("PendingSubmission")!
+                .GetValue(panelObject));
+            await host.SendAsync(id,"second allowed");
+            Assert.Equal(2,provider.SendCalls);
+        }
+        finally {if(Directory.Exists(path))Directory.Delete(path,true);}
+    }
+
+    [Fact]
     public async Task NewChatCreationCannotRepeatUncertainMessage()
     {
         var path=TemporaryFolder();

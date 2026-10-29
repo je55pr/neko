@@ -27,8 +27,9 @@ public sealed record MessagePreparationResult(
 /// </summary>
 public static class OutboundMessagePreparation
 {
-    public const int MaxTextLength=24_000;
-    public const int MaxConversationIdLength=256;
+    // Runtime properties avoid compiling policy limits into consumers.
+    public static int MaxTextLength {get;}=24_000;
+    public static int MaxConversationIdLength {get;}=256;
 
     public static MessagePreparationResult ForExisting(
         string? conversationId,string? text)
@@ -72,17 +73,20 @@ public static class OutboundMessagePreparation
 
     private static bool HasValidUtf16(string text)
     {
-        for(var i=0;i<text.Length;i++)
+        var index=0;
+        while(index<text.Length)
         {
-            var character=text[i];
+            var character=text[index];
             if(char.IsHighSurrogate(character))
             {
-                if(i+1>=text.Length || !char.IsLowSurrogate(text[i+1]))
+                if(index+1>=text.Length || !char.IsLowSurrogate(text[index+1]))
                     return false;
-                i++;
+                index+=2;
+                continue;
             }
-            else if(char.IsLowSurrogate(character))
+            if(char.IsLowSurrogate(character))
                 return false;
+            index++;
         }
         return true;
     }
