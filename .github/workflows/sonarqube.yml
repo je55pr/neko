@@ -38,7 +38,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet sonarscanner begin "/k:$env:SONAR_PROJECT_KEY" "/o:$env:SONAR_ORGANIZATION" "/d:sonar.token=$env:SONAR_TOKEN"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (Test-Path Neko.csproj) {
+          if (Test-Path src/Neko.App/Neko.csproj) {
+            dotnet build src/Neko.App/Neko.csproj --configuration Release --no-incremental
+          } elseif (Test-Path Neko.csproj) {
             dotnet build Neko.csproj --configuration Release --no-incremental
           } else {
             dotnet build src/Neko.Core/Neko.Core.csproj --configuration Release --no-incremental

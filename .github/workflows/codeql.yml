@@ -26,7 +26,14 @@ jobs:
       - uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
-      - name: Build C# core
+      - name: Build C# projects
         if: ${{ matrix.language == 'csharp' }}
-        run: dotnet build src/Neko.Core/Neko.Core.csproj --configuration Release
+        shell: pwsh
+        run: |
+          if (Test-Path src/Neko.App/Neko.csproj) {
+            dotnet build src/Neko.App/Neko.csproj --configuration Release
+          } else {
+            dotnet build src/Neko.Core/Neko.Core.csproj --configuration Release
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: github/codeql-action/analyze@v4
