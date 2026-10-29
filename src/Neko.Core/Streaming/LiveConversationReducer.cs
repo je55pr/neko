@@ -38,6 +38,7 @@ internal sealed class LiveConversationReducer
     private readonly List<string> _activityOrder=[];
     private readonly HashSet<string> _hidden=new(StringComparer.Ordinal);
     private bool _visibilityOverflow;
+    private bool _requireStart;
     private readonly SortedDictionary<int,StringBuilder> _finalParts=[];
     private string _finalId="";
     private string _cachedFinal="";
@@ -91,6 +92,7 @@ internal sealed class LiveConversationReducer
             if(removed)_activityOrder.Remove(id);
             if(_finalId!=id)return removed;
             ResetFinal();
+            _requireStart=true;
             return true;
         }
         if(_hidden.Contains(id))return false;
@@ -108,30 +110,31 @@ internal sealed class LiveConversationReducer
         if(update.Operation==StreamOperation.Start)
         {
             ResetFinal();
+            _requireStart=false;
             _finalId=id;
             return true;
         }
         if(_finalId.Length==0)
         {
-            if(update.Operation is StreamOperation.Complete or
+            if(_requireStart || update.Operation is StreamOperation.Complete or
                 StreamOperation.Fail)return false;
             _finalId=id;
         }
         if(id!=_finalId)return false;
         if(update.Operation==StreamOperation.Complete)
         {
-            if(Completed || _finalLength==0)return false;
+            if(Completed || _finalLength==0 ||
+               Error is "stream_failed" or "text_limit_reached")return false;
             Completed=true;
             return true;
         }
         if(update.Operation==StreamOperation.Fail)
         {
-            if(Error=="stream_failed")return false;
+            if(Completed || Error=="stream_failed")return false;
             Error="stream_failed";
-            Completed=false;
             return true;
         }
-        if(Completed)return false;
+        if(Completed || Error=="stream_failed")return false;
         if(update.Operation is not (StreamOperation.Append or
             StreamOperation.Replace))return false;
         var append=update.Operation==StreamOperation.Append;
@@ -151,6 +154,7 @@ internal sealed class LiveConversationReducer
         _finalParts[update.PartIndex]=part;
         _finalLength+=(int)newLength-oldLength;
         _finalDirty=true;
+        if(Error=="text_limit_reached")Error="";
         return true;
     }
 
@@ -160,7 +164,10 @@ internal sealed class LiveConversationReducer
         if(!_activity.TryGetValue(id,out var activity))
         {
             if(update.Operation is StreamOperation.Complete or StreamOperation.Fail ||
-               _activityOrder.Count>=MaxActivityItems)return false;
+               _activityOrder.Count>=MaxActivityItems ||
+               update.Operation==StreamOperation.Append && update.Text.Length==0 ||
+               update.Operation is StreamOperation.Append or StreamOperation.Replace &&
+               update.Text.Length>MaxActivityChars)return false;
             activity=new Activity(update.Content,SafeTitle(update.Title));
             _activity[id]=activity;
             _activityOrder.Add(id);
