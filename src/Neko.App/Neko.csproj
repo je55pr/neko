@@ -9,6 +9,7 @@
     <RootNamespace>Neko</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="..\Neko.Core\Neko.Core.csproj" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
     <InternalsVisibleTo Include="Neko.App.Tests" />
   </ItemGroup>

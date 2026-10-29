@@ -22,3 +22,6 @@ TestResults/
 *.db-wal
 *.user.config
 *.secrets.json
+secrets.json
+**/secrets.json
+*.local.json

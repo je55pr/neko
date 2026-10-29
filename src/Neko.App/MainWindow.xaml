@@ -8,7 +8,7 @@
         Loaded="OnLoaded">
     <DockPanel Background="#0c1116">
         <Border DockPanel.Dock="Top" Background="#203b34" Padding="12,6">
-            <TextBlock Foreground="#c4f0e1" FontSize="13" Text="Offline shell preview • no account or network provider connected"/>
+            <TextBlock x:Name="ProviderStatus" Foreground="#c4f0e1" FontSize="13" Text="Checking provider configuration…"/>
         </Border>
         <browser:WebView2 x:Name="Browser" DefaultBackgroundColor="#0c1116"/>
     </DockPanel>
