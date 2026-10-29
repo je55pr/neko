@@ -3,11 +3,12 @@ using System.Text.Json;
 
 namespace Neko;
 
-internal sealed record OfflineBoard(string Id,string Name);
+internal sealed record OfflineBoard(string Id,string Name,List<string>? ConversationIds=null);
 
 internal sealed class OfflineBoardStore
 {
     internal const int MaxBoards=24;
+    internal const int MaxPanelsPerBoard=8;
     private sealed record SavedBoards(string ActiveBoardId,List<OfflineBoard> Boards);
     private readonly string _path;
     private List<OfflineBoard> _boards=[];
@@ -27,7 +28,11 @@ internal sealed class OfflineBoardStore
                 var data=JsonSerializer.Deserialize<SavedBoards>(File.ReadAllText(_path));
                 if(data?.Boards is {Count:>0 and <=MaxBoards} &&
                    data.Boards.All(x=>Guid.TryParse(x.Id,out _) &&
-                       !string.IsNullOrWhiteSpace(x.Name) && x.Name.Length<=60) &&
+                       !string.IsNullOrWhiteSpace(x.Name) && x.Name.Length<=60 &&
+                       (x.ConversationIds is null ||
+                        (x.ConversationIds.Count<=MaxPanelsPerBoard &&
+                         x.ConversationIds.All(id=>!string.IsNullOrWhiteSpace(id) && id.Length<=256) &&
+                         x.ConversationIds.Distinct(StringComparer.Ordinal).Count()==x.ConversationIds.Count))) &&
                    data.Boards.Select(x=>x.Id).Distinct(StringComparer.Ordinal).Count()==data.Boards.Count &&
                    data.Boards.Any(x=>x.Id==data.ActiveBoardId))
                 {
@@ -77,6 +82,34 @@ internal sealed class OfflineBoardStore
         Save();
         return true;
     }
+    public IReadOnlyList<string> ConversationsForActiveBoard()=>
+        _boards.First(x=>x.Id==ActiveBoardId).ConversationIds?.ToArray() ?? [];
+
+    public bool AddConversation(string id)
+    {
+        if(string.IsNullOrWhiteSpace(id)||id.Length>256)return false;
+        var index=_boards.FindIndex(x=>x.Id==ActiveBoardId);
+        if(index<0)return false;
+        var ids=_boards[index].ConversationIds?.ToList() ?? [];
+        if(ids.Contains(id,StringComparer.Ordinal))return true;
+        if(ids.Count>=MaxPanelsPerBoard)return false;
+        ids.Add(id);
+        _boards[index]=_boards[index] with {ConversationIds=ids};
+        Save();
+        return true;
+    }
+
+    public bool RemoveConversation(string id)
+    {
+        var index=_boards.FindIndex(x=>x.Id==ActiveBoardId);
+        if(index<0)return false;
+        var ids=_boards[index].ConversationIds?.ToList() ?? [];
+        if(!ids.Remove(id))return false;
+        _boards[index]=_boards[index] with {ConversationIds=ids};
+        Save();
+        return true;
+    }
+
     private void Save()
     {
         var directory=Path.GetDirectoryName(_path)!;
