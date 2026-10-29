@@ -44,6 +44,46 @@ public sealed class WebSessionProviderSafetyTests
     }
 
     [Fact]
+    public void RejectsCredentialedOrNonCanonicalConfiguredOrigins()
+    {
+        Assert.False(Config(url:"https://name:pass"+(char)64+"provider.example/").Valid);
+        Assert.False(Config(url:"https://provider.example/?session=value").Valid);
+        Assert.False(Config(url:"https://provider.example/#fragment").Valid);
+        Assert.False(Config(url:"https://provider.example:8443/").Valid);
+        Assert.False((Config() with {UserMessageSelector=string.Concat("user",(char)0,"message")}).Valid);
+        Assert.False((Config() with {ActiveGenerationSelector=""}).Valid);
+        Assert.False((Config() with
+            {ActiveGenerationSelector=new string('a',201)}).Valid);
+        Assert.True((Config() with
+            {ActiveGenerationSelector="button[aria-label='Stop']"}).Valid);
+    }
+
+    [Theory]
+    [InlineData(0,1,true,true)]
+    [InlineData(2,3,true,true)]
+    [InlineData(2,2,true,false)]
+    [InlineData(2,3,false,false)]
+    [InlineData(2,1,true,false)]
+    public void OnlyANewMatchingUserTurnCanAcknowledgeDelivery(
+        int oldCount,int newCount,bool latestMatches,bool expected)
+    {
+        Assert.Equal(expected,WebSessionConversationProvider.IsFreshUserTurn(
+            oldCount,newCount,latestMatches));
+    }
+
+    [Theory]
+    [InlineData(0,1,true)]
+    [InlineData(5,6,true)]
+    [InlineData(5,5,false)]
+    [InlineData(5,4,false)]
+    public void OldAssistantTurnsCannotBeReportedAsNewReplies(
+        int oldCount,int newCount,bool expected)
+    {
+        Assert.Equal(expected,WebSessionConversationProvider.IsFreshAssistantTurn(
+            oldCount,newCount));
+    }
+
+    [Fact]
     public void ExpectedPathChecksAreExact()
     {
         Assert.True(WebSessionConversationProvider.IsExpectedPath(
