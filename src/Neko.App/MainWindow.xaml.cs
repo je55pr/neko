@@ -12,27 +12,47 @@ public partial class MainWindow : Window
     private const string BridgeChannel="neko-ui-bridge-v1";
     private readonly string _token=Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
     private readonly OfflineBoardStore _boards;
-    private int _revision;
-    private bool _ready;
-    private string _newChatError="";
+    private readonly ConversationWorkspaceHost _workspace;
+    private readonly IConversationProvider _provider;
     private readonly string _profileDirectory;
+    private bool _ready;
+    private int _revision;
+
     public MainWindow()
     {
         InitializeComponent();
-        // This intentionally cannot use the frozen application's profile.
         _profileDirectory=Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "NekoOfflineShell");
         _boards=new OfflineBoardStore(_profileDirectory);
+        var configured=LocalProviderConfiguration.Load();
+        _provider=configured.Provider;
+        ProviderStatus.Text=configured.Status;
+        _workspace=new ConversationWorkspaceHost(_provider,_boards);
+        _workspace.Changed+=OnWorkspaceChanged;
+    }
+
+    private void OnWorkspaceChanged()
+    {
+        if(!_ready || Dispatcher.HasShutdownStarted)return;
+        _=Dispatcher.InvokeAsync(async () =>
+        {
+            try {await PublishAsync();}
+            catch(Exception) { /* Keep UI alive if the browser was closed. */ }
+        });
     }
 
     private async void OnLoaded(object sender,RoutedEventArgs e)
     {
-        try { await InitializeFrontendAsync(); }
+        try
+        {
+            await InitializeFrontendAsync();
+            await _workspace.RefreshLibraryAsync();
+            await _workspace.RestoreBoardAsync();
+        }
         catch(Exception ex)
         {
-            // Never display full browser exceptions or user data.
-            MessageBox.Show(this,"The offline frontend could not start. "+
+            MessageBox.Show(this,"The frontend could not start. "+
                 ex.GetType().Name,"Neko",MessageBoxButton.OK,MessageBoxImage.Warning);
         }
     }
@@ -63,7 +83,7 @@ public partial class MainWindow : Window
         web.WebResourceRequested+=(_,args)=>{
             if(IsLocalAddress(args.Request.Uri))return;
             args.Response=web.Environment.CreateWebResourceResponse(
-                new MemoryStream(),403,"Offline only","Content-Type: text/plain");
+                new MemoryStream(),403,"Native provider only","Content-Type: text/plain");
         };
         web.WebMessageReceived+=OnWebMessage;
         var source=File.ReadAllText(surface);
@@ -84,11 +104,9 @@ public partial class MainWindow : Window
             url.IsDefaultPort;
     }
 
-    private async void OnWebMessage(object? sender,
-        CoreWebView2WebMessageReceivedEventArgs args)
+    private async void OnWebMessage(object? sender,CoreWebView2WebMessageReceivedEventArgs args)
     {
-        if(Browser.CoreWebView2 is null)return;
-        if(!IsLocalAddress(args.Source))return;
+        if(Browser.CoreWebView2 is null || !IsLocalAddress(args.Source))return;
         var raw=args.WebMessageAsJson;
         if(raw.Length>34_000)return;
         try
@@ -99,31 +117,62 @@ public partial class MainWindow : Window
                ReadString(message,"channel")!=BridgeChannel ||
                ReadString(message,"token")!=_token)return;
             var action=ReadString(message,"action");
-            if(action is null)return;
-            var changed=action switch
+            var id=ReadString(message,"id");
+            var text=ReadString(message,"text");
+            switch(action)
             {
-                "ready"=>true,
-                "panel-board-create"=>_boards.Create(),
-                "panel-board-switch"=>_boards.Switch(ReadString(message,"id")),
-                "panel-board-rename"=>_boards.Rename(ReadString(message,"id"),
-                    ReadString(message,"name")),
-                "panel-board-delete"=>_boards.Delete(ReadString(message,"id")),
-                "panel-new-chat"=>MarkOfflineOnly(),
-                _=>false
-            };
-            if(action=="ready")_ready=true;
-            if(changed && _ready)await PublishAsync();
+                case "ready":
+                    _ready=true;await PublishAsync();break;
+                case "panel-board-create":
+                    _boards.Create();await PublishAsync();break;
+                case "panel-board-switch":
+                    if(_boards.Switch(id))
+                    {
+                        await _workspace.RestoreBoardAsync();
+                        await PublishAsync();
+                    }
+                    break;
+                case "panel-board-rename":
+                    if(_boards.Rename(id,ReadString(message,"name")))
+                        await PublishAsync();
+                    break;
+                case "panel-board-delete":
+                    if(_boards.Delete(id))await PublishAsync();
+                    break;
+                case "library-refresh":
+                    await _workspace.RefreshLibraryAsync();break;
+                case "panel-add":
+                    await _workspace.OpenPanelAsync(id);break;
+                case "panel-remove":
+                    _workspace.RemovePanel(id);break;
+                case "panel-refresh-history":
+                    await _workspace.RefreshPanelAsync(id);break;
+                case "panel-draft":
+                    _workspace.SetDraft(id,text);break;
+                case "panel-send":
+                    await _workspace.SendAsync(id,text);break;
+                case "panel-stop":
+                    await _workspace.StopAsync(id);break;
+                case "panel-verify-send":
+                    await _workspace.VerifyAsync(id);break;
+                case "panel-new-chat":
+                    if(ReadString(message,"boardId")==_boards.ActiveBoardId)
+                        await _workspace.CreateAsync(text);
+                    break;
+                case "panel-new-chat-reset":
+                    // Never clear uncertain delivery without authoritative evidence.
+                    break;
+                default:
+                    // Unsupported bridge actions are inert. Never translate an
+                    // unknown command into a provider operation.
+                    break;
+            }
         }
-        catch(JsonException) { /* Reject malformed bridge messages. */ }
-        catch(InvalidOperationException) { /* Reject invalid bridge state. */ }
-        catch(IOException) { /* Keep the shell open if local persistence fails. */ }
-        catch(UnauthorizedAccessException) { /* Report unavailable storage via the window. */ }
-    }
-
-    private bool MarkOfflineOnly()
-    {
-        _newChatError="No provider is connected. No message was sent.";
-        return true;
+        catch(JsonException) { }
+        catch(InvalidOperationException) { }
+        catch(IOException) { }
+        catch(UnauthorizedAccessException) { }
+        catch(OperationCanceledException) { }
     }
 
     private static string? ReadString(JsonElement value,string key)=>
@@ -132,28 +181,27 @@ public partial class MainWindow : Window
 
     private async Task PublishAsync()
     {
+        if(!_ready || Browser.CoreWebView2 is null)return;
         var snapshot=new
         {
             version=++_revision,
             canvasOnly=true,
             selectedId=(string?)null,
             tabs=Array.Empty<object>(),
-            library=new {revision=0,loading=false,
-                chats=Array.Empty<object>(),total=0,hasMore=false},
-            panelWorkspace=new
-            {
-                visible=true,
-                activeBoardId=_boards.ActiveBoardId,
-                boards=_boards.Boards.Select(x=>new {id=x.Id,name=x.Name,
-                    count=0,conversationIds=Array.Empty<string>()}).ToArray(),
-                panels=Array.Empty<object>(),
-                capacity=OfflineBoardStore.MaxBoards,
-                newChatError=_newChatError,
-                creatingChat=false
-            }
+            library=_workspace.Library(),
+            panelWorkspace=_workspace.Snapshot()
         };
-        var json=JsonSerializer.Serialize(snapshot);
+        var json=JsonSerializer.Serialize(snapshot,
+            new JsonSerializerOptions{PropertyNamingPolicy=JsonNamingPolicy.CamelCase});
         await Browser.CoreWebView2.ExecuteScriptAsync(
             "window.__nekoShell?.receive("+json+");");
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        _workspace.Changed-=OnWorkspaceChanged;
+        _workspace.Dispose();
+        (_provider as IDisposable)?.Dispose();
+        base.OnClosed(e);
     }
 }
