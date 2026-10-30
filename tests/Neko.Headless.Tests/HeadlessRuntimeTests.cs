@@ -286,6 +286,229 @@ public sealed class HeadlessRuntimeTests
         Assert.Equal("previous_creation_unresolved", rejected.Reason);
     }
 
+    [Fact]
+    public void StatusJsonPreservesExistingKeysAndUsesOnlyAdditiveFields()
+    {
+        var started = new DateTimeOffset(2026, 10, 30, 12, 0, 0, TimeSpan.Zero);
+        var status = new ConversationStatus(
+            "chat-1", "generating", started, started, 1234,
+            started.AddSeconds(1), 2, "Final.Append", false, null);
+        var options = new System.Text.Json.JsonSerializerOptions(
+            System.Text.Json.JsonSerializerDefaults.Web);
+        using var doc = System.Text.Json.JsonDocument.Parse(
+            System.Text.Json.JsonSerializer.Serialize(status, options));
+        var root = doc.RootElement;
+        Assert.Equal("chat-1", root.GetProperty("id").GetString());
+        Assert.Equal("generating", root.GetProperty("status").GetString());
+        Assert.Equal(started, root.GetProperty("updatedAt").GetDateTimeOffset());
+        Assert.Equal(started, root.GetProperty("startedAt").GetDateTimeOffset());
+        Assert.Equal(1234, root.GetProperty("elapsedMilliseconds").GetInt64());
+        Assert.Equal(2, root.GetProperty("publicEventCount").GetInt64());
+        Assert.Equal("Final.Append", root.GetProperty("lastPublicUpdateType").GetString());
+        Assert.False(root.GetProperty("isTerminal").GetBoolean());
+        Assert.Equal(System.Text.Json.JsonValueKind.Null,
+            root.GetProperty("terminalOperation").ValueKind);
+    }
+
+    [Fact]
+    public async Task ZeroPublicOutputStillReportsElapsedTimeWithoutClaimingActivity()
+    {
+        using var folder = new TemporaryDirectory();
+        var clock = new ManualTimeProvider();
+        var provider = new FakeProvider { DeferCompletion = true };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path), clock);
+
+        Assert.Equal(SendDisposition.Accepted,
+            (await runtime.CreateAsync("first", CancellationToken.None)).Disposition);
+        var initial = runtime.GetStatus("chat-1")!;
+        Assert.Equal("generating", initial.Status);
+        Assert.Equal(clock.GetUtcNow(), initial.StartedAt);
+        Assert.Equal(0, initial.ElapsedMilliseconds);
+        Assert.Equal(0, initial.PublicEventCount);
+        Assert.Null(initial.LastPublicUpdateAt);
+        Assert.Null(initial.LastPublicUpdateType);
+        Assert.False(initial.IsTerminal);
+        Assert.Null(initial.TerminalOperation);
+
+        clock.AdvanceMilliseconds(1250);
+        Assert.Equal(1250, runtime.GetStatus("chat-1")!.ElapsedMilliseconds);
+        Assert.Equal(0, runtime.GetStatus("chat-1")!.PublicEventCount);
+
+        provider.CompletePending();
+        await WaitForTerminal(runtime, "chat-1");
+        var completed = runtime.GetStatus("chat-1")!;
+        Assert.Equal("idle", completed.Status);
+        Assert.Equal(1, completed.PublicEventCount);
+        Assert.True(completed.IsTerminal);
+        Assert.Equal("Complete", completed.TerminalOperation);
+        Assert.Equal("Final.Complete", completed.LastPublicUpdateType);
+        Assert.Equal(1250, completed.ElapsedMilliseconds);
+
+        clock.AdvanceMilliseconds(5000);
+        Assert.Equal(1250, runtime.GetStatus("chat-1")!.ElapsedMilliseconds);
+    }
+
+    [Fact]
+    public async Task OnlyPublishedEventsContributeToContentFreeProgressMetadata()
+    {
+        using var folder = new TemporaryDirectory();
+        var clock = new ManualTimeProvider();
+        var provider = new FakeProvider { DeferCompletion = true };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path), clock);
+        await runtime.CreateAsync("first", CancellationToken.None);
+        const string sensitive = "do-not-expose-public-update-payload";
+        clock.AdvanceMilliseconds(400);
+        provider.Publish(new PublicConversationUpdate(
+            "reply", PublicUpdateKind.Progress, PublicUpdateOperation.Replace,
+            sensitive, Title: sensitive));
+        var one = await WaitForStatus(runtime, "chat-1",
+            status => status.PublicEventCount == 1);
+        Assert.Equal("Progress.Replace", one.LastPublicUpdateType);
+        Assert.Equal(clock.GetUtcNow(), one.LastPublicUpdateAt);
+        Assert.False(one.IsTerminal);
+        Assert.DoesNotContain(sensitive, System.Text.Json.JsonSerializer.Serialize(one));
+
+        clock.AdvanceMilliseconds(100);
+        provider.Publish(new PublicConversationUpdate(
+            "tool", PublicUpdateKind.Activity, PublicUpdateOperation.Start,
+            sensitive, Title: sensitive));
+        var two = await WaitForStatus(runtime, "chat-1",
+            status => status.PublicEventCount == 2);
+        Assert.Equal("Activity.Start", two.LastPublicUpdateType);
+        Assert.Equal(clock.GetUtcNow(), two.LastPublicUpdateAt);
+        Assert.DoesNotContain(sensitive, System.Text.Json.JsonSerializer.Serialize(two));
+
+        provider.CompletePending();
+        await WaitForTerminal(runtime, "chat-1");
+        var final = runtime.GetStatus("chat-1")!;
+        Assert.Equal(3, final.PublicEventCount);
+        Assert.Equal("Final.Complete", final.LastPublicUpdateType);
+        Assert.Equal("Complete", final.TerminalOperation);
+        Assert.Equal(500, final.ElapsedMilliseconds);
+    }
+
+    [Fact]
+    public async Task FollowUpGetsNewZeroedMetricsEvenWhileSubmissionIsPending()
+    {
+        using var folder = new TemporaryDirectory();
+        var clock = new ManualTimeProvider();
+        var provider = new FakeProvider { DeferCompletion = true };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path), clock);
+        await runtime.CreateAsync("first", CancellationToken.None);
+        provider.Publish(new PublicConversationUpdate(
+            "reply", PublicUpdateKind.Final, PublicUpdateOperation.Append, "first"));
+        await WaitForStatus(runtime, "chat-1", s => s.PublicEventCount == 1);
+        provider.CompletePending();
+        await WaitForTerminal(runtime, "chat-1");
+        var old = runtime.GetStatus("chat-1")!;
+        Assert.Equal(2, old.PublicEventCount);
+        Assert.True(old.IsTerminal);
+
+        clock.AdvanceMilliseconds(2000);
+        var pending = new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        provider.PendingSend = pending;
+        var send = runtime.SendAsync("chat-1", "second", CancellationToken.None);
+        var sending = await WaitForStatus(runtime, "chat-1",
+            s => s.Status == "sending");
+        Assert.Equal(clock.GetUtcNow(), sending.StartedAt);
+        Assert.Equal(0, sending.ElapsedMilliseconds);
+        Assert.Equal(0, sending.PublicEventCount);
+        Assert.Null(sending.LastPublicUpdateAt);
+        Assert.Null(sending.LastPublicUpdateType);
+        Assert.False(sending.IsTerminal);
+        Assert.Null(sending.TerminalOperation);
+
+        pending.SetResult(new SendReceipt(SendDisposition.Accepted));
+        Assert.Equal(SendDisposition.Accepted, (await send).Disposition);
+        provider.Publish(new PublicConversationUpdate(
+            "reply2", PublicUpdateKind.Final, PublicUpdateOperation.Append, "second"));
+        var updated = await WaitForStatus(runtime, "chat-1",
+            s => s.PublicEventCount == 1);
+        Assert.Equal("Final.Append", updated.LastPublicUpdateType);
+        Assert.False(updated.IsTerminal);
+        provider.CompletePending();
+        await WaitForTerminal(runtime, "chat-1");
+        Assert.Equal(2, runtime.GetStatus("chat-1")!.PublicEventCount);
+    }
+
+    [Fact]
+    public async Task UnexpectedStreamEndIsTerminalFailButNotConfirmedSuccess()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider { DeferCompletion = true };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path));
+        await runtime.CreateAsync("first", CancellationToken.None);
+        provider.EndPublicStream();
+        var state = await WaitForStatus(runtime, "chat-1",
+            s => s.IsTerminal == true);
+        Assert.Equal("uncertain", state.Status);
+        Assert.Equal("Fail", state.TerminalOperation);
+        Assert.Equal("Final.Fail", state.LastPublicUpdateType);
+        Assert.Equal(1, state.PublicEventCount);
+    }
+
+    [Fact]
+    public async Task RestartDoesNotMisrepresentUnavailableEventMetricsAsZero()
+    {
+        using var folder = new TemporaryDirectory();
+        using (var first = new ChatRuntime(
+            new ScopedConversationProvider(new FakeProvider(), "scope-a"),
+            new ChatJournal(folder.Path)))
+        {
+            await first.CreateAsync("first", CancellationToken.None);
+            await WaitForTerminal(first, "chat-1");
+            Assert.NotNull(first.GetStatus("chat-1")!.StartedAt);
+        }
+        using var restarted = new ChatRuntime(
+            new ScopedConversationProvider(new FakeProvider(), "scope-a"),
+            new ChatJournal(folder.Path));
+        var state = restarted.GetStatus("chat-1")!;
+        Assert.Equal("idle", state.Status);
+        Assert.Null(state.StartedAt);
+        Assert.Null(state.ElapsedMilliseconds);
+        Assert.Null(state.PublicEventCount);
+        Assert.Null(state.LastPublicUpdateAt);
+        Assert.Null(state.LastPublicUpdateType);
+        Assert.Null(state.IsTerminal);
+        Assert.Null(state.TerminalOperation);
+        Assert.Null(restarted.GetStatus("unknown"));
+    }
+
+    private static async Task<ConversationStatus> WaitForStatus(
+        ChatRuntime runtime, string id, Func<ConversationStatus, bool> predicate)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (true)
+        {
+            var state = runtime.GetStatus(id)!;
+            if (predicate(state)) return state;
+            await Task.Delay(10, timeout.Token);
+        }
+    }
+
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private long _milliseconds;
+        private static readonly DateTimeOffset Epoch =
+            new(2026, 10, 30, 0, 0, 0, TimeSpan.Zero);
+
+        public override long TimestampFrequency => 1000;
+        public override long GetTimestamp() => Interlocked.Read(ref _milliseconds);
+        public override DateTimeOffset GetUtcNow() =>
+            Epoch.AddMilliseconds(Interlocked.Read(ref _milliseconds));
+        public void AdvanceMilliseconds(long milliseconds) =>
+            Interlocked.Add(ref _milliseconds, milliseconds);
+    }
+
     private static async Task WaitForTerminal(ChatRuntime runtime, string id)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -307,8 +530,11 @@ public sealed class HeadlessRuntimeTests
         public int StopCalls;
         public bool FailNextRead;
         public TaskCompletionSource<SendReceipt>? PendingSend;
+        public void Publish(PublicConversationUpdate update) =>
+            _events.Writer.TryWrite(update);
+        public void EndPublicStream() => _events.Writer.TryComplete();
         public void CompletePending() =>
-            _events.Writer.TryWrite(new PublicConversationUpdate(
+            Publish(new PublicConversationUpdate(
                 Guid.NewGuid().ToString("N"), PublicUpdateKind.Final,
                 PublicUpdateOperation.Complete));
         public void InjectMessage(string text) =>

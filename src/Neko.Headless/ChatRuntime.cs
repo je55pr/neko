@@ -10,6 +10,7 @@ namespace Neko.Headless;
 internal sealed class ChatRuntime : IDisposable
 {
     private readonly IConversationProvider _provider;
+    private readonly TimeProvider _timeProvider;
     private readonly ConversationCommandCoordinator _commands;
     private readonly ChatJournal _journal;
     private readonly SemaphoreSlim _creationGate = new(1, 1);
@@ -18,9 +19,11 @@ internal sealed class ChatRuntime : IDisposable
     private readonly ConcurrentDictionary<string, Task> _pumps = new();
     private readonly CancellationTokenSource _lifetime = new();
 
-    public ChatRuntime(IConversationProvider provider, ChatJournal journal)
+    public ChatRuntime(IConversationProvider provider, ChatJournal journal,
+        TimeProvider? timeProvider = null)
     {
         _provider = provider;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _commands = new ConversationCommandCoordinator(provider);
         _journal = journal;
         // The previous process may have died after a remote submission. Mark
@@ -37,6 +40,29 @@ internal sealed class ChatRuntime : IDisposable
 
     public IReadOnlyList<ChatRecord> List() => _journal.List();
     public ChatRecord? Get(string id) => _journal.Get(id);
+
+    /// <summary>
+    /// Read local public-event metrics only. A turn token prevents pairing a
+    /// previous journal snapshot with a newer feed during concurrent follow-ups.
+    /// Missing metrics mean not observed in this process, not zero events.
+    /// </summary>
+    public ConversationStatus? GetStatus(string id)
+    {
+        var record = _journal.Get(id);
+        if (record is null) return null;
+        ConversationProgressSnapshot? progress = null;
+        if (record.ProgressTurnId is not null &&
+            _updates.TryGetValue(id, out var feed) &&
+            feed.TurnId == record.ProgressTurnId)
+            progress = feed.Snapshot();
+
+        return new ConversationStatus(
+            record.Id, record.Status, record.UpdatedAt,
+            progress?.StartedAt, progress?.ElapsedMilliseconds,
+            progress?.LastPublicUpdateAt, progress?.PublicEventCount,
+            progress?.LastPublicUpdateType, progress?.IsTerminal,
+            progress?.TerminalOperation);
+    }
 
     public async Task<SendReceipt> CreateAsync(string text, CancellationToken cancellation)
     {
@@ -58,9 +84,11 @@ internal sealed class ChatRuntime : IDisposable
             else if (receipt.Disposition == SendDisposition.Accepted &&
                      !string.IsNullOrWhiteSpace(receipt.ConversationId))
             {
-                _journal.Set(new ChatRecord(receipt.ConversationId, "generating"));
+                var feed = new ConversationUpdateFeed(_timeProvider);
+                _journal.Set(new ChatRecord(receipt.ConversationId, "generating",
+                    ProgressTurnId: feed.TurnId));
                 _journal.ClearCreation();
-                StartPump(receipt.ConversationId);
+                StartPump(receipt.ConversationId, feed);
             }
             // An unconfirmed creation (including a missing conversation ID)
             // retains the on-disk lock. Never blindly create a duplicate.
@@ -101,13 +129,14 @@ internal sealed class ChatRuntime : IDisposable
             }
             // Bind the new stream before making "sending" observable, so
             // watchers cannot replay a terminal event from the previous turn.
-            var feed=new ConversationUpdateFeed();
+            var feed=new ConversationUpdateFeed(_timeProvider);
             _updates.TryGetValue(id,out var previousFeed);
             _updates[id]=feed;
             try
             {
                 _journal.Update(id, latest => latest with {
-                    Status="sending",History=upstream
+                    Status="sending",History=upstream,
+                    ProgressTurnId=feed.TurnId
                 });
             }
             catch
@@ -217,9 +246,8 @@ internal sealed class ChatRuntime : IDisposable
             yield return update;
     }
 
-    private void StartPump(string id,ConversationUpdateFeed? currentFeed=null)
+    private void StartPump(string id, ConversationUpdateFeed feed)
     {
-        var feed = currentFeed??new ConversationUpdateFeed();
         _updates[id] = feed;
         _pumps[id] = Task.Run(async () =>
         {

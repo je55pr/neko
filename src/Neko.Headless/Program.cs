@@ -73,9 +73,8 @@ try
         })));
     app.MapGet("/conversations/{id}/status", (string id) =>
     {
-        var record = runtime.Get(id);
-        return record is null ? Results.NotFound() :
-            Results.Json(new { record.Id, record.Status, record.UpdatedAt });
+        var status = runtime.GetStatus(id);
+        return status is null ? Results.NotFound() : Results.Json(status);
     });
     app.MapGet("/conversations/{id}", async (string id, CancellationToken cancellation) =>
     {

@@ -7,7 +7,7 @@ namespace Neko.Headless;
 
 internal sealed record ChatRecord(
     string Id, string Status, VisibleConversation? History = null,
-    DateTimeOffset UpdatedAt = default);
+    DateTimeOffset UpdatedAt = default, string? ProgressTurnId = null);
 
 /// <summary>Local checkpoint data. Never stored in the repository.</summary>
 internal sealed class ChatJournal
