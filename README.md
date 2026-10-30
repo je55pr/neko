@@ -48,6 +48,8 @@ The server binds to `127.0.0.1` on the configured port. Every endpoint requires 
 | `/conversations/{id}/events` | GET | Server-sent incremental text updates |
 | `/conversations/{id}/stop` | POST | Returns `Unsupported` / `stop_not_supported` without changing conversation state; remote stop is **not implemented** |
 
+Create/send JSON receipts (also printed unchanged by the CLI) now include optional `retryable` and `retryAfterSeconds` fields. `retryable: true` means the particular request was definitively rejected and a **new, explicitly requested** guarded attempt is safe; it does not promise eventual success. `retryAfterSeconds` is the bounded, rounded-up **remaining local provider cooldown** when known, not a guarantee of availability. Null means unknown or inapplicable, **not** retry immediately. `Accepted` and `Uncertain` must never be automatically resent, regardless of those fields. Existing `disposition`, `reason`, and operation state meanings are unchanged.
+
 ## Architecture and reliability
 
 The single WebView2 page supplies the signed-in execution environment. The adapter invokes the site's existing submission function with explicit conversation, parent and scope values. It does not navigate to individual conversations or interact with composer buttons. Read-only network observation captures live response updates. Server history verifies completion.

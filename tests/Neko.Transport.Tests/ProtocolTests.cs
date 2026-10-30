@@ -174,6 +174,20 @@ public sealed class ProtocolTests
 
 
     [Fact]
+    public void RemainingCooldownIsRoundedBoundedAndNeverInventedAfterExpiry()
+    {
+        var now=new DateTimeOffset(2026,10,30,12,0,0,TimeSpan.Zero);
+        Assert.Equal(90,ProjectProvider.RemainingCooldownSeconds(now.AddSeconds(90),now));
+        Assert.Equal(1,ProjectProvider.RemainingCooldownSeconds(now.AddMilliseconds(1),now));
+        Assert.Equal(600,ProjectProvider.RemainingCooldownSeconds(now.AddSeconds(900),now));
+        Assert.Null(ProjectProvider.RemainingCooldownSeconds(now,now));
+        Assert.Null(ProjectProvider.RemainingCooldownSeconds(now.AddSeconds(-2),now));
+        // The browser projects seconds or RFC date Retry-After without exposing headers.
+        Assert.Contains("Date.parse(trimmed)",BrowserSession.ReadScript,StringComparison.Ordinal);
+        Assert.Contains("Math.min(600,Number(trimmed))",BrowserSession.ReadScript,StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void RepeatedRateLimitsNeverShortenAnExistingCooldown()
     {
         var now=new DateTimeOffset(2026,10,30,12,0,0,TimeSpan.Zero);
