@@ -110,6 +110,34 @@ public sealed class ProtocolTests
     }
 
     [Fact]
+    public void PollingDoesNotCompleteOnFinishedIntermediateAssistantMessages()
+    {
+        var intermediate=Guid.NewGuid().ToString("D");
+        var final=Guid.NewGuid().ToString("D");
+
+        // A tool or activity message may have finished while the turn
+        // is still running, and can have no public text at all.
+        Assert.False(ProjectProvider.IsVerifiedVisibleCompletion(
+            intermediate,"finished_successfully","",intermediate,"IN_PROGRESS"));
+        Assert.False(ProjectProvider.IsVerifiedVisibleCompletion(
+            intermediate,"finished_successfully","intermediate text",
+            intermediate,"IN_PROGRESS"));
+        Assert.False(ProjectProvider.IsVerifiedVisibleCompletion(
+            intermediate,"finished_successfully","intermediate text",
+            final,"COMPLETE"));
+
+        // A completed stream is not sufficient if the visible answer is
+        // still absent or the assistant message is not actually finished.
+        Assert.False(ProjectProvider.IsVerifiedVisibleCompletion(
+            final,"finished_successfully","",final,"COMPLETE"));
+        Assert.False(ProjectProvider.IsVerifiedVisibleCompletion(
+            final,"in_progress","answer",final,"COMPLETE"));
+
+        Assert.True(ProjectProvider.IsVerifiedVisibleCompletion(
+            final,"finished_successfully","answer",final,"COMPLETE"));
+    }
+
+    [Fact]
     public void ParserAcceptsLargeChunksOfIndividuallyBoundedEvents()
     {
         var parser=new SseEventParser();

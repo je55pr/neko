@@ -387,6 +387,18 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             append && published.Length>0?newText[published.Length..]:newText);
     }
 
+    // A finished assistant message can be an intermediate tool/activity step.
+    // Only the completed remote stream and its current, visible assistant
+    // message together establish that a turn has finished successfully.
+    internal static bool IsVerifiedVisibleCompletion(string assistantId,
+        string assistantStatus,string assistantText,string currentNode,
+        string streamState) =>
+        !string.IsNullOrWhiteSpace(assistantId) &&
+        string.Equals(assistantId,currentNode,StringComparison.OrdinalIgnoreCase) &&
+        assistantStatus=="finished_successfully" &&
+        !string.IsNullOrWhiteSpace(assistantText) &&
+        streamState=="COMPLETE";
+
     private void StartPolling(string id,string previousAssistant,
         NativeLiveStreamHub.Attempt? capture=null)
     {
@@ -417,7 +429,33 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                        snapshot.LastAssistantId==previousAssistant ||
                        string.IsNullOrWhiteSpace(snapshot.LastAssistantId))
                         continue;
-                    var finished=snapshot.LastAssistantStatus=="finished_successfully";
+                    var finished=false;
+                    if(snapshot.LastAssistantStatus=="finished_successfully" &&
+                       !string.IsNullOrWhiteSpace(snapshot.LastAssistantText))
+                    {
+                        // The history endpoint can contain already-finished
+                        // intermediate assistant messages while the response
+                        // is still running. Check the independent stream state
+                        // before publishing a terminal receipt.
+                        try
+                        {
+                            using var state=await _browser.ReadAsync(
+                                _settings.Format(_settings.StreamStatusPath,"id",id),
+                                "status");
+                            var root=state.RootElement;
+                            var streamState=root.TryGetProperty("ok",out var ok) &&
+                                ok.ValueKind==JsonValueKind.True &&
+                                root.TryGetProperty("streamState",out var value) &&
+                                value.ValueKind==JsonValueKind.String
+                                    ?value.GetString()??"":"";
+                            finished=IsVerifiedVisibleCompletion(
+                                snapshot.LastAssistantId,snapshot.LastAssistantStatus,
+                                snapshot.LastAssistantText,snapshot.CurrentNode,streamState);
+                        }
+                        catch(OperationCanceledException) when(deadline.IsCancellationRequested)
+                        { break; }
+                        catch(Exception) { /* Status unavailable; keep observing. */ }
+                    }
                     // Reconcile at completion even if the latest snapshot
                     // text was already observed while capture was active.
                     if(snapshot.LastAssistantText!=last || finished)
@@ -426,8 +464,9 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                         // CDP emits genuine streaming updates. If capture is
                         // running, avoid interleaving stale polling snapshots.
                         // A final authoritative snapshot always wins.
-                        if(finished || capture is null || !capture.Capturing ||
-                           capture.StreamEnded)
+                        if(!string.IsNullOrWhiteSpace(last) &&
+                           (finished || capture is null || !capture.Capturing ||
+                            capture.StreamEnded))
                         {
                             var baseline=capture is not null &&
                                 capture.LastPublished.Length>0?
