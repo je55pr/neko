@@ -15,6 +15,9 @@ internal sealed class DemoProvider : IScopedConversationProvider
     private readonly Dictionary<string, List<VisibleConversationMessage>> _history = [];
     private readonly Dictionary<string, Channel<PublicConversationUpdate>> _events = [];
 
+    public Task<bool> BelongsToScopeAsync(string scope, string id, CancellationToken cancellation) =>
+        Task.FromResult(!string.IsNullOrWhiteSpace(scope) && _history.ContainsKey(id));
+
     public Task<SendReceipt> CreateInScopeAsync(
         string scope, PreparedOutboundMessage submission, CancellationToken cancellation)
     {

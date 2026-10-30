@@ -74,6 +74,64 @@ public sealed class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task UncertainStopBlocksFurtherSendsAndSurvivesRestart()
+    {
+        using var folder = new TemporaryDirectory();
+        var inner = new FakeProvider { DeferCompletion = true, StopUncertain = true };
+        using (var first = new ChatRuntime(
+            new ScopedConversationProvider(inner, "scope-a"), new ChatJournal(folder.Path)))
+        {
+            Assert.Equal(SendDisposition.Accepted,
+                (await first.CreateAsync("first", CancellationToken.None)).Disposition);
+            var stop = await first.StopAsync("chat-1", CancellationToken.None);
+            Assert.Equal(StopDisposition.Uncertain, stop.Disposition);
+            Assert.Equal("stop_uncertain", Assert.Single(first.List()).Status);
+            Assert.Equal(SendDisposition.Rejected,
+                (await first.SendAsync("chat-1", "not safe", CancellationToken.None)).Disposition);
+        }
+        using var second = new ChatRuntime(
+            new ScopedConversationProvider(new FakeProvider(), "scope-a"), new ChatJournal(folder.Path));
+        Assert.Equal(SendDisposition.Rejected,
+            (await second.SendAsync("chat-1", "still not safe", CancellationToken.None)).Disposition);
+    }
+
+    [Fact]
+    public void HistoryUpdatePreservesMoreRecentStatus()
+    {
+        using var folder = new TemporaryDirectory();
+        var journal = new ChatJournal(folder.Path);
+        journal.Set(new ChatRecord("chat", "idle"));
+        var prior = journal.Get("chat")!;
+        journal.Set(prior with { Status = "sending" });
+        journal.Update("chat", latest => latest with {
+            History = new VisibleConversation("chat", "title", [])
+        });
+        Assert.Equal("sending", journal.Get("chat")?.Status);
+    }
+
+    [Fact]
+    public void RestartReclassifiesInterruptedOperationsAsUncertain()
+    {
+        using var folder = new TemporaryDirectory();
+        var journal = new ChatJournal(folder.Path);
+        journal.Set(new ChatRecord("interrupted", "generating"));
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(new FakeProvider(), "scope-a"), journal);
+        Assert.Equal("uncertain", Assert.Single(runtime.List()).Status);
+    }
+
+    [Fact]
+    public void JournalRejectsTwoHostsUsingTheSameDirectory()
+    {
+        using var folder = new TemporaryDirectory();
+        var journal = new ChatJournal(folder.Path);
+        using (journal.AcquireHostLease())
+            Assert.Throws<InvalidOperationException>(() => journal.AcquireHostLease());
+        using var second = journal.AcquireHostLease();
+        Assert.NotNull(second);
+    }
+
+    [Fact]
     public async Task UncertainCreationBlocksFurtherCreationAcrossRestart()
     {
         using var folder = new TemporaryDirectory();
@@ -105,8 +163,12 @@ public sealed class HeadlessRuntimeTests
         public int UnscopedCreations;
         public bool UncertainNextSend;
         public bool UncertainNextCreation;
+        public bool DeferCompletion;
+        public bool StopUncertain;
         private readonly Channel<PublicConversationUpdate> _events = Channel.CreateUnbounded<PublicConversationUpdate>();
         private readonly List<VisibleConversationMessage> _messages = [];
+        public Task<bool> BelongsToScopeAsync(string scope, string id, CancellationToken cancellation) =>
+            Task.FromResult(scope == "scope-a" && id == "chat-1" && _messages.Count > 0);
         public Task<SendReceipt> CreateInScopeAsync(
             string scope, PreparedOutboundMessage message, CancellationToken cancellation)
         {
@@ -134,8 +196,9 @@ public sealed class HeadlessRuntimeTests
                 VisibleMessageRole.User, text));
             _messages.Add(new VisibleConversationMessage(Guid.NewGuid().ToString("N"),
                 VisibleMessageRole.Assistant, "reply " + text));
-            _events.Writer.TryWrite(new PublicConversationUpdate(
-                Guid.NewGuid().ToString("N"), PublicUpdateKind.Final, PublicUpdateOperation.Complete));
+            if (!DeferCompletion)
+                _events.Writer.TryWrite(new PublicConversationUpdate(
+                    Guid.NewGuid().ToString("N"), PublicUpdateKind.Final, PublicUpdateOperation.Complete));
         }
         public async IAsyncEnumerable<PublicConversationUpdate> WatchAsync(
             string id, [EnumeratorCancellation] CancellationToken cancellation)
@@ -153,7 +216,8 @@ public sealed class HeadlessRuntimeTests
         public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(CancellationToken cancellation) =>
             Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
         public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
-            Task.FromResult(new StopReceipt(StopDisposition.NotActive));
+            Task.FromResult(new StopReceipt(StopUncertain
+                ? StopDisposition.Uncertain : StopDisposition.NotActive));
     }
 
     private sealed class TemporaryDirectory : IDisposable

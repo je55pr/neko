@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Threading.Channels;
 using Neko;
 
 namespace Neko.Headless;
@@ -15,7 +14,8 @@ internal sealed class ChatRuntime : IDisposable
     private readonly ChatJournal _journal;
     private readonly SemaphoreSlim _creationGate = new(1, 1);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _gates = new();
-    private readonly ConcurrentDictionary<string, Channel<PublicConversationUpdate>> _updates = new();
+    private readonly ConcurrentDictionary<string, ConversationUpdateFeed> _updates = new();
+    private readonly ConcurrentDictionary<string, Task> _pumps = new();
     private readonly CancellationTokenSource _lifetime = new();
 
     public ChatRuntime(IConversationProvider provider, ChatJournal journal)
@@ -23,6 +23,11 @@ internal sealed class ChatRuntime : IDisposable
         _provider = provider;
         _commands = new ConversationCommandCoordinator(provider);
         _journal = journal;
+        // The previous process may have died after a remote submission. Mark
+        // in-flight operations unresolved until the provider can reconcile them.
+        foreach (var record in _journal.List())
+            if (record.Status is "sending" or "generating" or "stopping")
+                _journal.Update(record.Id, current => current with { Status = "uncertain" });
     }
 
     public IReadOnlyList<ChatRecord> List() => _journal.List();
@@ -96,7 +101,7 @@ internal sealed class ChatRuntime : IDisposable
             switch (receipt.Disposition)
             {
                 case SendDisposition.Rejected:
-                    _journal.Set(current with { Status = "idle" });
+                    _journal.Update(id, latest => latest with { Status = "idle" });
                     break;
                 case SendDisposition.Accepted:
                     _journal.Set(current with { Status = "generating" });
@@ -111,10 +116,33 @@ internal sealed class ChatRuntime : IDisposable
         finally { gate.Release(); }
     }
 
-    public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
-        _journal.Get(id) is null
-            ? Task.FromResult(new StopReceipt(StopDisposition.NotActive, "unknown_conversation"))
-            : _commands.StopAsync(id, cancellation);
+    public async Task<StopReceipt> StopAsync(string id, CancellationToken cancellation)
+    {
+        var gate = _gates.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellation);
+        try
+        {
+            var current = _journal.Get(id);
+            if (current is null)
+                return new StopReceipt(StopDisposition.NotActive, "unknown_conversation");
+            if (current.Status != "generating")
+                return new StopReceipt(StopDisposition.NotActive, "conversation_not_generating");
+
+            _journal.Update(id, latest => latest with { Status = "stopping" });
+            StopReceipt receipt;
+            try { receipt = await _commands.StopAsync(id, cancellation); }
+            catch (Exception) { receipt = new StopReceipt(StopDisposition.Uncertain, "stop_unknown"); }
+
+            if (receipt.Disposition == StopDisposition.NotActive)
+                _journal.Update(id, latest => latest.Status == "stopping"
+                    ? latest with { Status = "generating" } : latest);
+            else if (receipt.Disposition == StopDisposition.Uncertain)
+                _journal.Update(id, latest => latest with { Status = "stop_uncertain" });
+            // A requested stop remains pending until an authoritative terminal event.
+            return receipt;
+        }
+        finally { gate.Release(); }
+    }
 
     public async Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation)
     {
@@ -125,7 +153,7 @@ internal sealed class ChatRuntime : IDisposable
             var current = await _provider.ReadAsync(id, cancellation);
             if (current is not null)
             {
-                _journal.Set(record with { History = current });
+                _journal.Update(id, latest => latest with { History = current });
                 return current;
             }
         }
@@ -138,23 +166,24 @@ internal sealed class ChatRuntime : IDisposable
         string id, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellation)
     {
         if (_journal.Get(id) is null) yield break;
-        var channel = _updates.GetOrAdd(id, _ => Channel.CreateUnbounded<PublicConversationUpdate>(
-            new UnboundedChannelOptions { SingleReader = true, SingleWriter = true }));
-        await foreach (var update in channel.Reader.ReadAllAsync(cancellation))
+        if (!_updates.TryGetValue(id, out var feed))
         {
-            yield return update;
-            if (update.Kind == PublicUpdateKind.Final &&
-                update.Operation is PublicUpdateOperation.Complete or PublicUpdateOperation.Fail)
-                yield break;
+            var record = _journal.Get(id);
+            yield return new PublicConversationUpdate(
+                id, PublicUpdateKind.Final,
+                record?.Status == "idle"
+                    ? PublicUpdateOperation.Complete : PublicUpdateOperation.Fail);
+            yield break;
         }
+        await foreach (var update in feed.WatchAsync(cancellation))
+            yield return update;
     }
 
     private void StartPump(string id)
     {
-        var channel = Channel.CreateUnbounded<PublicConversationUpdate>(
-            new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
-        _updates[id] = channel;
-        _ = Task.Run(async () =>
+        var feed = new ConversationUpdateFeed();
+        _updates[id] = feed;
+        _pumps[id] = Task.Run(async () =>
         {
             var terminal = false;
             try
@@ -164,22 +193,18 @@ internal sealed class ChatRuntime : IDisposable
                     if (update.Kind != PublicUpdateKind.Final ||
                         update.Operation is not (PublicUpdateOperation.Complete or PublicUpdateOperation.Fail))
                     {
-                        channel.Writer.TryWrite(update);
+                        feed.Publish(update);
                         continue;
                     }
                     terminal = true;
-                    var record = _journal.Get(id);
-                    if (record is not null)
-                    {
-                        VisibleConversation? snapshot = null;
-                        try { snapshot = await _provider.ReadAsync(id, _lifetime.Token); }
-                        catch (Exception) { /* Keep existing snapshot. */ }
-                        _journal.Set(record with {
-                            Status = update.Operation == PublicUpdateOperation.Complete ? "idle" : "uncertain",
-                            History = snapshot ?? record.History
-                        });
-                    }
-                    channel.Writer.TryWrite(update);
+                    VisibleConversation? snapshot = null;
+                    try { snapshot = await _provider.ReadAsync(id, _lifetime.Token); }
+                    catch (Exception) { /* Keep existing snapshot. */ }
+                    _journal.Update(id, latest => latest with {
+                        Status = update.Operation == PublicUpdateOperation.Complete ? "idle" : "uncertain",
+                        History = snapshot ?? latest.History
+                    });
+                    feed.Publish(update);
                     break;
                 }
             }
@@ -188,13 +213,11 @@ internal sealed class ChatRuntime : IDisposable
             {
                 if (!terminal)
                 {
-                    var current = _journal.Get(id);
-                    if (current is not null)
-                        _journal.Set(current with { Status = "uncertain" });
-                    channel.Writer.TryWrite(new PublicConversationUpdate(
+                    _journal.Update(id, current => current with { Status = "uncertain" });
+                    feed.Publish(new PublicConversationUpdate(
                         Guid.NewGuid().ToString("D"), PublicUpdateKind.Final, PublicUpdateOperation.Fail));
                 }
-                channel.Writer.TryComplete();
+                // The terminal event also releases late subscribers.
             }
         });
     }
@@ -202,6 +225,13 @@ internal sealed class ChatRuntime : IDisposable
     public void Dispose()
     {
         _lifetime.Cancel();
+        try
+        {
+            // Do not release provider resources while a stream consumer is still
+            // accessing them. A noncooperative adapter has a bounded grace period.
+            Task.WhenAll(_pumps.Values).Wait(TimeSpan.FromSeconds(5));
+        }
+        catch (AggregateException) { /* Cancellation is expected on shutdown. */ }
         _lifetime.Dispose();
         if (_provider is IDisposable disposable) disposable.Dispose();
     }

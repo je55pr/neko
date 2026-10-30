@@ -8,6 +8,13 @@ public interface IScopedConversationProvider : IConversationProvider
 {
     Task<SendReceipt> CreateInScopeAsync(
         string scope, PreparedOutboundMessage submission, CancellationToken cancellation);
+
+    /// <summary>
+    /// Must use authoritative provider state, not the requested scope or a local
+    /// cache. False/unknown prevents follow-up sends. Never guess membership.
+    /// </summary>
+    Task<bool> BelongsToScopeAsync(
+        string scope, string conversationId, CancellationToken cancellation);
 }
 
 /// <summary>
@@ -53,23 +60,47 @@ public sealed class ScopedConversationProvider :
             : CreatePreparedAsync(prepared.Message, cancellation);
     }
 
-    public Task<SendReceipt> CreatePreparedAsync(
+    public async Task<SendReceipt> CreatePreparedAsync(
         PreparedOutboundMessage submission, CancellationToken cancellation)
     {
         if (!OutboundMessagePreparation.IsValid(submission) || !submission.CreatesConversation)
-            return Task.FromResult(new SendReceipt(SendDisposition.Rejected, "invalid_submission"));
-        return _provider.CreateInScopeAsync(_scope, submission, cancellation);
+            return new SendReceipt(SendDisposition.Rejected, "invalid_submission");
+
+        var receipt = await _provider.CreateInScopeAsync(_scope, submission, cancellation);
+        if (receipt.Disposition != SendDisposition.Accepted) return receipt;
+        if (string.IsNullOrWhiteSpace(receipt.ConversationId))
+            return new SendReceipt(SendDisposition.Uncertain, "conversation_id_unknown");
+
+        return await VerifyAsync(receipt.ConversationId, cancellation)
+            ? receipt : new SendReceipt(SendDisposition.Uncertain, "scope_not_verified",
+                ConversationId: receipt.ConversationId);
     }
 
-    public Task<SendReceipt> SendAsync(string conversationId, string text, CancellationToken cancellation) =>
-        _provider.SendAsync(conversationId, text, cancellation);
-    public Task<SendReceipt> SendPreparedAsync(PreparedOutboundMessage submission, CancellationToken cancellation)
+    public Task<SendReceipt> SendAsync(string conversationId, string text, CancellationToken cancellation)
+    {
+        var prepared = OutboundMessagePreparation.ForExisting(conversationId, text);
+        return prepared.Message is null
+            ? Task.FromResult(new SendReceipt(SendDisposition.Rejected, prepared.ErrorCode))
+            : SendPreparedAsync(prepared.Message, cancellation);
+    }
+
+    public async Task<SendReceipt> SendPreparedAsync(
+        PreparedOutboundMessage submission, CancellationToken cancellation)
     {
         if (!OutboundMessagePreparation.IsValid(submission) || submission.ConversationId is null)
-            return Task.FromResult(new SendReceipt(SendDisposition.Rejected, "invalid_submission"));
+            return new SendReceipt(SendDisposition.Rejected, "invalid_submission");
+        if (!await VerifyAsync(submission.ConversationId, cancellation))
+            return new SendReceipt(SendDisposition.Rejected, "scope_not_verified");
         return _provider is IPreparedConversationProvider prepared
-            ? prepared.SendPreparedAsync(submission, cancellation)
-            : _provider.SendAsync(submission.ConversationId, submission.Text, cancellation);
+            ? await prepared.SendPreparedAsync(submission, cancellation)
+            : await _provider.SendAsync(submission.ConversationId, submission.Text, cancellation);
+    }
+
+    private async Task<bool> VerifyAsync(string id, CancellationToken cancellation)
+    {
+        try { return await _provider.BelongsToScopeAsync(_scope, id, cancellation); }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
+        catch (Exception) { return false; }
     }
 
     public void Dispose()

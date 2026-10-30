@@ -32,7 +32,9 @@ try
     }
 
     var provider = config.CreateProvider(); // Fails closed if scoped creation is unsupported.
-    using var runtime = new ChatRuntime(provider, new ChatJournal(config.StateDirectory));
+    var journal = new ChatJournal(config.StateDirectory);
+    using var hostLease = journal.AcquireHostLease();
+    using var runtime = new ChatRuntime(provider, journal);
 
     var builder = WebApplication.CreateSlimBuilder();
     builder.WebHost.UseUrls($"http://127.0.0.1:{config.Port}");

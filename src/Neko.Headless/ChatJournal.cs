@@ -21,6 +21,20 @@ internal sealed class ChatJournal
         Directory.CreateDirectory(_directory);
     }
 
+    /// <summary>Only one local host may mutate a journal directory at a time.</summary>
+    public IDisposable AcquireHostLease()
+    {
+        try
+        {
+            return new FileStream(Path.Combine(_directory, "host.lock"),
+                FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException)
+        {
+            throw new InvalidOperationException("Another Neko host owns this state directory.");
+        }
+    }
+
     // A crash during creation cannot prove that no remote chat was created.
     // The next process must not retry until the operator has reconciled it.
     public bool TryStartCreation()
@@ -54,6 +68,21 @@ internal sealed class ChatJournal
     public ChatRecord? Get(string id)
     {
         lock (_gate) return Read(FileName(id));
+    }
+
+    /// <summary>Atomic read-modify-write so refreshing history never rewinds status.</summary>
+    public ChatRecord? Update(string id, Func<ChatRecord, ChatRecord> change)
+    {
+        lock (_gate)
+        {
+            var current = Read(FileName(id));
+            if (current is null) return null;
+            var updated = change(current);
+            if (updated.Id != id)
+                throw new InvalidOperationException("Conversation identity cannot change.");
+            Set(updated);
+            return updated;
+        }
     }
 
     public void Set(ChatRecord record)

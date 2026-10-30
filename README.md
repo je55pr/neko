@@ -7,8 +7,10 @@ No desktop frontend is required.
 
 Requires .NET 10. A provider adapter is built separately and kept out of this
 repository. The adapter must implement `IConversationProviderFactory`, returning
-an `IScopedConversationProvider`. Neko refuses startup if it cannot guarantee
-that new conversations use the configured creation scope.
+an `IScopedConversationProvider`. Its `CreateInScopeAsync` must actually route
+the request to the configured scope. Its `BelongsToScopeAsync` must independently
+verify authoritative provider membership. Neko refuses startup without these
+contracts and refuses unverified sends or creations.
 
 1. Copy `secrets.example.json` to `secrets.json` (ignored by Git).
 2. Set an absolute or relative adapter assembly path and its factory type.
