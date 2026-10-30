@@ -26,8 +26,13 @@ internal sealed class ChatRuntime : IDisposable
         // The previous process may have died after a remote submission. Mark
         // in-flight operations unresolved until the provider can reconcile them.
         foreach (var record in _journal.List())
+        {
             if (record.Status is "sending" or "generating" or "stopping")
                 _journal.Update(record.Id, current => current with { Status = "uncertain" });
+            else if (record.Status == "unavailable")
+                // Older builds set this after a failed read without sending.
+                _journal.Update(record.Id, current => current with { Status = "idle" });
+        }
     }
 
     public IReadOnlyList<ChatRecord> List() => _journal.List();
@@ -89,7 +94,8 @@ internal sealed class ChatRuntime : IDisposable
             catch (Exception) { upstream = null; }
             if (upstream is null)
             {
-                _journal.Set(current with { Status = "unavailable" });
+                // A read can fail transiently (e.g. rate limiting). No send
+                // occurred, so keep the chat idle for a later guarded attempt.
                 return new SendReceipt(SendDisposition.Rejected, "provider_history_unavailable");
             }
             _journal.Set(current with { Status = "sending", History = upstream });

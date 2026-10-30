@@ -5,7 +5,7 @@ No desktop frontend is required.
 
 ## Setup
 
-Requires .NET 10. A provider adapter is built separately and kept out of this
+Requires Windows and .NET 10. A provider adapter is built separately and kept out of this
 repository. The adapter must implement `IConversationProviderFactory`, returning
 an `IScopedConversationProvider`. Its `CreateInScopeAsync` must actually route
 the request to the configured scope. Its `BelongsToScopeAsync` must independently

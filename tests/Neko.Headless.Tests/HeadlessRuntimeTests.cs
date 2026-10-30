@@ -70,7 +70,28 @@ public sealed class HeadlessRuntimeTests
         Assert.Equal(2, cached?.Messages.Count);
         var rejected = await second.SendAsync("chat-1", "do not misroute", CancellationToken.None);
         Assert.Equal("provider_history_unavailable", rejected.Reason);
-        Assert.Equal("unavailable", Assert.Single(second.List()).Status);
+        // The remote read might be temporarily unavailable. A later attempt
+        // remains possible, but must repeat all provider checks.
+        Assert.Equal("idle", Assert.Single(second.List()).Status);
+    }
+
+
+    [Fact]
+    public async Task TransientReadFailureDoesNotPermanentlyBlockAChat()
+    {
+        using var folder = new TemporaryDirectory();
+        var inner = new FakeProvider();
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(inner, "scope-a"), new ChatJournal(folder.Path));
+        await runtime.CreateAsync("initial", CancellationToken.None);
+        await WaitForTerminal(runtime, "chat-1");
+        inner.FailNextRead = true;
+        var rejected = await runtime.SendAsync("chat-1", "later", CancellationToken.None);
+        Assert.Equal("provider_history_unavailable", rejected.Reason);
+        Assert.Equal("idle", Assert.Single(runtime.List()).Status);
+        var next = await runtime.SendAsync("chat-1", "later", CancellationToken.None);
+        Assert.Equal(SendDisposition.Accepted, next.Disposition);
+        await WaitForTerminal(runtime, "chat-1");
     }
 
     [Fact]
@@ -165,6 +186,7 @@ public sealed class HeadlessRuntimeTests
         public bool UncertainNextCreation;
         public bool DeferCompletion;
         public bool StopUncertain;
+        public bool FailNextRead;
         private readonly Channel<PublicConversationUpdate> _events = Channel.CreateUnbounded<PublicConversationUpdate>();
         private readonly List<VisibleConversationMessage> _messages = [];
         public Task<bool> BelongsToScopeAsync(string scope, string id, CancellationToken cancellation) =>
@@ -210,9 +232,16 @@ public sealed class HeadlessRuntimeTests
                 if (update.Operation == PublicUpdateOperation.Complete) yield break;
             }
         }
-        public Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation) =>
-            Task.FromResult<VisibleConversation?>(_messages.Count == 0 ? null :
+        public Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation)
+        {
+            if (FailNextRead)
+            {
+                FailNextRead = false;
+                return Task.FromResult<VisibleConversation?>(null);
+            }
+            return Task.FromResult<VisibleConversation?>(_messages.Count == 0 ? null :
                 new VisibleConversation(id, "Test", _messages.ToArray()));
+        }
         public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(CancellationToken cancellation) =>
             Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
         public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
