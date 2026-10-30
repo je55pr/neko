@@ -26,6 +26,7 @@ if (command == "help")
 {
     Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch [args] [--wait] [--config path]");
     Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch <id>");
+    Console.WriteLine("Stop requires provider support; otherwise it returns Unsupported/stop_not_supported without cancelling.");
     return;
 }
 

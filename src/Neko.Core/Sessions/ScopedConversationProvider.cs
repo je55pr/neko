@@ -47,6 +47,7 @@ public sealed class ScopedConversationProvider :
         _provider.BrowseAsync(cancellation);
     public Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation) =>
         _provider.ReadAsync(id, cancellation);
+    public bool SupportsStop => _provider.SupportsStop;
     public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
         _provider.StopAsync(id, cancellation);
     public IAsyncEnumerable<PublicConversationUpdate> WatchAsync(string id, CancellationToken cancellation) =>

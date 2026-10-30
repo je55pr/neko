@@ -46,7 +46,7 @@ The server binds to `127.0.0.1` on the configured port. Every endpoint requires 
 | `/conversations/{id}/status` | GET | Current local operation status |
 | `/conversations/{id}/messages` | POST | Continue an existing conversation |
 | `/conversations/{id}/events` | GET | Server-sent incremental text updates |
-| `/conversations/{id}/stop` | POST | Reserved; remote stop is **not implemented** |
+| `/conversations/{id}/stop` | POST | Returns `Unsupported` / `stop_not_supported` without changing conversation state; remote stop is **not implemented** |
 
 ## Architecture and reliability
 

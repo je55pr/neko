@@ -536,8 +536,10 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
         Task.FromException<IReadOnlyList<ConversationSummary>>(
             new NotSupportedException("Remote conversation browsing is not implemented."));
 
+    public bool SupportsStop => false;
+
     public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
-        Task.FromResult(new StopReceipt(StopDisposition.Uncertain, "stop_not_implemented"));
+        Task.FromResult(new StopReceipt(StopDisposition.Unsupported, "stop_not_supported"));
 
     public void Dispose()
     {
