@@ -70,6 +70,11 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
               { Retryable=true, RetryAfterSeconds=retryAfterSeconds }
             : null;
 
+    // A correlated 429 is known rejected even when the native POST ran.
+    // An attempted send without that confirmation may have been delivered.
+    internal static string SendArchiveOutcome(bool attempted,bool confirmedRejected) =>
+        attempted && !confirmedRejected?"submission_uncertain":"rejected";
+
     private void ObserveHttpRateLimit(int? status)
     {
         if(status!=429)return;
@@ -367,6 +372,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
         await _sendGate.WaitAsync(cancellation);
         var stage="preflight";
         var attempted=false;
+        var confirmedRejected=false;
         NativeLiveStreamHub.Attempt? capture=null;
         try
         {
@@ -412,10 +418,17 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
                 return new SendReceipt(SendDisposition.Rejected,result.State);
             }
             if(!result.SseAccepted)
-                return ConfirmedNative429Receipt(result,RateLimitRetryAfterSeconds) ??
-                    new SendReceipt(
-                        result.HttpStatus is >=400 ? SendDisposition.Rejected:
-                        SendDisposition.Uncertain,result.State);
+            {
+                var throttled=ConfirmedNative429Receipt(result,RateLimitRetryAfterSeconds);
+                if(throttled is not null)
+                {
+                    confirmedRejected=true;
+                    return throttled;
+                }
+                return new SendReceipt(
+                    result.HttpStatus is >=400 ? SendDisposition.Rejected:
+                    SendDisposition.Uncertain,result.State);
+            }
             StartPolling(id,before.LastAssistantId,capture);
             capture=null; // Polling now owns the live observer.
             return new SendReceipt(SendDisposition.Accepted);
@@ -441,7 +454,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
         {
             if(capture is not null)
                 await _live.FinishAsync(capture,
-                    attempted?"submission_uncertain":"rejected",id);
+                    SendArchiveOutcome(attempted,confirmedRejected),id);
             _sendGate.Release();
         }
     }

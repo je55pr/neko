@@ -203,6 +203,55 @@ public sealed class ProtocolTests
             new NativeDispatchSender.Result("dispatcher_unavailable",false,false),60));
     }
 
+    [Theory]
+    [InlineData(429,true,"rejected")]
+    [InlineData(null,true,"submission_uncertain")]
+    [InlineData(503,true,"submission_uncertain")]
+    [InlineData(429,false,"rejected")]
+    public void SendFinalizationArchivesConfirmed429ButNotAmbiguousDelivery(
+        int? httpStatus,bool dispatched,string expectedOutcome)
+    {
+        var result=new NativeDispatchSender.Result("native_result",
+            Dispatched:dispatched,SseAccepted:false,HttpStatus:httpStatus,
+            ObservedPosts:dispatched?1:0,CorrelatedPosts:dispatched?1:0);
+        var throttled=ProjectProvider.ConfirmedNative429Receipt(result,60);
+        Assert.Equal(dispatched && httpStatus==429,throttled is not null);
+        if(throttled is not null)
+        {
+            Assert.Equal(SendDisposition.Rejected,throttled.Disposition);
+            Assert.True(throttled.Retryable);
+        }
+
+        var folder=Path.Combine(Path.GetTempPath(),
+            "neko-send-terminal-"+Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var conversationId=Guid.NewGuid().ToString("D");
+            using var attempt=new NativeLiveStreamHub.Attempt(
+                Guid.NewGuid().ToString("D"),conversationId,null,"send test",folder);
+            // SendAsync's finally uses this exact classifier, then live
+            // capture calls Attempt.Finish to persist the terminal record.
+            attempt.Finish(ProjectProvider.SendArchiveOutcome(
+                result.Dispatched,throttled is not null),conversationId);
+
+            var human=File.ReadAllText(attempt.Archive.TextPath);
+            Assert.Contains("END "+expectedOutcome+" | conversation "+conversationId,human);
+            using var terminal=JsonDocument.Parse(
+                File.ReadLines(attempt.Archive.JsonlPath).Last());
+            Assert.Equal("terminal",terminal.RootElement.GetProperty("type").GetString());
+            Assert.Equal(expectedOutcome,
+                terminal.RootElement.GetProperty("operation").GetString());
+            Assert.Equal(conversationId,
+                terminal.RootElement.GetProperty("conversationId").GetString());
+            Assert.Equal(2,File.ReadLines(attempt.Archive.JsonlPath).Count());
+            var aggregate=File.ReadAllText(
+                Path.Combine(folder,"conversation-"+conversationId+".txt"));
+            Assert.Contains("END "+expectedOutcome,aggregate);
+        }
+        finally {Directory.Delete(folder,true);}
+    }
+
     [Fact]
     public void RemainingCooldownIsRoundedBoundedAndNeverInventedAfterExpiry()
     {
