@@ -8,6 +8,7 @@ public sealed class ConversationProviderContractTests
     public async Task DisconnectedProviderMakesNoPretendConversationsOrSubmissions()
     {
         IConversationProvider backend=new DisconnectedConversationProvider();
+        Assert.False(backend.SupportsStop);
         Assert.Empty(await backend.BrowseAsync(CancellationToken.None));
         Assert.Null(await backend.ReadAsync("local",CancellationToken.None));
 

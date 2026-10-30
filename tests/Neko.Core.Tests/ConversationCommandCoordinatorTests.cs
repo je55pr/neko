@@ -13,6 +13,7 @@ public sealed class ConversationCommandCoordinatorTests
         public int SendCalls;
         public int StopCalls;
         public int CreateCalls;
+        public bool SupportsStop { get; set; } = true;
 
         public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(
             CancellationToken cancellation)=>
@@ -88,6 +89,35 @@ public sealed class ConversationCommandCoordinatorTests
         Assert.Equal(0,provider.StopCalls);
         pending.SetResult(new SendReceipt(SendDisposition.Accepted));
         await send;
+    }
+
+    [Fact]
+    public async Task UnsupportedStopDoesNotAllocateOrPoisonSession()
+    {
+        var provider=new Provider {
+            SupportsStop=false,
+            OnSend=(_,_,_)=>Task.FromResult(new SendReceipt(SendDisposition.Accepted))
+        };
+        var coordinator=new ConversationCommandCoordinator(provider);
+        var initial=coordinator.GetState("id");
+        for(var attempt=0;attempt<3;attempt++)
+        {
+            var stop=await coordinator.StopAsync("id");
+            Assert.Equal(StopDisposition.Unsupported,stop.Disposition);
+            Assert.Equal("stop_not_supported",stop.Reason);
+            Assert.Equal(initial,coordinator.GetState("id"));
+        }
+        Assert.Equal(0,provider.StopCalls);
+        Assert.False(coordinator.ConfirmStopReconciled("id"));
+
+        var send=await coordinator.SendAsync("id","follow-up");
+        Assert.Equal(SendDisposition.Accepted,send.Disposition);
+        Assert.False(coordinator.GetState("id").StopUncertain);
+        Assert.False(coordinator.GetState("id").Stopping);
+        Assert.Equal(1,provider.SendCalls);
+        Assert.Equal(StopDisposition.Unsupported,
+            (await coordinator.StopAsync("id")).Disposition);
+        Assert.Equal(0,provider.StopCalls);
     }
 
     [Fact]

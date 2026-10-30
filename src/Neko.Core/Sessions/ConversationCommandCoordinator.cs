@@ -93,6 +93,8 @@ public sealed class ConversationCommandCoordinator(IConversationProvider provide
     public async Task<StopReceipt> StopAsync(
         string conversationId,CancellationToken cancellation=default)
     {
+        if(!provider.SupportsStop)
+            return new StopReceipt(StopDisposition.Unsupported,"stop_not_supported");
         if(string.IsNullOrWhiteSpace(conversationId))
             return new StopReceipt(StopDisposition.NotActive,"invalid_conversation");
         cancellation.ThrowIfCancellationRequested();

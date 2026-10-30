@@ -147,6 +147,9 @@ internal sealed class ChatRuntime : IDisposable
 
     public async Task<StopReceipt> StopAsync(string id, CancellationToken cancellation)
     {
+        // Unsupported Stop is a pure no-op, including for the on-disk journal.
+        if (!_provider.SupportsStop)
+            return new StopReceipt(StopDisposition.Unsupported, "stop_not_supported");
         var gate = _gates.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellation);
         try
@@ -167,7 +170,7 @@ internal sealed class ChatRuntime : IDisposable
             try { receipt = await _commands.StopAsync(id, cancellation); }
             catch (Exception) { receipt = new StopReceipt(StopDisposition.Uncertain, "stop_unknown"); }
 
-            if (receipt.Disposition == StopDisposition.NotActive)
+            if (receipt.Disposition is StopDisposition.NotActive or StopDisposition.Unsupported)
                 _journal.Update(id, latest => latest.Status == "stopping"
                     ? latest with { Status = "generating" } : latest);
             else if (receipt.Disposition == StopDisposition.Uncertain)

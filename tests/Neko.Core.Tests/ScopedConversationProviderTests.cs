@@ -20,6 +20,23 @@ public sealed class ScopedConversationProviderTests
         Assert.Equal(0, inner.UnscopedCalls);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ScopedProviderPreservesStopCapability(bool supportsStop)
+    {
+        var inner = new ScopedProbe { SupportsStop = supportsStop };
+        using var wrapped = new ScopedConversationProvider(inner, "private-scope");
+        Assert.Equal(supportsStop, wrapped.SupportsStop);
+
+        var coordinator = new ConversationCommandCoordinator(wrapped);
+        var receipt = await coordinator.StopAsync("scoped-conversation");
+        Assert.Equal(supportsStop ? StopDisposition.Requested : StopDisposition.Unsupported,
+            receipt.Disposition);
+        Assert.Equal(supportsStop ? 1 : 0, inner.StopCalls);
+        Assert.False(coordinator.GetState("scoped-conversation").StopUncertain);
+    }
+
     [Fact]
     public void RefusesMissingScopeOrUnsupportedAdapter()
     {
@@ -90,6 +107,8 @@ public sealed class ScopedConversationProviderTests
     {
         public int UnscopedCalls;
         public int Sends;
+        public int StopCalls;
+        public bool SupportsStop { get; set; }
         public bool Verify = true;
         public bool CancelScopeCheck;
         public string? LastScope;
@@ -115,8 +134,11 @@ public sealed class ScopedConversationProviderTests
             Sends++;
             return Task.FromResult(new SendReceipt(SendDisposition.Accepted));
         }
-        public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
-            Task.FromResult(new StopReceipt(StopDisposition.NotActive));
+        public Task<StopReceipt> StopAsync(string _, CancellationToken cancellation)
+        {
+            StopCalls++;
+            return Task.FromResult(new StopReceipt(StopDisposition.Requested));
+        }
         public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(CancellationToken cancellation) =>
             Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
         public Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation) =>

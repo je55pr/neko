@@ -156,6 +156,49 @@ public sealed class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task UnsupportedStopDuringAndAfterGenerationIsHarmless()
+    {
+        using var folder = new TemporaryDirectory();
+        var inner = new FakeProvider { DeferCompletion = true, SupportsStop = false };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(inner, "scope-a"), new ChatJournal(folder.Path));
+        Assert.Equal(SendDisposition.Accepted,
+            (await runtime.CreateAsync("first", CancellationToken.None)).Disposition);
+        var generating = runtime.Get("chat-1")!;
+        Assert.Equal("generating", generating.Status);
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var stop = await runtime.StopAsync("chat-1", CancellationToken.None);
+            Assert.Equal(StopDisposition.Unsupported, stop.Disposition);
+            Assert.Equal("stop_not_supported", stop.Reason);
+            Assert.Equal(generating.Status, runtime.Get("chat-1")?.Status);
+            Assert.Equal(generating.UpdatedAt, runtime.Get("chat-1")?.UpdatedAt);
+        }
+        Assert.Equal(0, inner.StopCalls);
+        inner.CompletePending();
+        await WaitForTerminal(runtime, "chat-1");
+        var completed = runtime.Get("chat-1")!;
+        Assert.Equal("idle", completed.Status);
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var stop = await runtime.StopAsync("chat-1", CancellationToken.None);
+            Assert.Equal(StopDisposition.Unsupported, stop.Disposition);
+            Assert.Equal("stop_not_supported", stop.Reason);
+            Assert.Equal(completed.Status, runtime.Get("chat-1")?.Status);
+            Assert.Equal(completed.UpdatedAt, runtime.Get("chat-1")?.UpdatedAt);
+        }
+        inner.DeferCompletion = false;
+        Assert.Equal(SendDisposition.Accepted,
+            (await runtime.SendAsync("chat-1", "follow-up", CancellationToken.None)).Disposition);
+        await WaitForTerminal(runtime, "chat-1");
+        Assert.Equal("idle", runtime.Get("chat-1")?.Status);
+        Assert.Equal(4, (await runtime.ReadAsync("chat-1", CancellationToken.None))?.Messages.Count);
+        Assert.Equal(0, inner.StopCalls);
+    }
+
+    [Fact]
     public async Task UncertainStopBlocksFurtherSendsAndSurvivesRestart()
     {
         using var folder = new TemporaryDirectory();
@@ -260,8 +303,14 @@ public sealed class HeadlessRuntimeTests
         public bool UncertainNextCreation;
         public bool DeferCompletion;
         public bool StopUncertain;
+        public bool SupportsStop { get; set; } = true;
+        public int StopCalls;
         public bool FailNextRead;
         public TaskCompletionSource<SendReceipt>? PendingSend;
+        public void CompletePending() =>
+            _events.Writer.TryWrite(new PublicConversationUpdate(
+                Guid.NewGuid().ToString("N"), PublicUpdateKind.Final,
+                PublicUpdateOperation.Complete));
         public void InjectMessage(string text) =>
             _messages.Add(new VisibleConversationMessage(
                 "injected-update",VisibleMessageRole.User,text));
@@ -323,9 +372,12 @@ public sealed class HeadlessRuntimeTests
         }
         public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(CancellationToken cancellation) =>
             Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
-        public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
-            Task.FromResult(new StopReceipt(StopUncertain
+        public Task<StopReceipt> StopAsync(string _, CancellationToken cancellation)
+        {
+            StopCalls++;
+            return Task.FromResult(new StopReceipt(StopUncertain
                 ? StopDisposition.Uncertain : StopDisposition.NotActive));
+        }
     }
 
     private sealed class TemporaryDirectory : IDisposable

@@ -14,6 +14,9 @@ public interface IConversationProvider
     Task<SendReceipt> SendAsync(string conversationId,string text,
         CancellationToken cancellation);
     Task<StopReceipt> StopAsync(string conversationId,CancellationToken cancellation);
+    // Remote Stop is opt-in: unsupported providers must not dispatch or change
+    // session/journal state, including when implementing adapters in the future.
+    bool SupportsStop => false;
     IAsyncEnumerable<PublicConversationUpdate> WatchAsync(
         string conversationId,CancellationToken cancellation);
 }
@@ -35,7 +38,7 @@ public sealed record SendReceipt(
     SendDisposition Disposition,string Reason="",string? ConversationId=null,
     string? MessageId=null);
 
-public enum StopDisposition { NotActive, Requested, Uncertain }
+public enum StopDisposition { NotActive, Requested, Uncertain, Unsupported }
 
 public sealed record StopReceipt(StopDisposition Disposition,string Reason="");
 
