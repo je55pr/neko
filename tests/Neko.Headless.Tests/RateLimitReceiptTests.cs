@@ -213,8 +213,12 @@ public sealed class RateLimitReceiptTests
                 : new SendReceipt(SendDisposition.Accepted, ConversationId: "chat-1"));
         }
 
-        public Task<SendReceipt> CreateAsync(string _, CancellationToken __) =>
+        public Task<SendReceipt> CreateAsync(string text, CancellationToken cancellation)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            ArgumentException.ThrowIfNullOrWhiteSpace(text);
             throw new InvalidOperationException("Unscoped create must never be called.");
+        }
 
         public Task<SendReceipt> SendAsync(string id, string text, CancellationToken cancellation)
         {
@@ -236,9 +240,10 @@ public sealed class RateLimitReceiptTests
             return Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
         }
 
-        public Task<StopReceipt> StopAsync(string _, CancellationToken cancellation)
+        public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation)
         {
             cancellation.ThrowIfCancellationRequested();
+            ArgumentException.ThrowIfNullOrWhiteSpace(id);
             return Task.FromResult(new StopReceipt(StopDisposition.Unsupported));
         }
 
