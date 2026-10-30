@@ -60,6 +60,26 @@ The transport is deliberately isolated in `src/Neko.Transport`. Its configured o
 - Creation verifies remote membership of the required scope; an unverified new conversation is not reported as accepted.
 - The local journal under `state/` stores the latest conversation snapshots and operation states. Session files, local checkpoints and secrets are ignored by Git.
 
+### Operator recovery after uncertain delivery
+
+If a submission is marked `uncertain`, **do not resend the same request** just because the local API did not receive confirmation. First stop Neko, back up the configured `stateDirectory`, and compare the recorded conversation ID, latest visible prompt and provider-side history with the intended project. A `creation.pending` file is a fail-closed guard for a possibly delivered creation; its presence alone does not indicate rejection. Keep that marker and the archive until the remote outcome has been independently established.
+
+There is currently no automated reconciliation or safe unlock endpoint. If the remote outcome is positively established by an operator, record the evidence in the local backup and deliberately reconcile the matching local journal/checkpoint while the service is stopped. If the outcome cannot be established, preserve the uncertain state and avoid another send or creation. Never blindly delete the guard or replay an ambiguous prompt.
+
+Keep the authenticated browser profile **outside this repository**. The example `local-session-profile/` directory is ignored only to prevent accidental staging during local experiments.
+
+## Reconciliation of uncertain operations
+
+An `Uncertain` receipt means delivery cannot safely be repeated. After
+stopping the service, inspect `state/creation.pending` for a blocked creation
+or `state/<conversation-id>.json` for a blocked follow-up. Check the remote
+conversation history and project membership **before** taking any action.
+If a matching request exists, record its server conversation ID and reconcile
+the local state with that authoritative record. If the result remains unknown,
+leave the checkpoint intact and do not replay the message. Archive the original
+checkpoint and your evidence before any manual resolution. Never simply remove
+the checkpoint to make a retry possible.
+
 ## Permanent output archives
 
 New turns are archived in `%LOCALAPPDATA%\Neko\conversation-archives`, with the following outputs:

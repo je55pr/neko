@@ -80,9 +80,12 @@ public sealed class HeadlessRuntimeTests
         for(var attempt=0;attempt<50 &&
             runtime.List().Single().Status!="sending";attempt++)
             await Task.Delay(10);
+        inner.InjectMessage("updated during read");
         var read=await runtime.ReadAsync("chat-1",CancellationToken.None);
         Assert.NotNull(read);
-        Assert.NotNull(runtime.List().Single().History);
+        Assert.Contains(read.Messages,message=>message.Text=="updated during read");
+        Assert.Contains(runtime.List().Single().History!.Messages,
+            message=>message.Text=="updated during read");
         pending.SetResult(new SendReceipt(SendDisposition.Uncertain,"test_uncertain"));
         Assert.Equal(SendDisposition.Uncertain,(await send).Disposition);
         Assert.Equal("uncertain",runtime.List().Single().Status);
@@ -189,6 +192,19 @@ public sealed class HeadlessRuntimeTests
     }
 
     [Fact]
+    public void RestartMigratesLegacyUnavailableButPreservesUncertain()
+    {
+        using var folder=new TemporaryDirectory();
+        var journal=new ChatJournal(folder.Path);
+        journal.Set(new ChatRecord("legacy","unavailable"));
+        journal.Set(new ChatRecord("ambiguous","uncertain"));
+        using var runtime=new ChatRuntime(
+            new ScopedConversationProvider(new FakeProvider(),"scope-a"),journal);
+        Assert.Equal("idle",runtime.Get("legacy")?.Status);
+        Assert.Equal("uncertain",runtime.Get("ambiguous")?.Status);
+    }
+
+    [Fact]
     public void RestartReclassifiesInterruptedOperationsAsUncertain()
     {
         using var folder = new TemporaryDirectory();
@@ -246,6 +262,9 @@ public sealed class HeadlessRuntimeTests
         public bool StopUncertain;
         public bool FailNextRead;
         public TaskCompletionSource<SendReceipt>? PendingSend;
+        public void InjectMessage(string text) =>
+            _messages.Add(new VisibleConversationMessage(
+                "injected-update",VisibleMessageRole.User,text));
         private readonly Channel<PublicConversationUpdate> _events = Channel.CreateUnbounded<PublicConversationUpdate>();
         private readonly List<VisibleConversationMessage> _messages = [];
         public Task<bool> BelongsToScopeAsync(string scope, string id, CancellationToken cancellation) =>

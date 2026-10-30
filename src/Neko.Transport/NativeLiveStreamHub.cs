@@ -96,7 +96,18 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
         {
             if(Closed)return;
             Closed=true;
-            Archive.Finish(outcome,id??ConversationId,serverText);
+            try
+            {
+                Archive.Finish(outcome,id??ConversationId,serverText);
+            }
+            catch(Exception ex) when(ex is IOException or UnauthorizedAccessException
+                or ObjectDisposedException)
+            {
+                // Archive I/O failure must not keep the provider send gate
+                // locked or keep subscribed clients waiting forever.
+                System.Diagnostics.Trace.TraceWarning(
+                    "Conversation archive could not be finalized.");
+            }
         }
 
         public void Dispose()=>Finish("observer_disposed",ConversationId);

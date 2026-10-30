@@ -56,6 +56,23 @@ public sealed class ProtocolTests
     }
 
     [Fact]
+    public void MissingProfileDirectoryIsRejectedBeforePathResolution()
+    {
+        var folder=Path.Combine(Path.GetTempPath(),
+            "neko-settings-absence-"+Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var path=Path.Combine(folder,"settings.json");
+            File.WriteAllText(path,JsonSerializer.Serialize(new {
+                transport=ValidSettings("")
+            }));
+            Assert.Throws<InvalidOperationException>(()=>TransportSettings.Read(path));
+        }
+        finally { Directory.Delete(folder,true); }
+    }
+
+    [Fact]
     public void TransportResolvesProfileRelativeToSettingsFile()
     {
         var folder=Path.Combine(Path.GetTempPath(),
@@ -133,7 +150,7 @@ public sealed class ProtocolTests
     public void StreamRequestParentUsesConfiguredFieldName()
     {
         var settings=new TransportSettings {ParentField="custom_parent"};
-        var parent=Guid.NewGuid().ToString("D");
+        var parent=new Guid(1,2,3,[4,5,6,7,8,9,10,11]).ToString("D");
         using var payload=JsonDocument.Parse(JsonSerializer.Serialize(
             new Dictionary<string,string>
             {

@@ -56,6 +56,25 @@ public sealed class ScopedConversationProviderTests
     }
 
     [Fact]
+    public async Task CancelledVerificationPreservesCreationButRejectsUnsentFollowup()
+    {
+        var inner=new ScopedProbe {CancelScopeCheck=true};
+        using var wrapped=new ScopedConversationProvider(inner,"private-scope");
+        using var cancelled=new CancellationTokenSource();
+        cancelled.Cancel();
+
+        var created=await wrapped.CreateAsync("created remotely",cancelled.Token);
+        Assert.Equal(SendDisposition.Uncertain,created.Disposition);
+        Assert.Equal("scope_verification_cancelled",created.Reason);
+        Assert.Equal("scoped-conversation",created.ConversationId);
+
+        var send=await wrapped.SendAsync("scoped-conversation","not sent",cancelled.Token);
+        Assert.Equal(SendDisposition.Rejected,send.Disposition);
+        Assert.Equal("scope_verification_cancelled_before_send",send.Reason);
+        Assert.Equal(0,inner.Sends);
+    }
+
+    [Fact]
     public async Task VerifiedCreationAllowsScopedFollowup()
     {
         var inner = new ScopedProbe();
@@ -72,10 +91,12 @@ public sealed class ScopedConversationProviderTests
         public int UnscopedCalls;
         public int Sends;
         public bool Verify = true;
+        public bool CancelScopeCheck;
         public string? LastScope;
         public PreparedOutboundMessage? LastSubmission;
         public Task<bool> BelongsToScopeAsync(string scope, string id, CancellationToken cancellation) =>
-            Task.FromResult(Verify && scope == "private-scope" && id == "scoped-conversation");
+            CancelScopeCheck ? Task.FromCanceled<bool>(cancellation)
+                : Task.FromResult(Verify && scope == "private-scope" && id == "scoped-conversation");
         public Task<SendReceipt> CreateInScopeAsync(
             string scope, PreparedOutboundMessage submission, CancellationToken cancellation)
         {

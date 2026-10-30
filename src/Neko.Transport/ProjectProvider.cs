@@ -138,7 +138,13 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             }
             try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "neko-private-adapter.log"),
                 DateTimeOffset.UtcNow.ToString("O") + " snapshot_http " + status +
-                Environment.NewLine); } catch { }
+                Environment.NewLine); }
+            catch (Exception)
+            {
+                // Logging is best effort. Never mask the original read result.
+                System.Diagnostics.Trace.TraceWarning(
+                    "Neko transport snapshot diagnostic unavailable.");
+            }
             return null;
         }
 
@@ -231,6 +237,9 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             stage="scope_reconciliation";
             var resolvedId=Guid.TryParse(result.ServerConversationId,out _)?
                 result.ServerConversationId:null;
+            if(!result.SseAccepted || resolvedId is null)
+                return new SendReceipt(SendDisposition.Uncertain,
+                    result.State,ConversationId:resolvedId);
 
             for(var attempt=0;attempt<5;attempt++)
             {
@@ -389,6 +398,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             var last="";
             var pollingPublished="";
             string? finalText=null;
+            var completedMessageId="";
             var complete=false;
             try
             {
@@ -435,9 +445,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                     if(!finished)continue;
                     complete=true;
                     finalText=last;
-                    channel.Writer.TryWrite(new PublicConversationUpdate(
-                        snapshot.LastAssistantId,PublicUpdateKind.Final,
-                        PublicUpdateOperation.Complete));
+                    completedMessageId=snapshot.LastAssistantId;
                     break;
                 }
             }
@@ -448,9 +456,10 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                     await _live.FinishAsync(capture,
                         complete?"server_verified_complete":"stream_uncertain",
                         id,finalText);
-                if(!complete)
-                    channel.Writer.TryWrite(new PublicConversationUpdate(
-                        updateId,PublicUpdateKind.Final,
+                channel.Writer.TryWrite(new PublicConversationUpdate(
+                    complete?completedMessageId:updateId,
+                    PublicUpdateKind.Final,
+                    complete?PublicUpdateOperation.Complete:
                         PublicUpdateOperation.Fail));
                 channel.Writer.TryComplete();
             }
@@ -471,8 +480,11 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
     public async Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation) =>
         (await SnapshotAsync(id, allowRecent: true))?.Conversation;
 
+    // Listing the entire remote account is not supported by this adapter.
+    // Returning an empty list would falsely imply that no conversations exist.
     public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(CancellationToken cancellation) =>
-        Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
+        Task.FromException<IReadOnlyList<ConversationSummary>>(
+            new NotSupportedException("Remote conversation browsing is not implemented."));
 
     public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
         Task.FromResult(new StopReceipt(StopDisposition.Uncertain, "stop_not_implemented"));

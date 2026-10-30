@@ -45,6 +45,9 @@ internal sealed record TransportSettings
         var settings=JsonSerializer.Deserialize<TransportSettings>(root.GetRawText(),
             new JsonSerializerOptions { PropertyNameCaseInsensitive=true })
             ?? throw new InvalidOperationException("Transport settings unavailable.");
+        if(string.IsNullOrWhiteSpace(settings.ProfileDirectory))
+            throw new InvalidOperationException(
+                "Configured user session directory is required.");
         var folder=Path.GetDirectoryName(Path.GetFullPath(path))!;
         var localProfile=Path.IsPathRooted(settings.ProfileDirectory)
             ?settings.ProfileDirectory:

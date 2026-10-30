@@ -64,10 +64,15 @@ try
     });
 
     app.MapGet("/health", () => Results.Json(new { status = "ready" }));
-    app.MapGet("/conversations", () => Results.Json(runtime.List()));
+    // Listing is metadata only; full transcripts belong in GET by ID.
+    app.MapGet("/conversations", () => Results.Json(runtime.List()
+        .Select(record => new {
+            record.Id,record.Status,record.UpdatedAt,
+            Title=record.History?.Title
+        })));
     app.MapGet("/conversations/{id}/status", (string id) =>
     {
-        var record = runtime.List().FirstOrDefault(x => x.Id == id);
+        var record = runtime.Get(id);
         return record is null ? Results.NotFound() :
             Results.Json(new { record.Id, record.Status, record.UpdatedAt });
     });

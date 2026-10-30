@@ -14,16 +14,37 @@ internal static class NativeDispatcherBootstrap
 {
     // Frontend script bodies are untrusted and may be malformed. Limit
     // source matching so initialization cannot hang in regex backtracking.
-    private static System.Text.RegularExpressions.MatchCollection SafeMatches(
-        string input,string pattern) =>
-        System.Text.RegularExpressions.Regex.Matches(input,pattern,
-            System.Text.RegularExpressions.RegexOptions.CultureInvariant,
-            TimeSpan.FromMilliseconds(200));
+    private static IReadOnlyList<System.Text.RegularExpressions.Match> SafeMatches(
+        string input,string pattern)
+    {
+        try
+        {
+            // Materialize inside the guarded section. MatchCollection evaluates
+            // lazily, so the timeout may arise while enumerating it.
+            return System.Text.RegularExpressions.Regex.Matches(input,pattern,
+                System.Text.RegularExpressions.RegexOptions.CultureInvariant,
+                TimeSpan.FromMilliseconds(200)).Cast<
+                    System.Text.RegularExpressions.Match>().ToArray();
+        }
+        catch(System.Text.RegularExpressions.RegexMatchTimeoutException)
+        {
+            return [];
+        }
+    }
 
-    private static bool SafeIsMatch(string input,string pattern) =>
-        System.Text.RegularExpressions.Regex.IsMatch(input,pattern,
-            System.Text.RegularExpressions.RegexOptions.NonBacktracking,
-            TimeSpan.FromMilliseconds(200));
+    private static bool SafeIsMatch(string input,string pattern)
+    {
+        try
+        {
+            return System.Text.RegularExpressions.Regex.IsMatch(input,pattern,
+                System.Text.RegularExpressions.RegexOptions.NonBacktracking,
+                TimeSpan.FromMilliseconds(200));
+        }
+        catch(System.Text.RegularExpressions.RegexMatchTimeoutException)
+        {
+            return false;
+        }
+    }
 
 
     public const string InstallScript="""

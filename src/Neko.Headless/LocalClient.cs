@@ -15,9 +15,17 @@ internal static class LocalClient
             new AuthenticationHeaderValue("Bearer", config.AccessToken);
 
         var positional = new List<string>();
+        var skipConfigValue = false;
         for (var i = 1; i < args.Length; i++)
         {
-            if (args[i] == "--config") { i++; continue; }
+            if (skipConfigValue) { skipConfigValue = false; continue; }
+            if (args[i] == "--config")
+            {
+                if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
+                    throw new ArgumentException("--config requires a file path.");
+                skipConfigValue = true;
+                continue;
+            }
             if (args[i] == "--wait") continue;
             positional.Add(args[i]);
         }

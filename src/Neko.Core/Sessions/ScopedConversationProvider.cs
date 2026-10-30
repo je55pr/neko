@@ -71,9 +71,20 @@ public sealed class ScopedConversationProvider :
         if (string.IsNullOrWhiteSpace(receipt.ConversationId))
             return new SendReceipt(SendDisposition.Uncertain, "conversation_id_unknown");
 
-        return await VerifyAsync(receipt.ConversationId, cancellation)
-            ? receipt : new SendReceipt(SendDisposition.Uncertain, "scope_not_verified",
+        try
+        {
+            return await VerifyAsync(receipt.ConversationId, cancellation)
+                ? receipt : new SendReceipt(SendDisposition.Uncertain, "scope_not_verified",
+                    ConversationId: receipt.ConversationId);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // Creation already happened. Cancellation cannot prove that the
+            // resulting conversation was rejected or that it is safe to retry.
+            return new SendReceipt(SendDisposition.Uncertain,
+                "scope_verification_cancelled",
                 ConversationId: receipt.ConversationId);
+        }
     }
 
     public Task<SendReceipt> SendAsync(string conversationId, string text, CancellationToken cancellation)
@@ -89,7 +100,16 @@ public sealed class ScopedConversationProvider :
     {
         if (!OutboundMessagePreparation.IsValid(submission) || submission.ConversationId is null)
             return new SendReceipt(SendDisposition.Rejected, "invalid_submission");
-        if (!await VerifyAsync(submission.ConversationId, cancellation))
+        bool scoped;
+        try { scoped = await VerifyAsync(submission.ConversationId, cancellation); }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // The provider has not been invoked. This is a rejected preflight,
+            // not an uncertain delivery requiring a permanent retry lock.
+            return new SendReceipt(SendDisposition.Rejected,
+                "scope_verification_cancelled_before_send");
+        }
+        if (!scoped)
             return new SendReceipt(SendDisposition.Rejected, "scope_not_verified");
         return _provider is IPreparedConversationProvider prepared
             ? await prepared.SendPreparedAsync(submission, cancellation)

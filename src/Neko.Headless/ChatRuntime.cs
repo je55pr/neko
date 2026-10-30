@@ -36,6 +36,7 @@ internal sealed class ChatRuntime : IDisposable
     }
 
     public IReadOnlyList<ChatRecord> List() => _journal.List();
+    public ChatRecord? Get(string id) => _journal.Get(id);
 
     public async Task<SendReceipt> CreateAsync(string text, CancellationToken cancellation)
     {
@@ -98,11 +99,25 @@ internal sealed class ChatRuntime : IDisposable
                 // occurred, so keep the chat idle for a later guarded attempt.
                 return new SendReceipt(SendDisposition.Rejected, "provider_history_unavailable");
             }
-            _journal.Set(current with { Status = "sending", History = upstream });
-            // Install a fresh feed before dispatch. Subscribers must never
-            // replay the previous turn's terminal event while sending.
+            // Bind the new stream before making "sending" observable, so
+            // watchers cannot replay a terminal event from the previous turn.
             var feed=new ConversationUpdateFeed();
+            _updates.TryGetValue(id,out var previousFeed);
             _updates[id]=feed;
+            try
+            {
+                _journal.Update(id, latest => latest with {
+                    Status="sending",History=upstream
+                });
+            }
+            catch
+            {
+                if(previousFeed is not null)_updates[id]=previousFeed;
+                else _updates.TryRemove(id,out _);
+                feed.Publish(new PublicConversationUpdate(id,
+                    PublicUpdateKind.Final,PublicUpdateOperation.Fail));
+                throw;
+            }
 
             SendReceipt receipt;
             try { receipt = await _commands.SendAsync(prepared.Message, cancellation); }
