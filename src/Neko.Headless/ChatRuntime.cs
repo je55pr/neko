@@ -182,22 +182,24 @@ internal sealed class ChatRuntime : IDisposable
         finally { gate.Release(); }
     }
 
-    public async Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation)
+    public async Task<HistoryReadResult> ReadAsync(string id, CancellationToken cancellation)
     {
-        var record = _journal.Get(id);
-        if (record is null) return null;
+        // Local registration, not provider availability, determines whether an ID is known.
+        if (_journal.Get(id) is null) return new HistoryReadResult(false, null);
         try
         {
             var current = await _provider.ReadAsync(id, cancellation);
             if (current is not null)
             {
                 _journal.Update(id, latest => latest with { History = current });
-                return current;
+                return new HistoryReadResult(true, current);
             }
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
-        catch (Exception) { /* Return the most recent local checkpoint. */ }
-        return record.History;
+        catch (Exception) { /* Preserve the most recent local checkpoint. */ }
+        // Re-read after awaiting the provider: the stream pump may have saved
+        // a transcript while this request was waiting for an unavailable read.
+        return new HistoryReadResult(true, _journal.Get(id)?.History);
     }
 
     public async IAsyncEnumerable<PublicConversationUpdate> WatchAsync(

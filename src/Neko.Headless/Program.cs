@@ -77,11 +77,8 @@ try
         return record is null ? Results.NotFound() :
             Results.Json(new { record.Id, record.Status, record.UpdatedAt });
     });
-    app.MapGet("/conversations/{id}", async (string id, CancellationToken cancellation) =>
-    {
-        var result = await runtime.ReadAsync(id, cancellation);
-        return result is null ? Results.NotFound() : Results.Json(result);
-    });
+    app.MapGet("/conversations/{id}", (string id, CancellationToken cancellation) =>
+        ConversationHistoryEndpoint.ReadAsync(runtime, id, cancellation));
     app.MapPost("/conversations", async (TextRequest body, CancellationToken cancellation) =>
         Results.Json(await runtime.CreateAsync(body.Text ?? "", cancellation)));
     app.MapPost("/conversations/{id}/messages", async (

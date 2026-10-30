@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -68,6 +69,12 @@ internal static class LocalClient
         if (body is not null) request.Content = new StringContent(body, Encoding.UTF8, "application/json");
         using var response = await client.SendAsync(request);
         var result = await response.Content.ReadAsStringAsync();
+        if (command == "read" && TryWriteReadStatus(
+            response.StatusCode, result, Console.Out, Console.Error, out var exitCode))
+        {
+            if (exitCode != 0) Environment.ExitCode = exitCode;
+            return;
+        }
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException("The local service rejected the request.");
         Console.WriteLine(result);
@@ -82,6 +89,28 @@ internal static class LocalClient
         var id = command == "send" ? positional[0] :
             root.TryGetProperty("conversationId", out var property) ? property.GetString() : null;
         if (id is not null) await WatchAsync(client, id);
+    }
+
+    // A pending transcript is an explicit, successful HTTP read state rather than
+    // an unknown conversation or a fabricated empty history.
+    internal static bool TryWriteReadStatus(
+        HttpStatusCode status, string payload, TextWriter output, TextWriter error,
+        out int exitCode)
+    {
+        exitCode = 0;
+        if (status == HttpStatusCode.Accepted)
+        {
+            output.WriteLine(payload);
+            error.WriteLine("History pending for a known conversation; retry read later.");
+            return true;
+        }
+        if (status == HttpStatusCode.NotFound)
+        {
+            exitCode = 1;
+            error.WriteLine("Conversation not found.");
+            return true;
+        }
+        return false;
     }
 
     private static async Task WatchAsync(HttpClient client, string id)
