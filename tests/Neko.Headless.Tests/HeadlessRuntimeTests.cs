@@ -483,6 +483,99 @@ public sealed class HeadlessRuntimeTests
         Assert.Null(restarted.GetStatus("unknown"));
     }
 
+    [Fact]
+    public async Task TerminalJournalWriteFailureClosesEarlyAndLateWatchersWithoutFalseSuccess()
+    {
+        using var folder = new TemporaryDirectory();
+        var failOnce = 0;
+        var journal = new ChatJournal(folder.Path, record =>
+        {
+            if (record.Status == "idle" && Interlocked.Exchange(ref failOnce, 1) == 0)
+                throw new IOException("Simulated terminal checkpoint failure.");
+        });
+        var provider = new FakeProvider { DeferCompletion = true };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"), journal);
+        await runtime.CreateAsync("first", CancellationToken.None);
+
+        var early = CollectPublicUpdates(runtime, "chat-1");
+        var simultaneous = CollectPublicUpdates(runtime, "chat-1");
+        provider.CompletePending();
+        var received = await early;
+        Assert.Equal(received.ToArray(), (await simultaneous).ToArray());
+        var last = Assert.Single(received);
+        Assert.Equal(PublicUpdateOperation.Fail, last.Operation);
+        Assert.Equal("uncertain", runtime.GetStatus("chat-1")?.Status);
+        Assert.Equal(1, failOnce);
+        Assert.Equal(1, runtime.GetStatus("chat-1")?.PublicEventCount);
+        Assert.True(runtime.GetStatus("chat-1")?.IsTerminal);
+        Assert.Equal("Fail", runtime.GetStatus("chat-1")?.TerminalOperation);
+
+        var late = await CollectPublicUpdates(runtime, "chat-1");
+        Assert.Equal(received, late);
+    }
+
+    [Fact]
+    public async Task PersistentJournalFailureOnUnexpectedStreamEndStillClosesFeed()
+    {
+        using var folder = new TemporaryDirectory();
+        var blockWrites = 0;
+        var journal = new ChatJournal(folder.Path, _ =>
+        {
+            if (Volatile.Read(ref blockWrites) == 1)
+                throw new IOException("Simulated persistent storage failure.");
+        });
+        var provider = new FakeProvider { DeferCompletion = true };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"), journal);
+        await runtime.CreateAsync("first", CancellationToken.None);
+        var early = CollectPublicUpdates(runtime, "chat-1");
+        var simultaneous = CollectPublicUpdates(runtime, "chat-1");
+        Volatile.Write(ref blockWrites, 1);
+        provider.EndPublicStream();
+
+        var received = await early;
+        Assert.Equal(received.ToArray(), (await simultaneous).ToArray());
+        Assert.Equal(PublicUpdateOperation.Fail, Assert.Single(received).Operation);
+        var state = runtime.GetStatus("chat-1")!;
+        Assert.True(state.IsTerminal);
+        Assert.Equal("Fail", state.TerminalOperation);
+        Assert.Equal(1, state.PublicEventCount);
+        Assert.Equal("Final.Fail", state.LastPublicUpdateType);
+        // Storage is still unavailable: report the stale checkpoint honestly,
+        // alongside the terminal *in-memory* public feed.
+        Assert.Equal("generating", state.Status);
+
+        var late = await CollectPublicUpdates(runtime, "chat-1");
+        Assert.Equal(received, late);
+    }
+
+    [Fact]
+    public async Task ProviderStreamExceptionPublishesFailExactlyOnce()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider { ThrowOnWatch = true };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path));
+        await runtime.CreateAsync("first", CancellationToken.None);
+        var received = await CollectPublicUpdates(runtime, "chat-1");
+        Assert.Equal(PublicUpdateOperation.Fail, Assert.Single(received).Operation);
+        Assert.Equal("uncertain", runtime.GetStatus("chat-1")?.Status);
+        Assert.True(runtime.GetStatus("chat-1")?.IsTerminal);
+        Assert.Equal(1, runtime.GetStatus("chat-1")?.PublicEventCount);
+    }
+
+    private static async Task<IReadOnlyList<PublicConversationUpdate>> CollectPublicUpdates(
+        ChatRuntime runtime, string id)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var received = new List<PublicConversationUpdate>();
+        await foreach (var update in runtime.WatchAsync(id, timeout.Token))
+            received.Add(update);
+        return received;
+    }
+
     private static async Task<ConversationStatus> WaitForStatus(
         ChatRuntime runtime, string id, Func<ConversationStatus, bool> predicate)
     {
@@ -525,6 +618,7 @@ public sealed class HeadlessRuntimeTests
         public bool UncertainNextSend;
         public bool UncertainNextCreation;
         public bool DeferCompletion;
+        public bool ThrowOnWatch;
         public bool StopUncertain;
         public bool SupportsStop { get; set; } = true;
         public int StopCalls;
@@ -579,6 +673,7 @@ public sealed class HeadlessRuntimeTests
         public async IAsyncEnumerable<PublicConversationUpdate> WatchAsync(
             string id, [EnumeratorCancellation] CancellationToken cancellation)
         {
+            if (ThrowOnWatch) throw new IOException("Simulated provider stream failure.");
             while (await _events.Reader.WaitToReadAsync(cancellation))
             {
                 if (!_events.Reader.TryRead(out var update)) continue;

@@ -72,6 +72,12 @@ conversation's lifecycle status. Each accepted new turn resets the metrics;
 a follow-up's `sending` attempt starts a fresh feed before remote submission.
 A rejected or unconfirmed send may therefore have a locally terminal `Fail`
 while the journal separately reports `idle` or `uncertain`.
+If terminal journal persistence fails, Neko closes the public feed with
+`Final.Fail` instead of falsely acknowledging a durable completion. The
+journal is then marked `uncertain` when possible; if storage remains unavailable,
+the persisted `status` may be stale even though `isTerminal=true` reports that
+the local public feed has ended. Operators must reconcile the remote outcome
+before retrying.
 
 These metrics describe **only public updates that Neko has received and
 published**, plus explicit local failure signals. They cannot determine

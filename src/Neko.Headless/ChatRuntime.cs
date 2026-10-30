@@ -251,7 +251,7 @@ internal sealed class ChatRuntime : IDisposable
         _updates[id] = feed;
         _pumps[id] = Task.Run(async () =>
         {
-            var terminal = false;
+            var terminalPublished = false;
             try
             {
                 await foreach (var update in _provider.WatchAsync(id, _lifetime.Token))
@@ -262,28 +262,37 @@ internal sealed class ChatRuntime : IDisposable
                         feed.Publish(update);
                         continue;
                     }
-                    terminal = true;
                     VisibleConversation? snapshot = null;
                     try { snapshot = await _provider.ReadAsync(id, _lifetime.Token); }
                     catch (Exception) { /* Keep existing snapshot. */ }
-                    _journal.Update(id, latest => latest with {
+                    // Do not acknowledge a remote completion until its local
+                    // checkpoint is durable. A failed write must close the feed
+                    // with Fail instead of leaving SSE watchers waiting forever.
+                    if (_journal.Update(id, latest => latest with {
                         Status = update.Operation == PublicUpdateOperation.Complete ? "idle" : "uncertain",
                         History = snapshot ?? latest.History
-                    });
+                    }) is null)
+                        throw new IOException("The terminal checkpoint is unavailable.");
                     feed.Publish(update);
+                    terminalPublished = true;
                     break;
                 }
             }
-            catch (Exception) { /* The absence of a terminal receipt is uncertain. */ }
+            catch (Exception) { /* A failed checkpoint or stream is locally uncertain. */ }
             finally
             {
-                if (!terminal)
+                if (!terminalPublished)
                 {
-                    _journal.Update(id, current => current with { Status = "uncertain" });
+                    try
+                    {
+                        // Best effort only: if storage remains unavailable, the
+                        // journal may be stale, but live consumers must finish.
+                        _journal.Update(id, current => current with { Status = "uncertain" });
+                    }
+                    catch (Exception) { /* Never suppress the terminal feed event. */ }
                     feed.Publish(new PublicConversationUpdate(
                         Guid.NewGuid().ToString("D"), PublicUpdateKind.Final, PublicUpdateOperation.Fail));
                 }
-                // The terminal event also releases late subscribers.
             }
         });
     }
