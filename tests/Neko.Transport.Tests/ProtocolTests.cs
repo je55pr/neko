@@ -174,6 +174,36 @@ public sealed class ProtocolTests
 
 
     [Fact]
+    public void CorrelatedNativeCreation429IsRetryableButAmbiguousDispatchIsNot()
+    {
+        // This is the actual result type returned by NativeDispatchSender for
+        // a correlated HTTP rejection, not a fabricated provider receipt.
+        var rejected=new NativeDispatchSender.Result("http_rejected",
+            Dispatched:true,SseAccepted:false,HttpStatus:429,
+            ObservedPosts:1,CorrelatedPosts:1);
+        var receipt=ProjectProvider.ConfirmedNative429Receipt(rejected,60);
+        Assert.NotNull(receipt);
+        Assert.Equal(SendDisposition.Rejected,receipt.Disposition);
+        Assert.Equal("http_rejected",receipt.Reason);
+        Assert.True(receipt.Retryable);
+        Assert.Equal(60,receipt.RetryAfterSeconds);
+        Assert.Null(receipt.ConversationId);
+
+        // A known rejection with unknown cooldown stays honestly unknown.
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            rejected,null)!.RetryAfterSeconds);
+        // A timeout or lost response might have submitted: never mark safe.
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            new NativeDispatchSender.Result("submission_uncertain",true,false),60));
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            new NativeDispatchSender.Result("http_rejected",true,false,503),60));
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            new NativeDispatchSender.Result("sse_accepted",true,true,200),60));
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            new NativeDispatchSender.Result("dispatcher_unavailable",false,false),60));
+    }
+
+    [Fact]
     public void RemainingCooldownIsRoundedBoundedAndNeverInventedAfterExpiry()
     {
         var now=new DateTimeOffset(2026,10,30,12,0,0,TimeSpan.Zero);

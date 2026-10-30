@@ -61,6 +61,15 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
         new(SendDisposition.Rejected,"provider_rate_limited")
         { Retryable=true, RetryAfterSeconds=RateLimitRetryAfterSeconds };
 
+    // Only a correlated, definitively rejected HTTP response is safe to retry.
+    // A timeout or lost native response still has ambiguous delivery.
+    internal static SendReceipt? ConfirmedNative429Receipt(
+        NativeDispatchSender.Result result,int? retryAfterSeconds) =>
+        result.Dispatched && !result.SseAccepted && result.HttpStatus==429
+            ? new SendReceipt(SendDisposition.Rejected,result.State)
+              { Retryable=true, RetryAfterSeconds=retryAfterSeconds }
+            : null;
+
     private void ObserveHttpRateLimit(int? status)
     {
         if(status!=429)return;
@@ -246,6 +255,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
 
         await _sendGate.WaitAsync(cancellation);
         var dispatched=false;
+        var confirmedRejected=false;
         NativeLiveStreamHub.Attempt? capture=null;
         var stage="scope_preflight";
         try
@@ -273,6 +283,12 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
             if(!dispatched)
             {
                 return new SendReceipt(SendDisposition.Rejected,result.State);
+            }
+            var throttled=ConfirmedNative429Receipt(result,RateLimitRetryAfterSeconds);
+            if(throttled is not null)
+            {
+                confirmedRejected=true;
+                return throttled;
             }
 
             // A page-side submission can succeed even if WebView2 loses
@@ -334,7 +350,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
         {
             if(capture is not null)
                 await _live.FinishAsync(capture,
-                    dispatched?"submission_uncertain":"rejected",null);
+                    dispatched && !confirmedRejected?"submission_uncertain":"rejected",null);
             _sendGate.Release();
         }
     }
@@ -396,9 +412,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
                 return new SendReceipt(SendDisposition.Rejected,result.State);
             }
             if(!result.SseAccepted)
-                return result.HttpStatus==429?
-                    new SendReceipt(SendDisposition.Rejected,result.State)
-                    { Retryable=true, RetryAfterSeconds=RateLimitRetryAfterSeconds }:
+                return ConfirmedNative429Receipt(result,RateLimitRetryAfterSeconds) ??
                     new SendReceipt(
                         result.HttpStatus is >=400 ? SendDisposition.Rejected:
                         SendDisposition.Uncertain,result.State);

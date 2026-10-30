@@ -186,6 +186,7 @@ public sealed class RateLimitReceiptTests
 
         public Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation)
         {
+            cancellation.ThrowIfCancellationRequested();
             HistoryReads++;
             return Task.FromResult<VisibleConversation?>(HistoryUnavailable ? null :
                 new VisibleConversation(id, "Test", []));
@@ -194,6 +195,7 @@ public sealed class RateLimitReceiptTests
         public Task<bool> BelongsToScopeAsync(string scope, string id,
             CancellationToken cancellation)
         {
+            cancellation.ThrowIfCancellationRequested();
             ScopeChecks++;
             return Task.FromResult(!RejectScope429 && scope == "scope-a" && id == "chat-1");
         }
@@ -201,6 +203,9 @@ public sealed class RateLimitReceiptTests
         public Task<SendReceipt> CreateInScopeAsync(string scope,
             PreparedOutboundMessage submission, CancellationToken cancellation)
         {
+            cancellation.ThrowIfCancellationRequested();
+            Assert.Equal("scope-a", scope);
+            Assert.True(submission.CreatesConversation);
             Creations++;
             return Task.FromResult(RejectCreation429
                 ? new SendReceipt(SendDisposition.Rejected, "provider_rate_limited")
@@ -208,11 +213,14 @@ public sealed class RateLimitReceiptTests
                 : new SendReceipt(SendDisposition.Accepted, ConversationId: "chat-1"));
         }
 
-        public Task<SendReceipt> CreateAsync(string text, CancellationToken cancellation) =>
+        public Task<SendReceipt> CreateAsync(string _, CancellationToken __) =>
             throw new InvalidOperationException("Unscoped create must never be called.");
 
         public Task<SendReceipt> SendAsync(string id, string text, CancellationToken cancellation)
         {
+            cancellation.ThrowIfCancellationRequested();
+            Assert.Equal("chat-1", id);
+            Assert.False(string.IsNullOrWhiteSpace(text));
             Submissions++;
             return Task.FromResult(RejectSubmission429
                 ? new SendReceipt(SendDisposition.Rejected, "http_rejected")
@@ -222,11 +230,17 @@ public sealed class RateLimitReceiptTests
                     : new SendReceipt(SendDisposition.Accepted));
         }
 
-        public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(CancellationToken cancellation) =>
-            Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
+        public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(CancellationToken cancellation)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            return Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
+        }
 
-        public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
-            Task.FromResult(new StopReceipt(StopDisposition.Unsupported));
+        public Task<StopReceipt> StopAsync(string _, CancellationToken cancellation)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            return Task.FromResult(new StopReceipt(StopDisposition.Unsupported));
+        }
 
         public async IAsyncEnumerable<PublicConversationUpdate> WatchAsync(string id,
             [EnumeratorCancellation] CancellationToken cancellation)
