@@ -168,7 +168,13 @@ internal sealed class BrowserSession : IDisposable
             .then(async response=>{
                 if(!response.ok){
                     const raw=response.headers.get('retry-after');
-                    const retryAfterSeconds=raw && /^\d{1,5}$/.test(raw) ? Number(raw) : 0;
+                    const trimmed=raw?.trim();
+                    const isSeconds=!!trimmed && /^\d+$/.test(trimmed);
+                    const parsedDate=!isSeconds && trimmed ? Date.parse(trimmed) : NaN;
+                    const retryAfterSeconds=isSeconds
+                        ? Math.min(600,Number(trimmed))
+                        : Number.isFinite(parsedDate)
+                            ? Math.min(600,Math.max(0,Math.ceil((parsedDate-Date.now())/1000))) : 0;
                     reply({status:response.status,ok:false,retryAfterSeconds});return;
                 }
                 const data=await response.json();

@@ -97,7 +97,14 @@ internal sealed class ChatRuntime : IDisposable
             {
                 // A read can fail transiently (e.g. rate limiting). No send
                 // occurred, so keep the chat idle for a later guarded attempt.
-                return new SendReceipt(SendDisposition.Rejected, "provider_history_unavailable");
+                return new SendReceipt(SendDisposition.Rejected, "provider_history_unavailable")
+                {
+                    // History preflight failed before any submission. A later
+                    // explicit attempt is safe, but never submit without a fresh read.
+                    Retryable = true,
+                    RetryAfterSeconds = (_provider as IProviderRateLimitStatus)?
+                        .RateLimitRetryAfterSeconds
+                };
             }
             // Bind the new stream before making "sending" observable, so
             // watchers cannot replay a terminal event from the previous turn.
