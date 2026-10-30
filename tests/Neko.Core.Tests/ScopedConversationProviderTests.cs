@@ -134,7 +134,7 @@ public sealed class ScopedConversationProviderTests
             Sends++;
             return Task.FromResult(new SendReceipt(SendDisposition.Accepted));
         }
-        public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation)
+        public Task<StopReceipt> StopAsync(string _, CancellationToken cancellation)
         {
             StopCalls++;
             return Task.FromResult(new StopReceipt(StopDisposition.Requested));
