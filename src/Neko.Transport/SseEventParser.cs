@@ -4,45 +4,66 @@ using System.Text;
 namespace Neko.Transport;
 
 /// <summary>
-/// Incremental UTF-8 SSE framing, independent of network chunk boundaries.
-/// This parser never decides that an HTTP 200 means generation completed.
+/// Incremental SSE framing. Limits apply to an incomplete line or event,
+/// not to the size of a network chunk containing many valid events.
 /// </summary>
 internal sealed class SseEventParser
 {
-    internal sealed record Event(string Name, string Data, string? Id);
-    private const int MaxFrame = 1024 * 1024;
-    private readonly StringBuilder _pending = new();
-    private readonly List<string> _data = [];
-    private string _name = "", _id = "";
+    internal sealed record Event(string Name,string Data,string? Id);
+    private const int MaxFrame=1024*1024;
+    private readonly StringBuilder _line=new();
+    private readonly List<string> _data=[];
+    private int _eventSize;
+    private string _name="",_id="";
 
     public IReadOnlyList<Event> Push(string text)
     {
-        _pending.Append(text);
-        if (_pending.Length > MaxFrame) throw new InvalidDataException("SSE frame exceeds limit.");
-        var emitted = new List<Event>();
-        while (true)
+        var emitted=new List<Event>();
+        for(var pos=0;pos<text.Length;)
         {
-            var raw = _pending.ToString();
-            var newline = raw.IndexOf('\n');
-            if (newline < 0) break;
-            var line = raw[..newline].TrimEnd('\r');
-            _pending.Remove(0,newline+1);
-            if (line.Length == 0)
+            var end=text.IndexOf('\n',pos);
+            if(end<0)
             {
-                if (_data.Count != 0)
-                    emitted.Add(new Event(_name, string.Join("\n",_data), _id.Length==0?null:_id));
-                _name=""; _id=""; _data.Clear();
+                _line.Append(text,pos,text.Length-pos);
+                if(_line.Length>MaxFrame)
+                    throw new InvalidDataException("SSE line exceeds limit.");
+                break;
+            }
+            _line.Append(text,pos,end-pos);
+            if(_line.Length>MaxFrame)
+                throw new InvalidDataException("SSE line exceeds limit.");
+            var line=_line.ToString().TrimEnd('\r');
+            _line.Clear();
+            pos=end+1;
+            if(line.Length==0)
+            {
+                if(_data.Count>0)
+                    emitted.Add(new Event(_name,string.Join("\n",_data),
+                        _id.Length==0?null:_id));
+                _name="";_id="";_eventSize=0;_data.Clear();
                 continue;
             }
-            if (line.StartsWith(':')) continue;
-            var colon = line.IndexOf(':');
-            var field = colon < 0 ? line : line[..colon];
-            var value = colon < 0 ? "" : line[(colon+1)..].TrimStart(' ');
+            if(line.StartsWith(':'))continue;
+            var colon=line.IndexOf(':');
+            var field=colon<0?line:line[..colon];
+            var value=colon<0?"":line[(colon+1)..].TrimStart(' ');
             switch(field)
             {
-                case "data": _data.Add(value); break;
-                case "event": _name = value; break;
-                case "id": if (!value.Contains('\0')) _id = value; break;
+                case "data":
+                    _eventSize+=value.Length+1;
+                    if(_eventSize>MaxFrame)
+                        throw new InvalidDataException("SSE event exceeds limit.");
+                    _data.Add(value);
+                    break;
+                case "event":
+                    _name=value;
+                    break;
+                case "id":
+                    if(!value.Contains('\0'))_id=value;
+                    break;
+                default:
+                    // Unknown fields are valid SSE extensions.
+                    break;
             }
         }
         return emitted;

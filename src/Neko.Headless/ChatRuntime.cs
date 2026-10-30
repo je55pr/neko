@@ -99,6 +99,10 @@ internal sealed class ChatRuntime : IDisposable
                 return new SendReceipt(SendDisposition.Rejected, "provider_history_unavailable");
             }
             _journal.Set(current with { Status = "sending", History = upstream });
+            // Install a fresh feed before dispatch. Subscribers must never
+            // replay the previous turn's terminal event while sending.
+            var feed=new ConversationUpdateFeed();
+            _updates[id]=feed;
 
             SendReceipt receipt;
             try { receipt = await _commands.SendAsync(prepared.Message, cancellation); }
@@ -108,13 +112,17 @@ internal sealed class ChatRuntime : IDisposable
             {
                 case SendDisposition.Rejected:
                     _journal.Update(id, latest => latest with { Status = "idle" });
+                    feed.Publish(new PublicConversationUpdate(id,PublicUpdateKind.Final,
+                        PublicUpdateOperation.Fail));
                     break;
                 case SendDisposition.Accepted:
-                    _journal.Set(current with { Status = "generating" });
-                    StartPump(id);
+                    _journal.Update(id, latest => latest with { Status = "generating" });
+                    StartPump(id,feed);
                     break;
                 default:
-                    _journal.Set(current with { Status = "uncertain" });
+                    _journal.Update(id, latest => latest with { Status = "uncertain" });
+                    feed.Publish(new PublicConversationUpdate(id,PublicUpdateKind.Final,
+                        PublicUpdateOperation.Fail));
                     break;
             }
             return receipt;
@@ -134,7 +142,12 @@ internal sealed class ChatRuntime : IDisposable
             if (current.Status != "generating")
                 return new StopReceipt(StopDisposition.NotActive, "conversation_not_generating");
 
-            _journal.Update(id, latest => latest with { Status = "stopping" });
+            var transition=_journal.Update(id,latest =>
+                latest.Status=="generating"?
+                    latest with {Status="stopping"}:latest);
+            if(transition?.Status!="stopping")
+                return new StopReceipt(StopDisposition.NotActive,
+                    "conversation_already_finished");
             StopReceipt receipt;
             try { receipt = await _commands.StopAsync(id, cancellation); }
             catch (Exception) { receipt = new StopReceipt(StopDisposition.Uncertain, "stop_unknown"); }
@@ -143,7 +156,8 @@ internal sealed class ChatRuntime : IDisposable
                 _journal.Update(id, latest => latest.Status == "stopping"
                     ? latest with { Status = "generating" } : latest);
             else if (receipt.Disposition == StopDisposition.Uncertain)
-                _journal.Update(id, latest => latest with { Status = "stop_uncertain" });
+                _journal.Update(id, latest => latest.Status=="stopping"
+                    ? latest with { Status = "stop_uncertain" }: latest);
             // A requested stop remains pending until an authoritative terminal event.
             return receipt;
         }
@@ -185,9 +199,9 @@ internal sealed class ChatRuntime : IDisposable
             yield return update;
     }
 
-    private void StartPump(string id)
+    private void StartPump(string id,ConversationUpdateFeed? currentFeed=null)
     {
-        var feed = new ConversationUpdateFeed();
+        var feed = currentFeed??new ConversationUpdateFeed();
         _updates[id] = feed;
         _pumps[id] = Task.Run(async () =>
         {

@@ -28,7 +28,6 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
 
     private readonly BrowserSession _browser;
     private readonly TransportSettings _settings;
-    private readonly BrowserFetchTransport _wire;
     private readonly NativeDispatchSender _sender;
     private readonly NativeLiveStreamHub _live;
     private readonly SemaphoreSlim _sendGate = new(1,1);
@@ -47,13 +46,20 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
     {
         _settings=settings;
         _browser = new BrowserSession(settings.ProfileDirectory,settings);
-        _wire = new BrowserFetchTransport(_browser);
         _sender = new NativeDispatchSender(_browser);
         _live = new NativeLiveStreamHub(_browser);
     }
 
-    private bool ValidScope(string id) =>
-        Regex.IsMatch(id,_settings.ScopePattern,RegexOptions.IgnoreCase);
+    private bool ValidScope(string id)
+    {
+        try
+        {
+            return Regex.IsMatch(id,_settings.ScopePattern,
+                RegexOptions.IgnoreCase|RegexOptions.CultureInvariant,
+                TimeSpan.FromMilliseconds(200));
+        }
+        catch(RegexMatchTimeoutException) { return false; }
+    }
 
     private async Task<HashSet<string>?> ProjectIdsAsync(string scope, CancellationToken cancellation)
     {
@@ -67,27 +73,39 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             var path = _settings.Format(_settings.ProjectListingPath,"scope",scope)
                 .Replace("{cursor}",Uri.EscapeDataString(cursor),
                     StringComparison.Ordinal);
-            var reply = await _wire.RequestAsync("GET", path, cancellation: cancellation);
-            if (reply.Status == 429)
+            using var result=await _browser.ReadAsync(path,"project");
+            var root=result.RootElement;
+            if(!root.TryGetProperty("ok",out var ok) ||
+               ok.ValueKind!=JsonValueKind.True)
             {
-                lock (_cooldownGate)
-                    _readCooldownUntil = DateTimeOffset.UtcNow.AddSeconds(
-                        Math.Clamp(reply.RetryAfterSeconds, 60, 600));
+                var status=root.TryGetProperty("status",out var code) &&
+                    code.ValueKind==JsonValueKind.Number?code.GetInt32():0;
+                if(status==429)
+                {
+                    var retry=root.TryGetProperty("retryAfterSeconds",out var seconds) &&
+                        seconds.ValueKind==JsonValueKind.Number?seconds.GetInt32():0;
+                    lock(_cooldownGate)
+                        _readCooldownUntil=DateTimeOffset.UtcNow.AddSeconds(
+                            Math.Clamp(retry,60,600));
+                }
                 return null;
             }
-            if (reply.Status != 200) return null;
-            using var result = JsonDocument.Parse(reply.Body);
-            var root = result.RootElement;
-            if (!root.TryGetProperty("items", out var items) ||
-                items.ValueKind != JsonValueKind.Array) return null;
-            foreach (var entry in root.GetProperty("items").EnumerateArray())
+            if(!root.TryGetProperty("valid",out var valid) ||
+               valid.ValueKind!=JsonValueKind.True ||
+               !root.TryGetProperty("truncated",out var clipped) ||
+               clipped.ValueKind!=JsonValueKind.False ||
+               !root.TryGetProperty("items",out var items) ||
+               items.ValueKind!=JsonValueKind.Array)return null;
+            foreach(var entry in items.EnumerateArray())
             {
-                var id = entry.GetProperty("id").GetString();
-                if (!string.IsNullOrWhiteSpace(id)) seen.Add(id);
+                if(!entry.TryGetProperty("id",out var value) ||
+                   value.ValueKind!=JsonValueKind.String ||
+                   !Guid.TryParse(value.GetString(),out _))return null;
+                seen.Add(value.GetString()!);
             }
-            var next = root.GetProperty("cursor");
-            if (next.ValueKind != JsonValueKind.String ||
-                string.IsNullOrWhiteSpace(next.GetString()))
+            if(!root.TryGetProperty("cursor",out var next) ||
+               next.ValueKind!=JsonValueKind.String ||
+               string.IsNullOrWhiteSpace(next.GetString()))
                 return seen;
             cursor = next.GetString()!;
             if (!cursors.Add(cursor)) return null;
@@ -162,6 +180,11 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
         catch (Exception) { return false; }
     }
 
+    internal static bool MatchesCreationReceipt(bool accepted,string? correlatedId,
+        IEnumerable<string> newlyListedIds) =>
+        accepted && Guid.TryParse(correlatedId,out _) &&
+        newlyListedIds.Contains(correlatedId,StringComparer.OrdinalIgnoreCase);
+
     // The signed-in application's own submission function performs request
     // preparation and verification. We never interact with a composer.
     public async Task<SendReceipt> CreateInScopeAsync(
@@ -199,7 +222,6 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             dispatched=result.Dispatched;
             if(!dispatched)
             {
-                await _live.FinishAsync(capture,"rejected",null);
                 return new SendReceipt(SendDisposition.Rejected,result.State);
             }
 
@@ -209,7 +231,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             stage="scope_reconciliation";
             var resolvedId=Guid.TryParse(result.ServerConversationId,out _)?
                 result.ServerConversationId:null;
-            string? onlyNewCandidate=null;
+
             for(var attempt=0;attempt<5;attempt++)
             {
                 if(attempt>0)
@@ -219,37 +241,22 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                 if(after is null)break;
                 var additions=after.Except(existing).Where(id=>
                     Guid.TryParse(id,out _)).Take(12).ToArray();
-                onlyNewCandidate=additions.Length==1?additions[0]:null;
-                if(result.SseAccepted && resolvedId is not null &&
-                   additions.Contains(resolvedId,StringComparer.OrdinalIgnoreCase))
+                // A same-text message is not a unique operation identity.
+                if(MatchesCreationReceipt(result.SseAccepted,resolvedId,additions))
                 {
-                    StartPolling(resolvedId,"",capture);
+                    StartPolling(resolvedId!,"",capture);
+                    capture=null; // Polling now owns the live observer.
                     return new SendReceipt(SendDisposition.Accepted,
                         ConversationId:resolvedId);
                 }
-                foreach(var id in additions)
-                {
-                    var transcript=await SnapshotAsync(id);
-                    if(transcript is null)
-                    {
-                        if(IsRateLimited())break;
-                        continue;
-                    }
-                    if(transcript.Conversation.Messages.Any(x=>
-                        x.Role==VisibleMessageRole.User &&
-                        x.Text==submission.Text))
-                    {
-                        StartPolling(id,"",capture);
-                        return new SendReceipt(SendDisposition.Accepted,
-                            ConversationId:id);
-                    }
-                }
+                // Never choose a conversation based only on prompt text.
+                // Two distinct creations may have identical first messages.
                 if(IsRateLimited())break;
             }
             return new SendReceipt(SendDisposition.Uncertain,
                 result.HttpStatus is >=400?"submission_rejected_but_scope_unverified":
                 "project_creation_pending_verification",
-                ConversationId:resolvedId??onlyNewCandidate);
+                ConversationId:resolvedId);
         }
         catch(Exception ex)
         {
@@ -260,11 +267,23 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                     DateTimeOffset.UtcNow.ToString("O")+" native_create_"+
                     stage+" "+ex.GetType().Name+Environment.NewLine);
             }
-            catch(Exception){}
+            catch(Exception)
+            {
+                // Diagnostics are best effort. The original failure remains
+                // represented by the sanitized receipt below.
+                System.Diagnostics.Trace.TraceWarning(
+                    "Neko transport creation diagnostic unavailable.");
+            }
             return new SendReceipt(dispatched?SendDisposition.Uncertain:
                 SendDisposition.Rejected,"adapter_"+stage+"_failed");
         }
-        finally{_sendGate.Release();}
+        finally
+        {
+            if(capture is not null)
+                await _live.FinishAsync(capture,
+                    dispatched?"submission_uncertain":"rejected",null);
+            _sendGate.Release();
+        }
     }
 
     public Task<SendReceipt> CreateAsync(string text, CancellationToken cancellation) =>
@@ -312,7 +331,6 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             attempted=result.Dispatched;
             if(!result.Dispatched)
             {
-                await _live.FinishAsync(capture,"rejected",id);
                 return new SendReceipt(SendDisposition.Rejected,result.State);
             }
             if(!result.SseAccepted)
@@ -320,6 +338,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                     result.HttpStatus is >=400 ? SendDisposition.Rejected:
                     SendDisposition.Uncertain,result.State);
             StartPolling(id,before.LastAssistantId,capture);
+            capture=null; // Polling now owns the live observer.
             return new SendReceipt(SendDisposition.Accepted);
         }
         catch(Exception ex)
@@ -331,11 +350,32 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                     DateTimeOffset.UtcNow.ToString("O")+" native_send_"+
                     stage+" "+ex.GetType().Name+Environment.NewLine);
             }
-            catch(Exception){}
+            catch(Exception)
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    "Neko transport send diagnostic unavailable.");
+            }
             return new SendReceipt(attempted?SendDisposition.Uncertain:
                 SendDisposition.Rejected,"adapter_"+stage+"_failed");
         }
-        finally{_sendGate.Release();}
+        finally
+        {
+            if(capture is not null)
+                await _live.FinishAsync(capture,
+                    attempted?"submission_uncertain":"rejected",id);
+            _sendGate.Release();
+        }
+    }
+
+    internal static PublicConversationUpdate? PollUpdate(
+        string messageId,string newText,string published)
+    {
+        if(newText==published)return null;
+        var append=newText.StartsWith(published,StringComparison.Ordinal);
+        return new PublicConversationUpdate(messageId,PublicUpdateKind.Final,
+            append && published.Length>0?PublicUpdateOperation.Append:
+                PublicUpdateOperation.Replace,
+            append && published.Length>0?newText[published.Length..]:newText);
     }
 
     private void StartPolling(string id,string previousAssistant,
@@ -347,6 +387,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
         _=Task.Run(async()=>{
             var updateId=Guid.NewGuid().ToString("D");
             var last="";
+            var pollingPublished="";
             string? finalText=null;
             var complete=false;
             try
@@ -357,13 +398,19 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                 while(!deadline.IsCancellationRequested)
                 {
                     await Task.Delay(3500,deadline.Token);
-                    var snapshot=await SnapshotAsync(id);
+                    RemoteSnapshot? snapshot;
+                    try { snapshot=await SnapshotAsync(id); }
+                    catch(OperationCanceledException) when(deadline.IsCancellationRequested)
+                    { break; }
+                    catch(Exception) { continue; } // A transient read is not terminal.
                     if(snapshot is null ||
                        snapshot.LastAssistantId==previousAssistant ||
                        string.IsNullOrWhiteSpace(snapshot.LastAssistantId))
                         continue;
                     var finished=snapshot.LastAssistantStatus=="finished_successfully";
-                    if(snapshot.LastAssistantText!=last)
+                    // Reconcile at completion even if the latest snapshot
+                    // text was already observed while capture was active.
+                    if(snapshot.LastAssistantText!=last || finished)
                     {
                         last=snapshot.LastAssistantText;
                         // CDP emits genuine streaming updates. If capture is
@@ -372,21 +419,16 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                         if(finished || capture is null || !capture.Capturing ||
                            capture.StreamEnded)
                         {
-                            var alreadyPublished=capture?.LastPublished??"";
-                            if(capture is null || alreadyPublished!=last)
+                            var baseline=capture is not null &&
+                                capture.LastPublished.Length>0?
+                                capture.LastPublished:pollingPublished;
+                            var update=PollUpdate(snapshot.LastAssistantId,
+                                last,baseline);
+                            if(update is not null)
                             {
-                                var append=capture is not null &&
-                                    last.StartsWith(alreadyPublished,
-                                        StringComparison.Ordinal);
-                                var operation=append?
-                                    PublicUpdateOperation.Append:
-                                    PublicUpdateOperation.Replace;
-                                var piece=append?last[alreadyPublished.Length..]:last;
-                                var update=new PublicConversationUpdate(
-                                    snapshot.LastAssistantId,PublicUpdateKind.Final,
-                                    operation,piece);
                                 capture?.Archive.RecordVisible(update,last);
                                 channel.Writer.TryWrite(update);
+                                pollingPublished=last;
                             }
                         }
                     }

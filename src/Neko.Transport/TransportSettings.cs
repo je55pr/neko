@@ -17,7 +17,6 @@ internal sealed record TransportSettings
     public string ConversationHistoryPath { get; init; } = "";
     public string StreamStatusPath { get; init; } = "";
     public string SubmitPath { get; init; } = "";
-    public string PreparePath { get; init; } = "";
     public string ScopePattern { get; init; } = "";
     public string ComposerSelector { get; init; } = "";
     public string SubmitExportName { get; init; } = "";
@@ -46,6 +45,11 @@ internal sealed record TransportSettings
         var settings=JsonSerializer.Deserialize<TransportSettings>(root.GetRawText(),
             new JsonSerializerOptions { PropertyNameCaseInsensitive=true })
             ?? throw new InvalidOperationException("Transport settings unavailable.");
+        var folder=Path.GetDirectoryName(Path.GetFullPath(path))!;
+        var localProfile=Path.IsPathRooted(settings.ProfileDirectory)
+            ?settings.ProfileDirectory:
+             Path.Combine(folder,settings.ProfileDirectory);
+        settings=settings with {ProfileDirectory=Path.GetFullPath(localProfile)};
         settings.Validate();
         return settings;
     }
@@ -55,15 +59,19 @@ internal sealed record TransportSettings
         if(!Uri.TryCreate(SiteOrigin,UriKind.Absolute,out var uri) ||
            uri.Scheme!="https" || !string.IsNullOrEmpty(uri.Query) ||
            !string.IsNullOrEmpty(uri.Fragment) ||
-           uri.AbsolutePath!="/")
+           !string.IsNullOrEmpty(uri.UserInfo) ||
+           uri.AbsolutePath!="/" ||
+           !string.Equals(SiteOrigin,uri.GetLeftPart(UriPartial.Authority),
+               StringComparison.Ordinal))
             throw new InvalidOperationException("Valid HTTPS service origin required.");
         if(string.IsNullOrWhiteSpace(ProfileDirectory) ||
            !Directory.Exists(ProfileDirectory))
             throw new InvalidOperationException("Configured user session unavailable.");
         var paths=new[] { ApiPrefix,AssetPrefix,ProjectListingPath,
-            ConversationHistoryPath,StreamStatusPath,SubmitPath,PreparePath };
+            ConversationHistoryPath,StreamStatusPath,SubmitPath };
         if(paths.Any(x=>string.IsNullOrWhiteSpace(x) ||
-            !x.StartsWith('/') || x.Contains("..") ||
+            !x.StartsWith('/') || x.StartsWith("//",StringComparison.Ordinal) ||
+            x.Contains("..") ||
             x.Contains('#') || x.Contains('\\')))
             throw new InvalidOperationException("Transport paths must be relative to the service origin.");
         if(string.IsNullOrWhiteSpace(ScopePattern) || ScopePattern.Length>200)

@@ -11,6 +11,13 @@ using Neko.Headless;
 
 var command = args.Length == 0 ? "help" : args[0].ToLowerInvariant();
 var configIndex = Array.IndexOf(args, "--config");
+if (configIndex >= 0 &&
+    (configIndex + 1 >= args.Length || args[configIndex + 1].StartsWith("--")))
+{
+    Console.Error.WriteLine("The --config option requires a file path.");
+    Environment.ExitCode = 2;
+    return;
+}
 var configPath = configIndex >= 0 && configIndex + 1 < args.Length
     ? args[configIndex + 1]
     : Environment.GetEnvironmentVariable("NEKO_CONFIG_FILE") ?? "secrets.json";

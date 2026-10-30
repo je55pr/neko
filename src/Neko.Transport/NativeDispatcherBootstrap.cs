@@ -12,6 +12,20 @@ namespace Neko.Transport;
 /// </summary>
 internal static class NativeDispatcherBootstrap
 {
+    // Frontend script bodies are untrusted and may be malformed. Limit
+    // source matching so initialization cannot hang in regex backtracking.
+    private static System.Text.RegularExpressions.MatchCollection SafeMatches(
+        string input,string pattern) =>
+        System.Text.RegularExpressions.Regex.Matches(input,pattern,
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant,
+            TimeSpan.FromMilliseconds(200));
+
+    private static bool SafeIsMatch(string input,string pattern) =>
+        System.Text.RegularExpressions.Regex.IsMatch(input,pattern,
+            System.Text.RegularExpressions.RegexOptions.NonBacktracking,
+            TimeSpan.FromMilliseconds(200));
+
+
     public const string InstallScript="""
       (() => {
         const ready=window.__nekoTransport;
@@ -212,14 +226,14 @@ internal static class NativeDispatcherBootstrap
             if(export<0)return null;
             var left=Math.Max(0,export-2048);
             var prefix=source[left..export];
-            var matches=System.Text.RegularExpressions.Regex.Matches(prefix,
+            var matches=SafeMatches(prefix,
                 @"(?<module>[\w$]+)\s*:\s*(?:\(function\((?<args>[\w$,\s]+)\)\s*\{|function\((?<args>[\w$,\s]+)\)\s*\{|\((?<args>[\w$,\s]+)\)\s*=>\s*\{)");
             for(var i=matches.Count-1;i>=0;i--)
             {
                 var match=matches[i];
                 var args=match.Groups["args"].Value.Split(',');
                 if(args.Length!=3 || args.Any(a=>
-                    !System.Text.RegularExpressions.Regex.IsMatch(a.Trim(),@"^[\w$]+$")))
+                    !SafeIsMatch(a.Trim(),@"^[\w$]+$")))
                     continue;
                 // The named export normally appears in the first statement.
                 // Avoid stopping in an unrelated nested function.
@@ -246,7 +260,7 @@ internal static class NativeDispatcherBootstrap
             if(index<0)return null;
             var left=Math.Max(0,index-4000);
             var prefix=source[left..index];
-            var matches=System.Text.RegularExpressions.Regex.Matches(prefix,
+            var matches=SafeMatches(prefix,
                 @"(?<module>[\w$]+)\s*:\s*(?:\(function\((?<args>[\w$,\s]+)\)\s*\{|function\((?<args>[\w$,\s]+)\)\s*\{|\((?<args>[\w$,\s]+)\)\s*=>\s*\{)");
             for(var i=matches.Count-1;i>=0;i--)
             {
@@ -255,7 +269,7 @@ internal static class NativeDispatcherBootstrap
                 var start=left+m.Index+m.Length;
                 if(index-start>3500)continue;
                 var factoryPrefix=source[start..Math.Min(index,start+500)];
-                if(!System.Text.RegularExpressions.Regex.IsMatch(
+                if(!SafeIsMatch(
                     factoryPrefix,@"\bs\s*:\s*\(\)\s*=>"))
                     continue;
                 return m.Groups["module"].Value;
@@ -275,7 +289,7 @@ internal static class NativeDispatcherBootstrap
             if(!source[Math.Max(0,index-80)..index].Contains(
                 "queryKey:",StringComparison.Ordinal))continue;
             var prefix=source[Math.Max(0,index-2200)..index];
-            var matches=System.Text.RegularExpressions.Regex.Matches(prefix,
+            var matches=SafeMatches(prefix,
                 @"(?<module>[\w$]+)\s*:\s*\(function\([\w$,\s]+\)\s*\{");
             if(matches.Count>0)
                 return matches[^1].Groups["module"].Value;

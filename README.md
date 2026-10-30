@@ -68,7 +68,7 @@ New turns are archived in `%LOCALAPPDATA%\Neko\conversation-archives`, with the 
 - `<attempt-id>.jsonl`: an append-only sequence of `append` / `replace` changes suitable for exact replay.
 - `conversation-<id>.txt`: completed turns accumulated for convenient reading.
 
-The archive preserves **observed, user-visible output**, not hidden internal reasoning, raw protocol traffic or authentication data. Prior overwritten drafts cannot be recreated retroactively. Local files are plaintext and never automatically deleted or uploaded; apply filesystem access controls and backups as appropriate.
+The archive preserves **observed, user-visible output**, including the **full user prompts**, not hidden internal reasoning or raw protocol traffic. If a user types passwords, tokens or other sensitive information into a prompt, those strings will be preserved in plaintext too. Prior overwritten drafts cannot be recreated retroactively. Local files are never automatically deleted or uploaded; apply filesystem access controls and backups as appropriate.
 
 ## Development
 

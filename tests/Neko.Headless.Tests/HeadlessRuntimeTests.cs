@@ -33,6 +33,64 @@ public sealed class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task NewSendWatchersCannotReplayPreviousTurnCompletion()
+    {
+        using var folder=new TemporaryDirectory();
+        var inner=new FakeProvider();
+        using var runtime=new ChatRuntime(
+            new ScopedConversationProvider(inner,"scope-a"),
+            new ChatJournal(folder.Path));
+        await runtime.CreateAsync("first",CancellationToken.None);
+        await WaitForTerminal(runtime,"chat-1");
+        var pending=new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        inner.PendingSend=pending;
+        var send=runtime.SendAsync("chat-1","second",CancellationToken.None);
+        for(var attempt=0;attempt<50 &&
+            runtime.List().Single().Status!="sending";attempt++)
+            await Task.Delay(10);
+        Assert.Equal("sending",runtime.List().Single().Status);
+        using var cancel=new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await using var watcher=runtime.WatchAsync("chat-1",cancel.Token)
+            .GetAsyncEnumerator(cancel.Token);
+        var next=watcher.MoveNextAsync().AsTask();
+        await Task.Delay(80);
+        Assert.False(next.IsCompleted); // It must not see old Complete.
+        pending.SetResult(new SendReceipt(SendDisposition.Rejected,"test_reject"));
+        Assert.Equal(SendDisposition.Rejected,(await send).Disposition);
+        Assert.True(await next);
+        Assert.Equal(PublicUpdateOperation.Fail,watcher.Current.Operation);
+        Assert.Equal("idle",runtime.List().Single().Status);
+    }
+
+    [Fact]
+    public async Task SendPreservesLatestHistoryWhileReceiptIsPending()
+    {
+        using var folder=new TemporaryDirectory();
+        var inner=new FakeProvider();
+        using var runtime=new ChatRuntime(
+            new ScopedConversationProvider(inner,"scope-a"),
+            new ChatJournal(folder.Path));
+        await runtime.CreateAsync("first",CancellationToken.None);
+        await WaitForTerminal(runtime,"chat-1");
+        var pending=new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        inner.PendingSend=pending;
+        var send=runtime.SendAsync("chat-1","second",CancellationToken.None);
+        for(var attempt=0;attempt<50 &&
+            runtime.List().Single().Status!="sending";attempt++)
+            await Task.Delay(10);
+        var read=await runtime.ReadAsync("chat-1",CancellationToken.None);
+        Assert.NotNull(read);
+        Assert.NotNull(runtime.List().Single().History);
+        pending.SetResult(new SendReceipt(SendDisposition.Uncertain,"test_uncertain"));
+        Assert.Equal(SendDisposition.Uncertain,(await send).Disposition);
+        Assert.Equal("uncertain",runtime.List().Single().Status);
+        Assert.NotNull(runtime.List().Single().History);
+        Assert.Equal(read.Messages.Count,runtime.List().Single().History!.Messages.Count);
+    }
+
+    [Fact]
     public async Task UnconfirmedSendSurvivesRestartAndNeverAutomaticallyRetries()
     {
         using var folder = new TemporaryDirectory();
@@ -187,6 +245,7 @@ public sealed class HeadlessRuntimeTests
         public bool DeferCompletion;
         public bool StopUncertain;
         public bool FailNextRead;
+        public TaskCompletionSource<SendReceipt>? PendingSend;
         private readonly Channel<PublicConversationUpdate> _events = Channel.CreateUnbounded<PublicConversationUpdate>();
         private readonly List<VisibleConversationMessage> _messages = [];
         public Task<bool> BelongsToScopeAsync(string scope, string id, CancellationToken cancellation) =>
@@ -207,6 +266,7 @@ public sealed class HeadlessRuntimeTests
         }
         public Task<SendReceipt> SendAsync(string id, string text, CancellationToken cancellation)
         {
+            if(PendingSend is not null)return PendingSend.Task;
             if (UncertainNextSend) return Task.FromResult(
                 new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"));
             AddExchange(text);

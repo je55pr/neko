@@ -53,8 +53,15 @@ internal sealed class BrowserSession : IDisposable
                     try {
                         File.AppendAllText(Path.Combine(Path.GetTempPath(), "neko-private-adapter.log"),
                             DateTimeOffset.UtcNow.ToString("O") + " browser_setup " +
-                            ex.GetType().Name + " " + ex.Message + Environment.NewLine);
-                    } catch { }
+                            ex.GetType().Name + Environment.NewLine);
+                    }
+                    catch (Exception)
+                    {
+                        // Diagnostic file failures are best effort and must
+                        // not replace the sanitized public startup error.
+                        System.Diagnostics.Trace.TraceWarning(
+                            "Neko transport startup diagnostic unavailable.");
+                    }
                     _ready.TrySetException(new InvalidOperationException(
                         "Authenticated browser session unavailable."));
                     window.Close();
@@ -173,9 +180,14 @@ internal sealed class BrowserSession : IDisposable
                 if(kind==='project'){
                     const items=Array.isArray(data.items)?data.items:[];
                     reply({status:response.status,ok:true,
-                        items:items.slice(0,100).map(x=>({
+                        // Complete ID projection without full conversation
+                        // objects. Reject excess data rather than silently
+                        // treating a truncated page as authoritative.
+                        items:items.slice(0,10000).map(x=>({
                             id:typeof x?.id==='string'?x.id:''
                         })).filter(x=>x.id),
+                        truncated:items.length>10000,
+                        valid:Array.isArray(data.items),
                         cursor:typeof data.cursor==='string'?data.cursor:null});
                     return;
                 }

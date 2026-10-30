@@ -93,8 +93,20 @@ internal sealed class ChatJournal
             var temp = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
-                File.WriteAllText(temp,
-                    JsonSerializer.Serialize(record with { UpdatedAt = DateTimeOffset.UtcNow }));
+                // Persist the new checkpoint before replacing the previous
+                // one. A crash must not lose the last safe delivery state.
+                using (var stream=new FileStream(temp,FileMode.CreateNew,
+                           FileAccess.Write,FileShare.None))
+                {
+                    using (var writer=new StreamWriter(stream,new UTF8Encoding(false),
+                               leaveOpen:true))
+                    {
+                        writer.Write(JsonSerializer.Serialize(record with {
+                            UpdatedAt=DateTimeOffset.UtcNow }));
+                        writer.Flush();
+                    }
+                    stream.Flush(flushToDisk:true);
+                }
                 File.Move(temp, file, true);
             }
             finally { if (File.Exists(temp)) File.Delete(temp); }

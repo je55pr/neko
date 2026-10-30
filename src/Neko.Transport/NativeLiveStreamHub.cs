@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO;
 using System.Text;
 using System.Text.Json;
@@ -101,8 +102,8 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
         public void Dispose()=>Finish("observer_disposed",ConversationId);
     }
 
-    private readonly Dictionary<string,Attempt> _byParent=new(StringComparer.Ordinal);
-    private readonly Dictionary<string,Attempt> _byRequest=new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string,Attempt> _byParent=new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string,Attempt> _byRequest=new(StringComparer.Ordinal);
     private CoreWebView2? _core;
     private CoreWebView2DevToolsProtocolEventReceiver? _requests,_responses,_data;
     private bool _disposed;
@@ -129,7 +130,8 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
                     _responses.DevToolsProtocolEventReceived+=OnResponse;
                     _data.DevToolsProtocolEventReceived+=OnData;
                 }
-                _byParent.Add(parentId,result);
+                if(!_byParent.TryAdd(parentId,result))
+                    throw new InvalidOperationException("Already observing this parent.");
                 return true;
             });
             return result;
@@ -232,15 +234,24 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
         {
             await browser.RunAsync(core=>
             {
-                _byParent.Remove(attempt.ParentId);
+                _byParent.TryRemove(attempt.ParentId,out _);
                 foreach(var key in _byRequest.Where(p=>ReferenceEquals(p.Value,attempt))
                     .Select(p=>p.Key).ToArray())
-                    _byRequest.Remove(key);
+                    _byRequest.TryRemove(key,out _);
                 attempt.Finish(outcome,conversationId,authoritativeText);
                 return Task.FromResult(true);
             });
         }
-        catch {attempt.Finish("browser_unavailable",conversationId,authoritativeText);}
+        catch
+        {
+            // The UI scheduler may be gone. Concurrent dictionaries allow
+            // deterministic cleanup even when no browser callback can run.
+            _byParent.TryRemove(attempt.ParentId,out _);
+            foreach(var key in _byRequest.Where(x=>ReferenceEquals(x.Value,attempt))
+                .Select(x=>x.Key).ToArray())
+                _byRequest.TryRemove(key,out _);
+            attempt.Finish("browser_unavailable",conversationId,authoritativeText);
+        }
     }
 
     public void Dispose()

@@ -7,7 +7,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 dotnet build 'src/Neko.Transport/Neko.Transport.csproj' -c Release --nologo
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
+$architecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()) {
     'X64' {'win-x64'}
     'X86' {'win-x86'}
     'Arm64' {'win-arm64'}
@@ -20,3 +20,4 @@ Copy-Item $native $destination -Force
 
 Write-Output 'Neko adapter installed. Starting headless API...'
 dotnet run --no-build -c Release --project src/Neko.Headless -- serve --config secrets.json
+exit $LASTEXITCODE
