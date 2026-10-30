@@ -141,6 +141,12 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
         }
     }
 
+    internal static string? ExtractParent(JsonElement payload,TransportSettings settings) =>
+        payload.ValueKind==JsonValueKind.Object &&
+        payload.TryGetProperty(settings.ParentField,out var parent) &&
+        parent.ValueKind==JsonValueKind.String
+            ?parent.GetString():null;
+
     private void OnRequest(object? _,CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
     {
         try
@@ -156,9 +162,8 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
                body.ValueKind!=JsonValueKind.String)return;
             using var json=JsonDocument.Parse(body.GetString()??"");
             var payload=json.RootElement;
-            if(!payload.TryGetProperty("parent_message_id",out var parent) ||
-               parent.ValueKind!=JsonValueKind.String)return;
-            var key=parent.GetString()??"";
+            var key=ExtractParent(payload,browser.Settings);
+            if(string.IsNullOrEmpty(key))return;
             if(!_byParent.TryGetValue(key,out var attempt))return;
             if(!NativeDispatchSender.MatchesWirePayload(payload,
                 attempt.ConversationId,attempt.ParentId,attempt.Scope,browser.Settings))return;

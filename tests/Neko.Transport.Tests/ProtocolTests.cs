@@ -14,6 +14,23 @@ public sealed class ProtocolTests
     };
 
     [Fact]
+    public void StreamRequestParentUsesConfiguredFieldName()
+    {
+        var settings=new TransportSettings {ParentField="custom_parent"};
+        var parent=Guid.NewGuid().ToString("D");
+        using var payload=JsonDocument.Parse(JsonSerializer.Serialize(
+            new Dictionary<string,string>
+            {
+                ["custom_parent"]=parent,
+                ["parent_message_id"]="wrong"
+            }));
+        Assert.Equal(parent,NativeLiveStreamHub.ExtractParent(
+            payload.RootElement,settings));
+        Assert.Null(NativeLiveStreamHub.ExtractParent(
+            payload.RootElement,new TransportSettings {ParentField="missing"}));
+    }
+
+    [Fact]
     public void CreationRequiresTheRequestedScopeAndParent()
     {
         var scope="team-"+new string('c',24);
