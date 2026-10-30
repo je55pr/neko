@@ -42,6 +42,33 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
         lock (_cooldownGate) return DateTimeOffset.UtcNow < _readCooldownUntil;
     }
 
+    internal static TimeSpan? RetryAfter(JsonElement root)
+    {
+        if(!root.TryGetProperty("status",out var code) ||
+           code.ValueKind!=JsonValueKind.Number ||
+           !code.TryGetInt32(out var status) || status!=429)return null;
+        var seconds=root.TryGetProperty("retryAfterSeconds",out var retry) &&
+            retry.ValueKind==JsonValueKind.Number &&
+            retry.TryGetInt32(out var value)?value:0;
+        return TimeSpan.FromSeconds(Math.Clamp(seconds,60,600));
+    }
+
+    internal static DateTimeOffset ExtendedCooldown(DateTimeOffset previous,
+        JsonElement response,DateTimeOffset now)
+    {
+        var delay=RetryAfter(response);
+        if(delay is null)return previous;
+        var until=now+delay.Value;
+        return until>previous?until:previous;
+    }
+
+    private void ObserveReadThrottle(JsonElement root)
+    {
+        lock(_cooldownGate)
+            _readCooldownUntil=ExtendedCooldown(
+                _readCooldownUntil,root,DateTimeOffset.UtcNow);
+    }
+
     public ProjectProvider(TransportSettings settings)
     {
         _settings=settings;
@@ -78,16 +105,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             if(!root.TryGetProperty("ok",out var ok) ||
                ok.ValueKind!=JsonValueKind.True)
             {
-                var status=root.TryGetProperty("status",out var code) &&
-                    code.ValueKind==JsonValueKind.Number?code.GetInt32():0;
-                if(status==429)
-                {
-                    var retry=root.TryGetProperty("retryAfterSeconds",out var seconds) &&
-                        seconds.ValueKind==JsonValueKind.Number?seconds.GetInt32():0;
-                    lock(_cooldownGate)
-                        _readCooldownUntil=DateTimeOffset.UtcNow.AddSeconds(
-                            Math.Clamp(retry,60,600));
-                }
+                ObserveReadThrottle(root);
                 return null;
             }
             if(!root.TryGetProperty("valid",out var valid) ||
@@ -126,16 +144,9 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
         var root = result.RootElement;
         if (!root.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
         {
-            var status = root.TryGetProperty("status", out var code) ? code.GetInt32() : 0;
-            if (status == 429)
-            {
-                var retry = root.TryGetProperty("retryAfterSeconds", out var seconds)
-                    && seconds.ValueKind == JsonValueKind.Number
-                    ? seconds.GetInt32() : 0;
-                lock (_cooldownGate)
-                    _readCooldownUntil = DateTimeOffset.UtcNow.AddSeconds(
-                        Math.Clamp(retry, 60, 600));
-            }
+            var status = root.TryGetProperty("status", out var code) &&
+                code.ValueKind==JsonValueKind.Number ? code.GetInt32() : 0;
+            ObserveReadThrottle(root);
             try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "neko-private-adapter.log"),
                 DateTimeOffset.UtcNow.ToString("O") + " snapshot_http " + status +
                 Environment.NewLine); }
@@ -439,10 +450,12 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                         // before publishing a terminal receipt.
                         try
                         {
+                            if(IsRateLimited())continue;
                             using var state=await _browser.ReadAsync(
                                 _settings.Format(_settings.StreamStatusPath,"id",id),
                                 "status");
                             var root=state.RootElement;
+                            ObserveReadThrottle(root);
                             var streamState=root.TryGetProperty("ok",out var ok) &&
                                 ok.ValueKind==JsonValueKind.True &&
                                 root.TryGetProperty("streamState",out var value) &&
@@ -456,28 +469,26 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                         { break; }
                         catch(Exception) { /* Status unavailable; keep observing. */ }
                     }
-                    // Reconcile at completion even if the latest snapshot
-                    // text was already observed while capture was active.
+                    // Reconcile against the actual last published text while
+                    // holding the native publication gate. At completion it
+                    // excludes delayed CDP callbacks before the final update.
                     if(snapshot.LastAssistantText!=last || finished)
                     {
                         last=snapshot.LastAssistantText;
-                        // CDP emits genuine streaming updates. If capture is
-                        // running, avoid interleaving stale polling snapshots.
-                        // A final authoritative snapshot always wins.
-                        if(!string.IsNullOrWhiteSpace(last) &&
-                           (finished || capture is null || !capture.Capturing ||
-                            capture.StreamEnded))
+                        if(!string.IsNullOrWhiteSpace(last))
                         {
-                            var baseline=capture is not null &&
-                                capture.LastPublished.Length>0?
-                                capture.LastPublished:pollingPublished;
-                            var update=PollUpdate(snapshot.LastAssistantId,
-                                last,baseline);
-                            if(update is not null)
+                            if(capture is not null)
+                                capture.PublishPolling(snapshot.LastAssistantId,
+                                    last,finished);
+                            else
                             {
-                                capture?.Archive.RecordVisible(update,last);
-                                channel.Writer.TryWrite(update);
-                                pollingPublished=last;
+                                var update=PollUpdate(snapshot.LastAssistantId,
+                                    last,pollingPublished);
+                                if(update is not null)
+                                {
+                                    channel.Writer.TryWrite(update);
+                                    pollingPublished=last;
+                                }
                             }
                         }
                     }

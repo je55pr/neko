@@ -33,6 +33,8 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
         public bool Capturing {get; internal set;}
         public bool StreamEnded {get; internal set;}
         internal bool Closed;
+        private readonly object _publicationGate=new();
+        private bool _reconciled;
 
         public Attempt(string parentId,string? conversationId,string? scope,
             string text,string? archiveDirectory=null,string fallbackMetadataKey="richPayload")
@@ -45,7 +47,18 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
 
         internal void ReceiveBase64(string raw)
         {
-            if(Closed || raw.Length>2_000_000)return;
+            lock(_publicationGate) ReceiveBase64Locked(raw);
+        }
+
+        internal void MarkCapturing()
+        {
+            lock(_publicationGate)
+                if(!Closed && !_reconciled)Capturing=true;
+        }
+
+        private void ReceiveBase64Locked(string raw)
+        {
+            if(Closed || _reconciled || raw.Length>2_000_000)return;
             try
             {
                 var bytes=Convert.FromBase64String(raw);
@@ -92,7 +105,33 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
             }
         }
 
+        // Reconcile the authoritative history while native events are excluded.
+        // An in-flight CDP callback may finish first, but can never write after
+        // the final verified text is published.
+        internal bool PublishPolling(string id,string text,bool verifiedFinal)
+        {
+            lock(_publicationGate)
+            {
+                if(Closed || _reconciled || string.IsNullOrWhiteSpace(text) ||
+                   (!verifiedFinal && Capturing && !StreamEnded))return false;
+                if(verifiedFinal)_reconciled=true;
+                var baseline=LastMessageId==id?LastPublished:"";
+                var update=ProjectProvider.PollUpdate(id,text,baseline);
+                if(update is null)return false;
+                Archive.RecordVisible(update,text);
+                LastPublished=text;
+                LastMessageId=id;
+                Updates.Writer.TryWrite(update);
+                return true;
+            }
+        }
+
         public void Finish(string outcome,string? id,string? serverText=null)
+        {
+            lock(_publicationGate) FinishLocked(outcome,id,serverText);
+        }
+
+        private void FinishLocked(string outcome,string? id,string? serverText)
         {
             if(Closed)return;
             Closed=true;
@@ -210,7 +249,7 @@ internal sealed class NativeLiveStreamHub(BrowserSession browser) : IDisposable
         {
             var json=await _core!.CallDevToolsProtocolMethodAsync(
                 "Network.streamResourceContent",JsonSerializer.Serialize(new {requestId=id}));
-            attempt.Capturing=true;
+            attempt.MarkCapturing();
             using var data=JsonDocument.Parse(json);
             if(data.RootElement.TryGetProperty("bufferedData",out var value) &&
                value.ValueKind==JsonValueKind.String)

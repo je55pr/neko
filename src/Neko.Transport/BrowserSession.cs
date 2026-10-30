@@ -154,7 +154,7 @@ internal sealed class BrowserSession : IDisposable
             actual.StartsWith("/g/",StringComparison.Ordinal);
     });
 
-    private const string ReadScript = """
+    internal const string ReadScript = """
         (() => {
             const path=__PATH__,kind=__KIND__,context=__HEADERS__,token=__TOKEN__;
             const reply=result=>chrome.webview.postMessage({
@@ -207,8 +207,8 @@ internal sealed class BrowserSession : IDisposable
                     const fallback=m?.metadata?.[__FALLBACK_METADATA_KEY__]?.fallbackMarkdown;
                     return {
                         id:typeof m?.id==='string'?m.id:'',
-                        role,text:(typeof fallback==='string' && role==='assistant'
-                            ?fallback:text).slice(0,150000),
+                        role,text:(typeof fallback==='string' && fallback.length>0 &&
+                            role==='assistant'?fallback:text).slice(0,150000),
                         status:typeof m?.status==='string'?m.status:''
                     };
                 }).filter(m=>m && m.id);

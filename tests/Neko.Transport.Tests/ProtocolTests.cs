@@ -137,6 +137,138 @@ public sealed class ProtocolTests
             final,"finished_successfully","answer",final,"COMPLETE"));
     }
 
+
+    [Fact]
+    public void HistoryProjectionKeepsVisiblePartsWhenFallbackMarkdownIsEmpty()
+    {
+        // A present but empty fallback must not hide populated content parts.
+        Assert.Contains("typeof fallback==='string' && fallback.length>0",
+            BrowserSession.ReadScript,StringComparison.Ordinal);
+        Assert.Contains("role==='assistant'?fallback:text",
+            BrowserSession.ReadScript,StringComparison.Ordinal);
+        Assert.Contains("parts.filter(p=>typeof p==='string').join('')",
+            BrowserSession.ReadScript,StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RateLimitResponseHonorsRetryAfterAndBounds()
+    {
+        static TimeSpan? Backoff(string json)
+        {
+            using var doc=JsonDocument.Parse(json);
+            return ProjectProvider.RetryAfter(doc.RootElement);
+        }
+
+        Assert.Equal(TimeSpan.FromSeconds(90),Backoff(
+            """{"ok":false,"status":429,"retryAfterSeconds":90}"""));
+        Assert.Equal(TimeSpan.FromSeconds(60),Backoff(
+            """{"ok":false,"status":429,"retryAfterSeconds":3}"""));
+        Assert.Equal(TimeSpan.FromSeconds(600),Backoff(
+            """{"ok":false,"status":429,"retryAfterSeconds":10000}"""));
+        Assert.Equal(TimeSpan.FromSeconds(60),Backoff(
+            """{"ok":false,"status":429,"retryAfterSeconds":"invalid"}"""));
+        Assert.Null(Backoff("""{"ok":true,"status":200}"""));
+        Assert.Null(Backoff("""{"ok":false,"status":503}"""));
+        Assert.Null(Backoff("""{"ok":false,"status":"429"}"""));
+    }
+
+
+    [Fact]
+    public void RepeatedRateLimitsNeverShortenAnExistingCooldown()
+    {
+        var now=new DateTimeOffset(2026,10,30,12,0,0,TimeSpan.Zero);
+        using var longResponse=JsonDocument.Parse(
+            """{"status":429,"retryAfterSeconds":240}""");
+        using var shortResponse=JsonDocument.Parse(
+            """{"status":429,"retryAfterSeconds":60}""");
+        using var success=JsonDocument.Parse("""{"status":200}""");
+
+        var until=ProjectProvider.ExtendedCooldown(
+            DateTimeOffset.MinValue,longResponse.RootElement,now);
+        Assert.Equal(now.AddSeconds(240),until);
+        Assert.Equal(until,ProjectProvider.ExtendedCooldown(
+            until,shortResponse.RootElement,now.AddSeconds(30)));
+        Assert.Equal(until,ProjectProvider.ExtendedCooldown(
+            until,success.RootElement,now.AddSeconds(50)));
+        Assert.Equal(now.AddSeconds(200),ProjectProvider.ExtendedCooldown(
+            now.AddSeconds(100),shortResponse.RootElement,now.AddSeconds(140)));
+    }
+
+    [Fact]
+    public void PolledMessageSwitchUsesReplaceInsteadOfAppendingToOtherMessage()
+    {
+        var folder=Path.Combine(Path.GetTempPath(),
+            "neko-message-switch-"+Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var id=Guid.NewGuid().ToString("D");
+            using var attempt=new NativeLiveStreamHub.Attempt(
+                Guid.NewGuid().ToString("D"),id,null,"test request",folder);
+            Assert.True(attempt.PublishPolling(
+                Guid.NewGuid().ToString("D"),"Hello",false));
+            Assert.True(attempt.PublishPolling(
+                Guid.NewGuid().ToString("D"),"Hello final",true));
+            var events=new List<PublicConversationUpdate>();
+            while(attempt.Updates.Reader.TryRead(out var update))events.Add(update);
+            Assert.Equal(2,events.Count);
+            Assert.All(events,e=>Assert.Equal(PublicUpdateOperation.Replace,e.Operation));
+            Assert.NotEqual(events[0].MessageId,events[1].MessageId);
+            attempt.Finish("server_verified_complete",id,"Hello final");
+        }
+        finally {Directory.Delete(folder,true);}
+    }
+
+    [Fact]
+    public void AuthoritativePollingReconciliationBlocksLateNativeUpdates()
+    {
+        var folder=Path.Combine(Path.GetTempPath(),
+            "neko-final-barrier-"+Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var id=Guid.NewGuid().ToString("D");
+            var message=Guid.NewGuid().ToString("D");
+            using var attempt=new NativeLiveStreamHub.Attempt(
+                Guid.NewGuid().ToString("D"),id,null,"test request",folder);
+            void Frame(string value)
+            {
+                var eventText="data: "+JsonSerializer.Serialize(new
+                {
+                    type="delta",v=new {message=new
+                    {
+                        id=message,author=new {role="assistant"},
+                        channel="final",recipient="all",status="in_progress",
+                        content=new {parts=new[]{value}}
+                    }}
+                })+"\n\n";
+                attempt.ReceiveBase64(Convert.ToBase64String(
+                    System.Text.Encoding.UTF8.GetBytes(eventText)));
+            }
+
+            Frame("Early");
+            attempt.Capturing=true;
+            Assert.False(attempt.PublishPolling(message,"stale",false));
+            Assert.True(attempt.PublishPolling(message,"Authoritative final",true));
+            Frame("Late stale frame");
+            Assert.False(attempt.PublishPolling(message,"stale",false));
+            attempt.Finish("server_verified_complete",id,"Authoritative final");
+
+            var updates=new List<PublicConversationUpdate>();
+            while(attempt.Updates.Reader.TryRead(out var update))
+                updates.Add(update);
+            Assert.Equal(2,updates.Count);
+            Assert.Equal("Early",updates[0].Text);
+            Assert.Equal(PublicUpdateOperation.Replace,updates[1].Operation);
+            Assert.Equal("Authoritative final",updates[1].Text);
+            var archive=File.ReadAllText(attempt.Archive.TextPath);
+            Assert.Contains("Authoritative final",archive);
+            Assert.DoesNotContain("Late stale frame",archive);
+            Assert.DoesNotContain("stale",archive);
+        }
+        finally {Directory.Delete(folder,true);}
+    }
+
     [Fact]
     public void ParserAcceptsLargeChunksOfIndividuallyBoundedEvents()
     {
