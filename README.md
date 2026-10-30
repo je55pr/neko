@@ -1,61 +1,84 @@
 # Neko
 
-A headless, provider-neutral conversation host with a localhost JSON API and CLI.
-No desktop frontend is required.
+A local, headless conversation host with a JSON API, command-line client, and an authenticated single-page transport. The host and transport are part of this repository. No desktop UI is required.
+
+## Requirements
+
+Windows, .NET 10 SDK, WebView2 Runtime, and an existing user-authorized session in the configured browser profile. The service is designed to run on the same computer as that session. Neko does not store or generate credentials for remote services.
 
 ## Setup
 
-Requires Windows and .NET 10. A provider adapter is built separately and kept out of this
-repository. The adapter must implement `IConversationProviderFactory`, returning
-an `IScopedConversationProvider`. Its `CreateInScopeAsync` must actually route
-the request to the configured scope. Its `BelongsToScopeAsync` must independently
-verify authoritative provider membership. Neko refuses startup without these
-contracts and refuses unverified sends or creations.
-
-1. Copy `secrets.example.json` to `secrets.json` (ignored by Git).
-2. Set an absolute or relative adapter assembly path and its factory type.
-3. Set an ignored adapter settings path and the required creation scope.
-4. Set a random local access token (at least 24 characters).
-5. Start the server:
+1. Copy `secrets.example.json` to `secrets.json`. **Only the latter is private**; do not commit it.
+2. Supply the locally authorized WebView2 profile directory and the service origin, route templates, module lookup names, and wire property names under `transport`. These values are service-specific and intentionally not hardcoded into the adapter.
+3. Supply the scope identifier you are authorized to use under `creationScope`, and generate a random localhost bearer `accessToken` of at least 24 characters.
+4. Start Neko:
 
 ```powershell
-dotnet run --project src/Neko.Headless -- serve --config secrets.json
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-headless.ps1
 ```
 
-From another terminal, including via Remote Desktop Commander:
+This script builds both the headless host and the tracked transport, copies the native WebView2 runtime dependency, and runs the server with the ignored local configuration.
+
+### CLI
+
+From another terminal:
 
 ```powershell
-dotnet run --project src/Neko.Headless -- health --config secrets.json
-dotnet run --project src/Neko.Headless -- create "Hello" --wait --config secrets.json
-dotnet run --project src/Neko.Headless -- list --config secrets.json
-dotnet run --project src/Neko.Headless -- send <conversation-id> "Continue" --wait --config secrets.json
-dotnet run --project src/Neko.Headless -- read <conversation-id> --config secrets.json
-dotnet run --project src/Neko.Headless -- status <conversation-id> --config secrets.json
+dotnet run --no-build -c Release --project src/Neko.Headless -- health --config secrets.json
+dotnet run --no-build -c Release --project src/Neko.Headless -- create "Hello" --wait --config secrets.json
+dotnet run --no-build -c Release --project src/Neko.Headless -- list --config secrets.json
+dotnet run --no-build -c Release --project src/Neko.Headless -- send <conversation-id> "Continue" --wait --config secrets.json
+dotnet run --no-build -c Release --project src/Neko.Headless -- read <conversation-id> --config secrets.json
+dotnet run --no-build -c Release --project src/Neko.Headless -- status <conversation-id> --config secrets.json
+dotnet run --no-build -c Release --project src/Neko.Headless -- watch <conversation-id> --config secrets.json
 ```
 
-The HTTP API binds to `127.0.0.1` only, requires a bearer token for every
-request, and supports `/health` and `/conversations` routes.
-`GET /conversations/{id}/events` streams server-sent JSON updates.
-No provider credentials, session URLs, scope IDs, or provider-specific protocol
-code belong in Git.
+### HTTP API
 
-## Reliability rules
+The server binds to `127.0.0.1` on the configured port. Every endpoint requires the locally configured bearer token.
 
-- Accepted means the provider accepted a submission, **not** that the response
-  finished. Only a terminal stream event marks completion.
-- A send, create or stream with an uncertain outcome is **never** automatically
-  retried. Its local checkpoint remains unresolved after restart.
-- Conversation snapshots are stored locally in `state/`, outside version control.
-  Scope enforcement applies to every new chat; existing IDs are not re-created.
-- A private adapter is responsible for authenticated delivery, authoritative
-  history, and ensuring the scope is honoured. The public host does not guess.
-- The current host is an initial working slice, **not** yet unlimited conversation
-  context. Cross-session summarisation and safe recovery require additional work.
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/health` | GET | Health check |
+| `/conversations` | GET | Locally tracked conversations |
+| `/conversations` | POST | Create a conversation in the configured scope |
+| `/conversations/{id}` | GET | Latest saved history, with server refresh |
+| `/conversations/{id}/status` | GET | Current local operation status |
+| `/conversations/{id}/messages` | POST | Continue an existing conversation |
+| `/conversations/{id}/events` | GET | Server-sent incremental text updates |
+| `/conversations/{id}/stop` | POST | Reserved; remote stop is **not implemented** |
+
+## Architecture and reliability
+
+The single WebView2 page supplies the signed-in execution environment. The adapter invokes the site's existing submission function with explicit conversation, parent and scope values. It does not navigate to individual conversations or interact with composer buttons. Read-only network observation captures live response updates. Server history verifies completion.
+
+The transport is deliberately isolated in `src/Neko.Transport`. Its configured origin, module export name, route patterns, headers, scope format and other service identifiers are read from `secrets.json`. The public host consumes only the neutral conversation contract in `src/Neko.Core`.
+
+- An `Accepted` submission is **not** a completed response. The conversation remains active until its terminal event or authoritative server history confirms completion.
+- Ambiguous sends and creations are **never** automatically retried. A crash can leave a pending checkpoint that requires reconciliation before another request.
+- A temporary server read failure must not be mistaken for successful completion.
+- Creation verifies remote membership of the required scope; an unverified new conversation is not reported as accepted.
+- The local journal under `state/` stores the latest conversation snapshots and operation states. Session files, local checkpoints and secrets are ignored by Git.
+
+## Permanent output archives
+
+New turns are archived in `%LOCALAPPDATA%\Neko\conversation-archives`, with the following outputs:
+
+- `<attempt-id>.txt`: a readable, timestamped history of received visible text including earlier versions overwritten by later replacements.
+- `<attempt-id>.jsonl`: an append-only sequence of `append` / `replace` changes suitable for exact replay.
+- `conversation-<id>.txt`: completed turns accumulated for convenient reading.
+
+The archive preserves **observed, user-visible output**, not hidden internal reasoning, raw protocol traffic or authentication data. Prior overwritten drafts cannot be recreated retroactively. Local files are plaintext and never automatically deleted or uploaded; apply filesystem access controls and backups as appropriate.
 
 ## Development
 
 ```powershell
-dotnet test tests/Neko.Core.Tests/Neko.Core.Tests.csproj
-dotnet test tests/Neko.Headless.Tests/Neko.Headless.Tests.csproj
+dotnet test tests/Neko.Core.Tests/Neko.Core.Tests.csproj -c Release
+dotnet test tests/Neko.Headless.Tests/Neko.Headless.Tests.csproj -c Release
+dotnet test tests/Neko.Transport.Tests/Neko.Transport.Tests.csproj -c Release
 node scripts/check-public-source.cjs
 ```
+
+Unit tests verify streaming updates, archive revisions, scope correlation, replay, and headless recovery semantics. Full live testing requires a separately configured, authorized browser session; CI does not make network calls or send messages to external services.
+
+**Known gaps:** remote generation cancellation, multi-client live streaming under load, automatic reconciliation of uncertain requests, archive browsing/export API, and non-text response preservation.

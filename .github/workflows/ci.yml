@@ -22,6 +22,10 @@ jobs:
           node-version: '22'
       - name: Build headless host
         run: dotnet build src/Neko.Headless/Neko.Headless.csproj --configuration Release
+      - name: Build transport
+        run: dotnet build src/Neko.Transport/Neko.Transport.csproj --configuration Release
+      - name: Run transport tests
+        run: dotnet test tests/Neko.Transport.Tests/Neko.Transport.Tests.csproj --configuration Release
       - name: Run core tests
         run: dotnet test tests/Neko.Core.Tests/Neko.Core.Tests.csproj --configuration Release
       - name: Run headless tests
