@@ -28,7 +28,6 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Analyse .NET project
-        if: ${{ hashFiles('Neko.csproj', 'src/Neko.Core/Neko.Core.csproj') != '' }}
         shell: pwsh
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -38,13 +37,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet sonarscanner begin "/k:$env:SONAR_PROJECT_KEY" "/o:$env:SONAR_ORGANIZATION" "/d:sonar.token=$env:SONAR_TOKEN"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (Test-Path src/Neko.App/Neko.csproj) {
-            dotnet build src/Neko.App/Neko.csproj --configuration Release --no-incremental
-          } elseif (Test-Path Neko.csproj) {
-            dotnet build Neko.csproj --configuration Release --no-incremental
-          } else {
-            dotnet build src/Neko.Core/Neko.Core.csproj --configuration Release --no-incremental
-          }
+          dotnet build src/Neko.Headless/Neko.Headless.csproj --configuration Release --no-incremental
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet sonarscanner end "/d:sonar.token=$env:SONAR_TOKEN"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
