@@ -25,3 +25,8 @@ TestResults/
 secrets.json
 **/secrets.json
 *.local.json
+state/
+private/
+local-session-profile/
+**/local-session-profile/
+*.pending
