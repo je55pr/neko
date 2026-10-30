@@ -372,7 +372,7 @@ public sealed class HeadlessRuntimeTests
         }
         public Task<IReadOnlyList<ConversationSummary>> BrowseAsync(CancellationToken cancellation) =>
             Task.FromResult<IReadOnlyList<ConversationSummary>>([]);
-        public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation)
+        public Task<StopReceipt> StopAsync(string _, CancellationToken cancellation)
         {
             StopCalls++;
             return Task.FromResult(new StopReceipt(StopUncertain
