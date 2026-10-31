@@ -210,6 +210,51 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
+    public void VerifiedEmptyAutomatedReviewRequiresOptInAndExhaustiveCommentEvidence()
+    {
+        var linked = new HashSet<long>();
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, linked, "", null));
+        Assert.True(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, linked, "", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: true));
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, linked, "", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: false));
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "other-bot", 9, linked, "", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: true));
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, new HashSet<long> { 9 }, "", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: true));
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, linked, "Some prose", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: true));
+
+        const string sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        using var olderBotComment = JsonDocument.Parse("""
+            [{"user":{"login":"review-bot"},"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+            """);
+        Assert.True(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            olderBotComment.RootElement, sha, "review-bot"));
+        using var currentBotComment = JsonDocument.Parse("""
+            [{"user":{"login":"review-bot"},"commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]
+            """);
+        Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            currentBotComment.RootElement, sha, "review-bot"));
+        using var unknownAuthor = JsonDocument.Parse("""
+            [{"user":null,"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+            """);
+        Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            unknownAuthor.RootElement, sha, "review-bot"));
+        using var unknownRevision = JsonDocument.Parse("""
+            [{"user":{"login":"other"}}]
+            """);
+        Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            unknownRevision.RootElement, sha, "review-bot"));
+    }
+
+    [Fact]
     public void WorkflowRunIdentityRequiresTrustedHostAndExactRepository()
     {
         using var valid = JsonDocument.Parse("""

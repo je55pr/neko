@@ -20,7 +20,8 @@ public sealed record PrReviewPolicy(
     IReadOnlyDictionary<string, string>? TrustedCheckWorkflows = null,
     string? AutomatedCheckWorkflow = null,
     string? AutomatedNoFindingsMarker = null,
-    IReadOnlyList<string>? AllowedRepositories = null);
+    IReadOnlyList<string>? AllowedRepositories = null,
+    bool AllowVerifiedEmptyAutomatedReview = false);
 public sealed record PrWorkerEvidence(string ConversationId, string CreatedForHead,
     DateTimeOffset CreatedAt, bool Completed, DateTimeOffset? CompletedAt,
     string? ReviewUrl, string? Verdict, string? ReviewerAccount,
@@ -194,7 +195,8 @@ public static class PrReviewGate
                 .ThenByDescending(r => r.SourceReviewId ?? long.MinValue).ToArray();
             if (botReviews.Length == 0)
                 blockers.Add("substantive_automated_review_missing");
-            if (string.IsNullOrWhiteSpace(policy.AutomatedNoFindingsMarker))
+            if (string.IsNullOrWhiteSpace(policy.AutomatedNoFindingsMarker) &&
+                !policy.AllowVerifiedEmptyAutomatedReview)
                 blockers.Add("automated_finding_policy_missing");
             // A successful check says a reviewer ran, NOT that it found no
             // defects. Only a configured, source-derived positive conclusion

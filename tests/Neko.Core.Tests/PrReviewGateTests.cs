@@ -66,6 +66,30 @@ public sealed class PrReviewGateTests
         Assert.Empty(result.Blockers);
     }
 
+    [Fact]
+    public void EmptyAutomatedReviewOptInStillRequiresTrustworthyReviewAndCheck()
+    {
+        var policy = Policy with {
+            AutomatedNoFindingsMarker = null,
+            AllowVerifiedEmptyAutomatedReview = true
+        };
+        Assert.True(Evaluate(policy: policy).Ready);
+        Assert.Contains("automated_finding_policy_missing",
+            Evaluate(policy: Policy with { AutomatedNoFindingsMarker = null }).Blockers);
+        var incomplete = Source() with {
+            Reviews = [Source().Reviews[0],
+                Source().Reviews[1] with { Substantive = false }]
+        };
+        Assert.Contains("substantive_automated_review_missing",
+            Evaluate(source: incomplete, policy: policy).Blockers);
+        var untrusted = Source() with {
+            Checks = [Source().Checks[0],
+                Source().Checks[1] with { ProducerId = "app:untrusted" }]
+        };
+        Assert.Contains("automated_review_run_not_successful",
+            Evaluate(source: untrusted, policy: policy).Blockers);
+    }
+
     [Theory]
     [InlineData("author-worker")]
     [InlineData("developer-worker")]

@@ -178,10 +178,39 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
 
     internal static bool SourceAutomatedNoFindings(
         string author, string? configuredReviewer, long reviewId,
-        IReadOnlySet<long> reviewsWithInlineComments, string body, string? marker) =>
+        IReadOnlySet<long> reviewsWithInlineComments, string body, string? marker,
+        bool allowVerifiedEmptyReview = false,
+        bool noAutomatedCommentsOnHead = false) =>
         StringComparer.OrdinalIgnoreCase.Equals(author, configuredReviewer) &&
         !reviewsWithInlineComments.Contains(reviewId) &&
-        VerifiedNoFindingsLine(body, marker);
+        (VerifiedNoFindingsLine(body, marker) ||
+         (allowVerifiedEmptyReview && body.Length == 0 &&
+          noAutomatedCommentsOnHead));
+
+    // Optional, explicitly configured no-findings evidence for automated
+    // reviewers that submit an empty COMMENTED review on a clean run.
+    // An empty review is never enough by itself: the gate still requires a
+    // single trusted successful check run, matching revision and submitted
+    // review. Unknown comment authors/revisions fail closed here.
+    internal static bool NoAutomatedInlineCommentsOnHead(
+        JsonElement comments, string head, string? configuredReviewer)
+    {
+        if (string.IsNullOrWhiteSpace(configuredReviewer) ||
+            comments.ValueKind != JsonValueKind.Array) return false;
+        foreach (var comment in comments.EnumerateArray())
+        {
+            if (comment.ValueKind != JsonValueKind.Object ||
+                !comment.TryGetProperty("user", out var user) ||
+                user.ValueKind != JsonValueKind.Object) return false;
+            var author = GetString(user, "login");
+            var revision = GetString(comment, "commit_id");
+            if (string.IsNullOrWhiteSpace(author) ||
+                string.IsNullOrWhiteSpace(revision)) return false;
+            if (StringComparer.OrdinalIgnoreCase.Equals(author, configuredReviewer) &&
+                revision == head) return false;
+        }
+        return true;
+    }
 
     internal static string BodyDigest(string body) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
@@ -345,6 +374,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         // Standalone PR comments can legitimately have a null review ID.
         // They do not count as evidence for a particular submitted review.
         var reviewComments = AssociatedReviewIds(comments.RootElement);
+        var emptyReviewCommentsClear = NoAutomatedInlineCommentsOnHead(
+            comments.RootElement, head, _policy?.AutomatedReviewer);
         var sourceReviews = new List<PrReview>();
         foreach (var r in reviews.RootElement.EnumerateArray())
         {
@@ -363,10 +394,14 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             // were later resolved. A clear body marker cannot override them.
             var findingsClear = SourceAutomatedNoFindings(authorId,
                 _policy?.AutomatedReviewer, reviewId, reviewComments,
-                body, _policy?.AutomatedNoFindingsMarker);
+                body, _policy?.AutomatedNoFindingsMarker,
+                _policy?.AllowVerifiedEmptyAutomatedReview == true &&
+                    verdict == "commented" && GetString(r, "commit_id") == head,
+                emptyReviewCommentsClear);
             sourceReviews.Add(new PrReview(GetString(r, "html_url") ?? "",
                 authorId, GetString(r, "commit_id") ?? "", verdict,
-                !string.IsNullOrWhiteSpace(body) || reviewComments.Contains(reviewId),
+                !string.IsNullOrWhiteSpace(body) || reviewComments.Contains(reviewId) ||
+                (_policy?.AllowVerifiedEmptyAutomatedReview == true && findingsClear),
                 submitted, BodyDigest(body), reviewId, findingsClear));
         }
 

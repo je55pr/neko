@@ -20,6 +20,7 @@ Set optional `reviewGate` in the local ignored host configuration. There is
     "automatedCheckProducer": "app:12345",
     "automatedCheckWorkflow": "workflow:400010385",
     "automatedNoFindingsMarker": "Actionable findings: 0",
+    "allowVerifiedEmptyAutomatedReview": false,
     "allowedRepositories": ["owner/repository"],
     "trustedCheckProducers": {
       "build-and-test": "app:23456",
@@ -59,6 +60,18 @@ blocked until a new commit or an eventual per-run evidence contract. This is
 an intentional conservative availability limit, not a signed run/review pair.
 No marker is assumed by default. Skipped, neutral, pending, rejected,
 cancelled, and check-only responses cannot pass.
+
+For automated reviewers that submit a **blank COMMENTED review when clean**, the
+operator may explicitly set `allowVerifiedEmptyAutomatedReview: true` instead
+of a no-findings marker. This narrower alternative accepts a truly empty review
+body only when the trusted automated review check completes successfully, the
+single run and submitted review can be bound to the exact current head, and
+the complete source inline-comment page verifies **no comments from that bot
+on that head**. Unknown comment authors or revisions fail closed. An empty
+body without a trusted successful run or a submitted review never counts.
+Only enable this for a reviewer whose documented clean-review behaviour is a
+blank review; the source must not report actionable findings solely through
+another channel. Normal positive zero-count markers remain preferred.
 
 ## Explicit operations
 
