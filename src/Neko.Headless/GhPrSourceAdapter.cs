@@ -165,9 +165,13 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             if (allLines.Count(other => other.Contains(
                     stem, StringComparison.OrdinalIgnoreCase)) != 1)
                 return false;
-            // Shared parser covers both plain and Markdown-bracketed
-            // severity headings, including [P1] and ### [P1] findings.
-            return !PrReviewGate.ContainsSeverityFinding(body);
+            // The one configured header is a validated zero-count status,
+            // not a contradictory BLOCKERS: finding. Remove just that marker
+            // before scanning the remaining review for severity evidence.
+            // Earlier uniqueness validation prevents a second marker.
+            var otherContent = body.Replace(marker, "",
+                StringComparison.OrdinalIgnoreCase);
+            return !PrReviewGate.ContainsSeverityFinding(otherContent);
         }
         return false;
     }

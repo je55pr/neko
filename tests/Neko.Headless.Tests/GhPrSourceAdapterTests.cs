@@ -123,6 +123,21 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
+    public void BotZeroBlockerHeaderDoesNotMaskLaterInlineFindings()
+    {
+        const string marker = "No blockers: 0";
+        Assert.True(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**No blockers: 0**\nEverything checked clean.", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**No blockers: 0**\nA late note reports P1: Unsafe merge.", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**No blockers: 0**\nBLOCKERS: Another defect.", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable findings: 0**\n1. P1: Unsafe merge path remains.",
+            "Actionable findings: 0"));
+    }
+
+    [Fact]
     public void CheckRunSnapshotRequestsAllSameHeadRuns()
     {
         const string sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

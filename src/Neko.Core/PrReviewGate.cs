@@ -72,10 +72,16 @@ public static class PrReviewGate
             if (SeverityHeading(line) ||
                 line.Contains("BLOCKERS:", StringComparison.OrdinalIgnoreCase))
                 return true;
-            for (var i = 0; i + 3 < line.Length; i++)
-                if (line[i] == '[' && line[i + 1] is 'P' or 'p' &&
-                    line[i + 2] is >= '0' and <= '3' && line[i + 3] == ']')
+            for (var i = 0; i + 1 < line.Length; i++)
+            {
+                // In-line severity labels must be checked too. A review may
+                // claim zero findings at the top while describing P1: later.
+                if (line[i] is 'P' or 'p' &&
+                    line[i + 1] is >= '0' and <= '3' &&
+                    (i == 0 || IsSeverityBoundary(line[i - 1])) &&
+                    (i + 2 == line.Length || IsSeverityBoundary(line[i + 2])))
                     return true;
+            }
         }
         return false;
     }
