@@ -13,7 +13,8 @@ internal sealed record ManagerRecord(
     string? CheckpointPointer,
     IReadOnlyList<string> OutstandingJobReferences,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    string? PendingOperationId = null);
 
 internal sealed class ManagerRegistry
 {

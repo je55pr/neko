@@ -66,6 +66,20 @@ internal static class LocalClient
                 route = $"conversations/{Uri.EscapeDataString(positional[0])}/stop";
                 method = HttpMethod.Post;
                 break;
+            case "reconcile" when positional.Count == 1:
+                route = $"conversations/{Uri.EscapeDataString(positional[0])}/reconcile";
+                method = HttpMethod.Post;
+                break;
+            case "reconcile-creation" when positional.Count == 0:
+                route = "conversations/creation/reconcile";
+                method = HttpMethod.Post;
+                break;
+            case "reconcile-manager" when positional.Count == 1:
+                var name = positional[0].StartsWith("manager/", StringComparison.Ordinal)
+                    ? positional[0]["manager/".Length..] : positional[0];
+                route = $"managers/{Uri.EscapeDataString(name)}/reconcile";
+                method = HttpMethod.Post;
+                break;
             case "watch" when positional.Count == 1:
                 await WatchAsync(client, positional[0]);
                 return 0;
@@ -138,9 +152,11 @@ internal static class LocalClient
                 if (operation == "Replace") Console.WriteLine();
                 Console.Write(text);
             }
-            if (kind == "Final" && operation is "Complete" or "Fail")
+            if (kind == "Final" && operation is "Complete" or "Fail" or "ObservationExpired")
             {
-                Console.WriteLine(operation == "Complete" ? "\n[complete]" : "\n[unconfirmed]");
+                Console.WriteLine(operation == "Complete" ? "\n[complete]" :
+                    operation == "ObservationExpired" ? "\n[observer expired; remote outcome unknown]" :
+                        "\n[unconfirmed]");
                 return;
             }
         }

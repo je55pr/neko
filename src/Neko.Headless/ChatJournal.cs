@@ -5,9 +5,26 @@ using Neko;
 
 namespace Neko.Headless;
 
+internal sealed record PendingTurnEvidence(
+    string PromptSha256, IReadOnlyList<string> BaselineMessageIds,
+    bool AcceptedSubmission = false, string? CorrelatedUserMessageId = null,
+    string? OperationId = null);
+
+internal sealed record ReconciliationDecision(
+    DateTimeOffset CheckedAt, string Outcome, string Reason,
+    string PromptSha256, string? UserMessageId = null,
+    string? AssistantMessageId = null, string? OperationId = null);
+
+internal sealed record CreationPendingRecord(
+    string? PromptSha256, string? OwnerId,
+    string? CorrelatedConversationId, DateTimeOffset StartedAt,
+    DateTimeOffset? LastCheckedAt = null, string? LastCheckReason = null);
+
 internal sealed record ChatRecord(
     string Id, string Status, VisibleConversation? History = null,
-    DateTimeOffset UpdatedAt = default, string? ProgressTurnId = null);
+    DateTimeOffset UpdatedAt = default, string? ProgressTurnId = null,
+    PendingTurnEvidence? PendingTurn = null,
+    ReconciliationDecision? LastReconciliation = null);
 
 /// <summary>Local checkpoint data. Never stored in the repository.</summary>
 internal sealed class ChatJournal
@@ -15,12 +32,15 @@ internal sealed class ChatJournal
     private readonly string _directory;
     private readonly object _gate = new();
     private readonly Action<ChatRecord>? _beforePersist;
+    private readonly Action<CreationPendingRecord>? _beforeCreationPersist;
 
     // Optional injection permits deterministic filesystem-failure regressions.
-    public ChatJournal(string directory, Action<ChatRecord>? beforePersist = null)
+    public ChatJournal(string directory, Action<ChatRecord>? beforePersist = null,
+        Action<CreationPendingRecord>? beforeCreationPersist = null)
     {
         _directory = Path.GetFullPath(directory);
         _beforePersist = beforePersist;
+        _beforeCreationPersist = beforeCreationPersist;
         Directory.CreateDirectory(_directory);
     }
 
@@ -40,15 +60,77 @@ internal sealed class ChatJournal
 
     // A crash during creation cannot prove that no remote chat was created.
     // The next process must not retry until the operator has reconciled it.
-    public bool TryStartCreation()
+    public bool TryStartCreation(string promptSha256, string? ownerId = null)
     {
         lock (_gate)
         {
             var path = Path.Combine(_directory, "creation.pending");
             if (File.Exists(path)) return false;
-            using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write);
+            var pending = new CreationPendingRecord(promptSha256, ownerId, null,
+                DateTimeOffset.UtcNow);
+            _beforeCreationPersist?.Invoke(pending);
+            using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write,
+                FileShare.None);
+            using (var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen:true))
+            {
+                writer.Write(JsonSerializer.Serialize(pending));
+                writer.Flush();
+            }
+            stream.Flush(flushToDisk:true);
             return true;
         }
+    }
+
+    // A legacy/corrupt marker must remain blocking and is never inferred away.
+    public CreationPendingRecord? GetPendingCreation()
+    {
+        lock (_gate)
+        {
+            var file = Path.Combine(_directory, "creation.pending");
+            if (!File.Exists(file)) return null;
+            try
+            {
+                return JsonSerializer.Deserialize<CreationPendingRecord>(File.ReadAllText(file))
+                    ?? new CreationPendingRecord(null,null,null,default);
+            }
+            catch (JsonException)
+            {
+                return new CreationPendingRecord(null,null,null,default);
+            }
+        }
+    }
+
+    public void SetCreationCorrelation(string conversationId)
+    {
+        lock (_gate)
+        {
+            var pending=GetPendingCreation();
+            if (pending?.PromptSha256 is null)
+                throw new InvalidOperationException("Creation evidence is unavailable.");
+            if (pending.CorrelatedConversationId is not null &&
+                pending.CorrelatedConversationId != conversationId)
+                throw new InvalidOperationException("Creation identity cannot change.");
+            var updated=pending with { CorrelatedConversationId=conversationId };
+            WriteCreationPending(updated);
+        }
+    }
+
+    public void RecordCreationCheck(string reason)
+    {
+        lock (_gate)
+        {
+            var pending=GetPendingCreation();
+            if (pending?.PromptSha256 is null) return;
+            WriteCreationPending(pending with {
+                LastCheckedAt=DateTimeOffset.UtcNow, LastCheckReason=reason
+            });
+        }
+    }
+
+    private void WriteCreationPending(CreationPendingRecord updated)
+    {
+        _beforeCreationPersist?.Invoke(updated);
+        WriteAtomic(Path.Combine(_directory, "creation.pending"), updated);
     }
 
     public void ClearCreation()
@@ -57,6 +139,21 @@ internal sealed class ChatJournal
         {
             var path = Path.Combine(_directory, "creation.pending");
             if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    // The identity check and removal are one critical section. Otherwise a
+    // concurrent creation could replace the guard between read and delete.
+    public bool ClearCorrelatedCreation(string ownerId, string conversationId)
+    {
+        lock (_gate)
+        {
+            var pending = GetPendingCreation();
+            if (pending?.OwnerId != ownerId ||
+                pending.CorrelatedConversationId != conversationId)
+                return false;
+            File.Delete(Path.Combine(_directory, "creation.pending"));
+            return true;
         }
     }
 
@@ -93,28 +190,32 @@ internal sealed class ChatJournal
         lock (_gate)
         {
             _beforePersist?.Invoke(record);
-            var file = FileName(record.Id);
-            var temp = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            try
-            {
-                // Persist the new checkpoint before replacing the previous
-                // one. A crash must not lose the last safe delivery state.
-                using (var stream=new FileStream(temp,FileMode.CreateNew,
-                           FileAccess.Write,FileShare.None))
-                {
-                    using (var writer=new StreamWriter(stream,new UTF8Encoding(false),
-                               leaveOpen:true))
-                    {
-                        writer.Write(JsonSerializer.Serialize(record with {
-                            UpdatedAt=DateTimeOffset.UtcNow }));
-                        writer.Flush();
-                    }
-                    stream.Flush(flushToDisk:true);
-                }
-                File.Move(temp, file, true);
-            }
-            finally { if (File.Exists(temp)) File.Delete(temp); }
+            WriteAtomic(FileName(record.Id),
+                record with { UpdatedAt = DateTimeOffset.UtcNow });
         }
+    }
+
+    // Shared durable checkpoint protocol for conversation journals and
+    // creation markers. Faults must leave the previous file intact.
+    private static void WriteAtomic<T>(string file, T value)
+    {
+        var temp = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew,
+                       FileAccess.Write, FileShare.None))
+            {
+                using (var writer = new StreamWriter(stream,
+                           new UTF8Encoding(false), leaveOpen: true))
+                {
+                    writer.Write(JsonSerializer.Serialize(value));
+                    writer.Flush();
+                }
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, file, overwrite: true);
+        }
+        finally { if (File.Exists(temp)) File.Delete(temp); }
     }
 
     private ChatRecord? Read(string file)

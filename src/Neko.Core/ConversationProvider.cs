@@ -60,7 +60,7 @@ public enum StopDisposition { NotActive, Requested, Uncertain, Unsupported }
 public sealed record StopReceipt(StopDisposition Disposition,string Reason="");
 
 public enum PublicUpdateKind { Final, Progress, Activity }
-public enum PublicUpdateOperation { Start, Replace, Append, Complete, Fail }
+public enum PublicUpdateOperation { Start, Replace, Append, Complete, Fail, ObservationExpired }
 
 public sealed record PublicConversationUpdate(
     string MessageId,PublicUpdateKind Kind,PublicUpdateOperation Operation,

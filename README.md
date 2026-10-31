@@ -163,25 +163,60 @@ The transport is deliberately isolated in `src/Neko.Transport`. Its configured o
 - Creation verifies remote membership of the required scope; an unverified new conversation is not reported as accepted.
 - The local journal under `state/` stores the latest conversation snapshots and operation states. Session files, local checkpoints and secrets are ignored by Git.
 
-### Operator recovery after uncertain delivery
+### Explicit reconciliation of uncertain operations
 
-If a submission is marked `uncertain`, **do not resend the same request** just because the local API did not receive confirmation. First stop Neko, back up the configured `stateDirectory`, and compare the recorded conversation ID, latest visible prompt and provider-side history with the intended project. A `creation.pending` file is a fail-closed guard for a possibly delivered creation; its presence alone does not indicate rejection. Keep that marker and the archive until the remote outcome has been independently established.
+Reconciliation is a **read-only remote verification**, invoked explicitly by an
+operator. No uncertain or accepted submission is automatically retried. The
+host retains the original prompt digest, ordered pre-send message IDs, any
+confirmed admission evidence and the final reconciliation decision in durable
+checkpoints. It does not choose a remote conversation by matching prompt text.
 
-There is currently no automated reconciliation or safe unlock endpoint. If the remote outcome is positively established by an operator, record the evidence in the local backup and deliberately reconcile the matching local journal/checkpoint while the service is stopped. If the outcome cannot be established, preserve the uncertain state and avoid another send or creation. Never blindly delete the guard or replay an ambiguous prompt.
+With the existing authenticated local service running, use:
 
-Keep the authenticated browser profile **outside this repository**. The example `local-session-profile/` directory is ignored only to prevent accidental staging during local experiments.
+```powershell
+dotnet run --no-build -c Release --project src/Neko.Headless -- reconcile <conversation-id> --config secrets.json
+dotnet run --no-build -c Release --project src/Neko.Headless -- reconcile-manager manager/main --config secrets.json
+dotnet run --no-build -c Release --project src/Neko.Headless -- reconcile-creation --config secrets.json
+```
 
-## Reconciliation of uncertain operations
+Corresponding authenticated JSON API operations are `POST
+/conversations/{id}/reconcile`, `POST /managers/{name}/reconcile`, and
+`POST /conversations/creation/reconcile`. These return `outcome` and
+`reason` (`restored`, `blocked`, `not_applicable`, or
+`guard_cleared`). Manager reconciliation may return `guard_cleared`
+when a durable, server-correlated manager binding safely releases a
+stranded global creation guard after a crash. This does **not** certify
+that its active turn finished. Manager results also include the registry
+snapshot. Only an exact newly observed user
+message, proven submission correlation, fresh authoritative history, and an
+independent remote terminal-success state can restore `idle`; the durable
+journal update must succeed first. The provider must implement the optional
+read-only reconciliation contract. Legacy uncorrelated turns cannot be
+unlocked by a mere transcript match, even when the apparent text matches.
 
-An `Uncertain` receipt means delivery cannot safely be repeated. After
-stopping the service, inspect `state/creation.pending` for a blocked creation
-or `state/<conversation-id>.json` for a blocked follow-up. Check the remote
-conversation history and project membership **before** taking any action.
-If a matching request exists, record its server conversation ID and reconcile
-the local state with that authoritative record. If the result remains unknown,
-leave the checkpoint intact and do not replay the message. Archive the original
-checkpoint and your evidence before any manual resolution. Never simply remove
-the checkpoint to make a retry possible.
+A `creation.pending` marker is a global fail-closed guard. Creation
+reconciliation needs a conversation ID **correlated by the original
+submission**, a matching first turn and verified completion. Manager-owned
+creation cannot be reconciled through the unowned creation endpoint; its
+registry binding is committed before the global creation guard is removed.
+Missing IDs, transient history failures, rate limiting, ambiguous histories,
+and terminal failures all stay blocked. A confirmed rejected send was never
+ambiguous and remains `idle`, requiring a new explicit send to try again.
+
+The 12-minute observation deadline is **not** a remote failure. It now emits
+`ObservationExpired`, leaving the conversation `uncertain` until a later
+explicit reconciliation establishes actual completion. The legacy `Fail`
+terminal also does not prove a remote failure. No event or GET read alone
+releases a blocked send.
+
+Before attempting recovery, back up the ignored `stateDirectory` and
+preserve any archives. Do not delete `creation.pending`, alter hashed
+journal checkpoint files, or replay a request to bypass a safety guard. If
+evidence remains inconclusive, preserve the block for investigation.
+
+Keep the authenticated browser profile **outside this repository**. The
+example `local-session-profile/` directory is ignored only to prevent
+accidental staging during local experiments.
 
 ## Permanent output archives
 
@@ -204,4 +239,4 @@ node scripts/check-public-source.cjs
 
 Unit tests verify streaming updates, archive revisions, scope correlation, replay, and headless recovery semantics. Full live testing requires a separately configured, authorized browser session; CI does not make network calls or send messages to external services.
 
-**Known gaps:** remote generation cancellation, multi-client live streaming under load, automatic reconciliation of uncertain requests, archive browsing/export API, and non-text response preservation.
+**Known gaps:** remote generation cancellation, multi-client live streaming under load, reconciliation of legacy operations without unique correlation evidence, archive browsing/export API, and non-text response preservation.

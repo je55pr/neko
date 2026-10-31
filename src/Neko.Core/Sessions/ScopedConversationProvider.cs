@@ -30,7 +30,8 @@ public interface IConversationProviderFactory
 /// Other operations delegate to the original provider without changing transport data.
 /// </summary>
 public sealed class ScopedConversationProvider :
-    IConversationProvider, IPreparedConversationProvider, IProviderRateLimitStatus, IDisposable
+    IConversationProvider, IPreparedConversationProvider, IProviderRateLimitStatus,
+    IAuthoritativeReconciliationProvider, IDisposable
 {
     private readonly IScopedConversationProvider _provider;
     private readonly string _scope;
@@ -131,6 +132,18 @@ public sealed class ScopedConversationProvider :
         try { return await _provider.BelongsToScopeAsync(_scope, id, cancellation); }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
         catch (Exception) { return false; }
+    }
+
+    public async Task<ReconciliationInspection> InspectAsync(
+        ReconciliationProbe probe, CancellationToken cancellation)
+    {
+        if (_provider is not IAuthoritativeReconciliationProvider inspector)
+            return new ReconciliationInspection(false, "verification_unsupported");
+        if (!await VerifyAsync(probe.ConversationId, cancellation))
+            return new ReconciliationInspection(false,
+                RateLimitRetryAfterSeconds.HasValue
+                    ? "provider_rate_limited" : "scope_not_verified");
+        return await inspector.InspectAsync(probe, cancellation);
     }
 
     public void Dispose()

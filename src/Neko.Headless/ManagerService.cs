@@ -12,6 +12,7 @@ internal sealed record ManagerSnapshot(
 internal sealed record ManagerCreateResult(ManagerSnapshot Manager, SendReceipt Receipt);
 internal sealed record ManagerSendResult(ManagerSnapshot Manager, SendReceipt Receipt);
 internal sealed record ManagerHistoryResult(string? ConversationId, VisibleConversation? History);
+internal sealed record ManagerReconcileResult(ManagerSnapshot Manager, ReconciliationResult Reconciliation);
 
 /// <summary>
 /// Stable local manager addresses. All remote operations use the existing
@@ -79,7 +80,7 @@ internal sealed class ManagerService
         SendReceipt receipt;
         try
         {
-            receipt = await _runtime.CreateAsync(text, cancellation);
+            receipt = await _runtime.CreateAsync(text, cancellation, id);
         }
         catch (CreationWaitCancelledException) when (cancellation.IsCancellationRequested)
         {
@@ -114,6 +115,9 @@ internal sealed class ManagerService
                 ? null : ManagerRegistry.CheckpointFor(conversationId),
             LifecycleState = state
         });
+        if (receipt.Disposition == SendDisposition.Accepted && conversationId is not null &&
+            !_runtime.FinishAcceptedManagerCreation(id, conversationId))
+            throw new InvalidOperationException("Creation binding checkpoint unavailable.");
         return new ManagerCreateResult(Snapshot(updated), receipt);
     }
 
@@ -137,10 +141,13 @@ internal sealed class ManagerService
 
             // Persist the guard before the remote operation, including before
             // potentially slow history preflight. A crash requires review.
-            _registry.Update(id, record => record with { LifecycleState = "sending" });
+            var operationId = Guid.NewGuid().ToString("N");
+            _registry.Update(id, record => record with {
+                LifecycleState = "sending", PendingOperationId = operationId
+            });
 
             SendReceipt receipt;
-            try { receipt = await _runtime.SendAsync(current.ConversationId, text, cancellation); }
+            try { receipt = await _runtime.SendAsync(current.ConversationId, text, cancellation, operationId); }
             catch (OperationCanceledException) when (
                 cancellation.IsCancellationRequested &&
                 _runtime.Get(current.ConversationId)?.Status == "idle")
@@ -162,6 +169,54 @@ internal sealed class ManagerService
                 LifecycleState = state
             });
             return new ManagerSendResult(Snapshot(updated), receipt);
+        }
+        finally { gate.Release(); }
+    }
+
+    public async Task<ManagerReconcileResult?> ReconcileAsync(
+        string id, CancellationToken cancellation)
+    {
+        if (_registry.Get(id) is null) return null;
+        var gate = _sendGates.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellation);
+        try
+        {
+            var current = Get(id)!;
+            if (current.ConversationId is not null &&
+                _runtime.FinishAcceptedManagerCreation(id, current.ConversationId))
+                return new(Get(id)!, new("guard_cleared",
+                    "durable_creation_binding", current.ConversationId));
+            if (current.LifecycleState != "uncertain")
+                return new(current, new("not_applicable", "manager_not_uncertain",
+                    current.ConversationId));
+            if (current.ConversationId is null)
+            {
+                var creation = await _runtime.ReconcileCreationAsync(id, cancellation);
+                if (creation.Outcome != "restored" || creation.ConversationId is null)
+                    return new(Get(id)!, creation);
+                var bound = _registry.Update(id, record => record with {
+                    ConversationId = creation.ConversationId,
+                    CheckpointPointer = ManagerRegistry.CheckpointFor(creation.ConversationId),
+                    LifecycleState = "idle"
+                });
+                _runtime.FinishReconciledManagerCreation(id, creation.ConversationId);
+                return new(Snapshot(bound), creation);
+            }
+            var resolved = _runtime.HasVerifiedManagerTurn(current.ConversationId,
+                _registry.Get(id)?.PendingOperationId)
+                    ? new ReconciliationResult("restored", "durable_verified_turn",
+                        current.ConversationId)
+                    : await _runtime.ReconcileAsync(current.ConversationId, cancellation);
+            if (resolved.Outcome == "restored" &&
+                resolved.ConversationId == current.ConversationId)
+            {
+                var updated = _registry.Update(id, record =>
+                    record.LifecycleState == "uncertain" &&
+                    record.ConversationId == resolved.ConversationId
+                        ? record with { LifecycleState = "idle" } : record);
+                return new(Snapshot(updated), resolved);
+            }
+            return new(Get(id)!, resolved);
         }
         finally { gate.Release(); }
     }
