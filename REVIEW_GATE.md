@@ -108,7 +108,11 @@ identities must be set from verified source metadata. Policy evaluation and
 journal records are service-neutral. GitHub Actions checks are additionally
 bound to their source workflow IDs from authenticated run metadata and the
 newest run from that exact producer/workflow identity; same-app checks from
-other workflows cannot satisfy the gate. Repository identities use the
+other workflows cannot satisfy the gate. The check-runs endpoint uses
+`filter=all` to include prior runs; multiple trusted bot runs for the same
+head remain blocked even when GitHub's default latest-only view would have
+hidden them. Bracketed severity headings such as `### [P1]` are treated as
+findings rather than an all-clear. Repository identities use the
 canonical name returned by the source, and the durable PR journal treats
 repository casing aliases as the same identifier. Pagination remains deliberately
 fail-closed: 100 or more statuses, review comments, or reviews are rejected;
