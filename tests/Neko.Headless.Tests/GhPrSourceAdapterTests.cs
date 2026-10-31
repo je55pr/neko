@@ -113,7 +113,10 @@ public sealed class GhPrSourceAdapterTests
             "### [P1] Unsafe merge path",
             "- **[P2]** Unverified review provenance",
             "> [P0] Critical authentication bypass",
-            "### [p3]: Missing test for restart"
+            "### [p3]: Missing test for restart",
+            "### **P1**: Claim hides a finding",
+            "P2. Broken adapter path",
+            "P3, Another unresolved defect"
         })
             Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
                 "**Actionable comments posted: 0**\n" + finding, marker));

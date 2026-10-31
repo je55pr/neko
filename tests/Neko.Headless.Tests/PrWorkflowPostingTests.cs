@@ -34,6 +34,8 @@ public sealed partial class HeadlessRuntimeTests
     [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nP1: Blocking race remains.")]
     [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\n### [P1] Blocking race remains.")]
     [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nA hidden [P2] finding remains.")]
+    [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\n**P1**: Blocking race remains.")]
+    [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nP2. Untriaged finding remains.")]
     [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 1\nP1: Blocking race remains.")]
     [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 0\nThe source has a blocker.")]
     [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 2\nP1: Only one labelled finding.")]

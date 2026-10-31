@@ -56,11 +56,14 @@ public static class PrReviewGate
         if (line.Length >= 4 && line[0] == '[' &&
             line[1] is 'P' or 'p' && line[2] is >= '0' and <= '3' &&
             line[3] == ']')
-            return line.Length == 4 || line[4] is ':' or ' ' or '-' or '*';
-        return line.Length >= 3 &&
+            return line.Length == 4 || IsSeverityBoundary(line[4]);
+        return line.Length >= 2 &&
             line[0] is 'P' or 'p' && line[1] is >= '0' and <= '3' &&
-            line[2] is ':' or ' ' or '-' or '*';
+            (line.Length == 2 || IsSeverityBoundary(line[2]));
     }
+
+    private static bool IsSeverityBoundary(char value) =>
+        !char.IsLetterOrDigit(value) && value != '_';
 
     public static bool ContainsSeverityFinding(string body)
     {
@@ -77,19 +80,23 @@ public static class PrReviewGate
         return false;
     }
 
-    // The latest run from the exact trusted producer/workflow wins. A
-    // same-name status from another actor cannot shadow or satisfy it.
-    private static PrCheck? TrustedLatestCheck(IEnumerable<PrCheck> checks,
+    // Select one exact trusted producer/workflow set for both latest-run
+    // evaluation and same-head rerun ambiguity detection.
+    private static IEnumerable<PrCheck> TrustedChecks(IEnumerable<PrCheck> checks,
         string name, string head, string? producer, string? workflow)
     {
-        if (string.IsNullOrWhiteSpace(producer)) return null;
+        if (string.IsNullOrWhiteSpace(producer)) return Enumerable.Empty<PrCheck>();
         return checks.Where(c => c.Name == name && c.HeadSha == head &&
-                c.ProducerId == producer &&
-                (string.IsNullOrWhiteSpace(workflow)
-                    ? !c.RequiresWorkflowIdentity
-                    : c.WorkflowId == workflow))
-            .OrderByDescending(c => c.RunId).FirstOrDefault();
+            c.ProducerId == producer &&
+            (string.IsNullOrWhiteSpace(workflow)
+                ? !c.RequiresWorkflowIdentity
+                : c.WorkflowId == workflow));
     }
+
+    private static PrCheck? TrustedLatestCheck(IEnumerable<PrCheck> checks,
+        string name, string head, string? producer, string? workflow) =>
+        TrustedChecks(checks, name, head, producer, workflow)
+            .OrderByDescending(c => c.RunId).FirstOrDefault();
 
     public static PrGateDecision Evaluate(PrWorkflow workflow, PrReviewPolicy policy,
         PrSourceStatus source, DateTimeOffset now)
@@ -167,13 +174,9 @@ public static class PrReviewGate
             // overlapping runs whose review timestamps can interleave.
             // Fail closed rather than pairing one run's check to another's
             // review simply because their timestamps overlap.
-            if (source.Checks.Count(c =>
-                c.Name == policy.AutomatedCheck &&
-                c.HeadSha == workflow.HeadSha &&
-                c.ProducerId == policy.AutomatedCheckProducer &&
-                (string.IsNullOrWhiteSpace(policy.AutomatedCheckWorkflow)
-                    ? !c.RequiresWorkflowIdentity
-                    : c.WorkflowId == policy.AutomatedCheckWorkflow)) != 1)
+            if (TrustedChecks(source.Checks, policy.AutomatedCheck,
+                    workflow.HeadSha, policy.AutomatedCheckProducer,
+                    policy.AutomatedCheckWorkflow).Count() != 1)
                 blockers.Add("automated_review_run_ambiguous");
             var botReviews = source.Reviews.Where(r =>
                 StringComparer.OrdinalIgnoreCase.Equals(r.Author, policy.AutomatedReviewer) &&
