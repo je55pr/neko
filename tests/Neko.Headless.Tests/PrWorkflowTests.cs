@@ -35,7 +35,8 @@ public sealed partial class HeadlessRuntimeTests
     private static PrReviewPolicy GatePolicy() => new(
         ["build"], "review-job", "auto-account",
         TrustedCheckProducers: new Dictionary<string, string> { ["build"] = "app:100" },
-        AutomatedCheckProducer: "app:200");
+        AutomatedCheckProducer: "app:200",
+        AutomatedNoFindingsMarker: "No actionable findings");
 
     private static PrSourceStatus GoodSource(DateTimeOffset now) =>
         new("sample/project", 7, PrHead, PrBase, "open", "creator-account", false, true,
@@ -47,7 +48,8 @@ public sealed partial class HeadlessRuntimeTests
             new(PrReviewUrl, "independent-account", PrHead, "approved",
                 true, now.AddMinutes(1), "test-review-body"),
             new("https://example.org/reviews/8", "auto-account", PrHead, "commented",
-                true, now.AddMinutes(1))
+                true, now.AddMinutes(1), SourceReviewId: 88,
+                AutomatedNoFindings: true)
         ], 0);
 
     private sealed class PrSourceFake(PrSourceStatus initial) : IPrSourceAdapter

@@ -5,7 +5,8 @@ public sealed record PrCheck(string Name, string HeadSha, string Status, string?
     string? ProducerId = null, string? WorkflowId = null,
     bool RequiresWorkflowIdentity = false, long RunId = 0);
 public sealed record PrReview(string Url, string Author, string HeadSha, string Verdict,
-    bool Substantive, DateTimeOffset SubmittedAt, string? BodySha256 = null);
+    bool Substantive, DateTimeOffset SubmittedAt, string? BodySha256 = null,
+    long? SourceReviewId = null, bool AutomatedNoFindings = false);
 public sealed record PrSourceStatus(string Repository, int Number, string HeadSha,
     string BaseSha, string State, string Author, bool Merged, bool Mergeable,
     IReadOnlyList<PrCheck> Checks, IReadOnlyList<PrReview> Reviews,
@@ -16,7 +17,8 @@ public sealed record PrReviewPolicy(
     IReadOnlyDictionary<string, string>? TrustedCheckProducers = null,
     string? AutomatedCheckProducer = null,
     IReadOnlyDictionary<string, string>? TrustedCheckWorkflows = null,
-    string? AutomatedCheckWorkflow = null);
+    string? AutomatedCheckWorkflow = null,
+    string? AutomatedNoFindingsMarker = null);
 public sealed record PrWorkerEvidence(string ConversationId, string CreatedForHead,
     DateTimeOffset CreatedAt, bool Completed, DateTimeOffset? CompletedAt,
     string? ReviewUrl, string? Verdict, string? ReviewerAccount,
@@ -125,12 +127,27 @@ public static class PrReviewGate
                 policy.AutomatedCheckProducer, policy.AutomatedCheckWorkflow);
             if (automated is not { Status: "completed", Conclusion: "success" })
                 blockers.Add("automated_review_run_not_successful");
-            if (!source.Reviews.Any(r =>
+            var botReviews = source.Reviews.Where(r =>
                 StringComparer.OrdinalIgnoreCase.Equals(r.Author, policy.AutomatedReviewer) &&
                 r.HeadSha == workflow.HeadSha && r.Substantive &&
                 r.Url != worker?.ReviewUrl &&
-                r.Verdict is "approved" or "commented"))
+                r.Verdict is "approved" or "commented")
+                .OrderByDescending(r => r.SubmittedAt)
+                .ThenByDescending(r => r.SourceReviewId ?? long.MinValue).ToArray();
+            if (botReviews.Length == 0)
                 blockers.Add("substantive_automated_review_missing");
+            if (string.IsNullOrWhiteSpace(policy.AutomatedNoFindingsMarker))
+                blockers.Add("automated_finding_policy_missing");
+            // A successful check says a reviewer ran, NOT that it found no
+            // defects. Only a configured, source-derived positive conclusion
+            // on the latest substantive bot review counts as clear.
+            if (botReviews.Length > 0 &&
+                (!botReviews[0].AutomatedNoFindings ||
+                 botReviews.Length > 1 &&
+                 botReviews[0].SubmittedAt == botReviews[1].SubmittedAt &&
+                 (botReviews[0].SourceReviewId is null ||
+                  botReviews[1].SourceReviewId is null)))
+                blockers.Add("automated_findings_untriaged");
         }
         if (policy.RequiredChecks is null || policy.RequiredChecks.Count == 0)
             blockers.Add("required_checks_policy_missing");
@@ -160,7 +177,21 @@ public static class PrReviewGate
         if (source.Reviews
             .Where(r => r.Verdict is "approved" or "changes_requested")
             .GroupBy(r => r.Author, StringComparer.OrdinalIgnoreCase)
-            .Any(g => g.MaxBy(r => r.SubmittedAt)!.Verdict == "changes_requested"))
+            .Any(g =>
+            {
+                var timestamp = g.Max(r => r.SubmittedAt);
+                var latestAtTime = g.Where(r => r.SubmittedAt == timestamp).ToArray();
+                // GitHub submission timestamps have second precision. A later
+                // review ID breaks ties; missing/ambiguous IDs must fail closed
+                // whenever a change request might still be outstanding.
+                var ambiguous = latestAtTime.Length > 1 &&
+                    latestAtTime.Any(r => r.SourceReviewId is null) &&
+                    latestAtTime.Any(r => r.Verdict == "changes_requested");
+                var newestId = latestAtTime.Max(r => r.SourceReviewId ?? 0);
+                return ambiguous || latestAtTime.Any(r =>
+                    (r.SourceReviewId ?? 0) == newestId &&
+                    r.Verdict == "changes_requested");
+            }))
             blockers.Add("changes_requested");
         var state = blockers.Count == 0 ? "merge_ready" :
             blockers.Contains("head_sha_changed") || blockers.Contains("base_sha_changed")

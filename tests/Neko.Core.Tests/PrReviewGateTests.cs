@@ -11,7 +11,8 @@ public sealed class PrReviewGateTests
     private static readonly PrReviewPolicy Policy = new(
         ["build"], "review-bot-run", "review-bot",
         TrustedCheckProducers: new Dictionary<string, string> { ["build"] = "app:100" },
-        AutomatedCheckProducer: "app:200");
+        AutomatedCheckProducer: "app:200",
+        AutomatedNoFindingsMarker: "No actionable findings");
 
     private static PrWorkerEvidence Worker() => new("fresh-review-worker", Head,
         Now.AddMinutes(-30), true, Now.AddMinutes(-10), "https://example.org/review/12",
@@ -34,7 +35,8 @@ public sealed class PrReviewGateTests
             new("https://example.org/review/12", "review-account", Head, "approved",
                 true, Now.AddMinutes(-9), "verified-body-digest"),
             new("https://example.org/review/13", "review-bot", Head, "commented",
-                true, Now.AddMinutes(-8))
+                true, Now.AddMinutes(-8), SourceReviewId: 51,
+                AutomatedNoFindings: true)
         ], 0);
 
     private static PrGateDecision Evaluate(PrWorkflow? workflow = null,
@@ -245,6 +247,64 @@ public sealed class PrReviewGateTests
                 source: source with {
                     Checks = [Source().Checks[0], correct]
                 }).Blockers);
+    }
+
+    [Fact]
+    public void SuccessfulAutomationCheckNeverWaivesActionableSourceReviewFindings()
+    {
+        var oldClear = Source().Reviews[1] with {
+            SourceReviewId = 51, AutomatedNoFindings = true,
+            SubmittedAt = Now.AddMinutes(-8)
+        };
+        var latestActionable = oldClear with {
+            Url = "https://example.org/review/14", SourceReviewId = 52,
+            SubmittedAt = Now.AddMinutes(-7), AutomatedNoFindings = false
+        };
+        var source = Source() with {
+            Reviews = [Source().Reviews[0], oldClear, latestActionable],
+            UnresolvedThreads = 0
+        };
+        Assert.Contains("automated_findings_untriaged",
+            Evaluate(source: source).Blockers);
+        Assert.False(Evaluate(source: source).Ready);
+
+        var newerClear = latestActionable with {
+            Url = "https://example.org/review/15", SourceReviewId = 53,
+            SubmittedAt = Now.AddMinutes(-6), AutomatedNoFindings = true
+        };
+        Assert.True(Evaluate(source: source with {
+            Reviews = [..source.Reviews, newerClear]
+        }).Ready);
+        Assert.Contains("automated_finding_policy_missing",
+            Evaluate(policy: Policy with { AutomatedNoFindingsMarker = null }).Blockers);
+    }
+
+    [Fact]
+    public void SameSecondReviewChangesUseSourceIdsOrFailClosed()
+    {
+        var stamp = Now.AddMinutes(-2);
+        var approval = new PrReview("https://example.org/review/a",
+            "reviewer-x", Head, "approved", true, stamp, SourceReviewId: 101);
+        var request = new PrReview("https://example.org/review/b",
+            "REVIEWER-X", Head, "changes_requested", true, stamp, SourceReviewId: 102);
+        var source = Source() with {
+            Reviews = [..Source().Reviews, approval, request]
+        };
+        Assert.Contains("changes_requested", Evaluate(source: source).Blockers);
+
+        var laterApproval = approval with {
+            Url = "https://example.org/review/c", SourceReviewId = 103
+        };
+        Assert.DoesNotContain("changes_requested", Evaluate(source: source with {
+            Reviews = [..source.Reviews, laterApproval]
+        }).Blockers);
+
+        var unknownIds = Source() with {
+            Reviews = [..Source().Reviews,
+                approval with { SourceReviewId = null },
+                request with { SourceReviewId = null }]
+        };
+        Assert.Contains("changes_requested", Evaluate(source: unknownIds).Blockers);
     }
 
     [Fact]

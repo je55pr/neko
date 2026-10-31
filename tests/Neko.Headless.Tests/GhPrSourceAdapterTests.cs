@@ -42,6 +42,39 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
+    public void DeletedPullRequestAuthorKeepsSourceReadable()
+    {
+        using var missingAuthor = JsonDocument.Parse("""
+            {"id":12345,"user":null}
+            """);
+        Assert.Equal("deleted-pr-author:12345",
+            GhPrSourceAdapter.PullAuthorIdentity(missingAuthor.RootElement));
+        using var author = JsonDocument.Parse("""
+            {"id":12345,"user":{"login":"repository-author"}}
+            """);
+        Assert.Equal("repository-author",
+            GhPrSourceAdapter.PullAuthorIdentity(author.RootElement));
+    }
+
+    [Fact]
+    public void AutomatedReviewNeedsConfiguredVerifiedNoFindingsLine()
+    {
+        const string marker = "Actionable comments posted: 0";
+        Assert.True(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable comments posted: 0**\n", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable comments posted: 3**\n", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "Status: Actionable comments posted: 0 (old)\n", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "> Actionable comments posted: 0\n", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "```\nActionable comments posted: 0\n```\n", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable comments posted: 0**", null));
+    }
+
+    [Fact]
     public void WorkflowRunIdentityRequiresTrustedHostAndExactRepository()
     {
         using var valid = JsonDocument.Parse("""

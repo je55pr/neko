@@ -10,11 +10,13 @@ namespace Neko.Headless;
 internal sealed class GhPrSourceAdapter : IPrSourceAdapter
 {
     private readonly string? _trustedExecutable;
+    private readonly PrReviewPolicy? _policy;
 
     // This is an opt-in adapter: missing configuration disables external PR
     // operations without preventing legacy headless hosting.
-    public GhPrSourceAdapter(string? trustedExecutable)
+    public GhPrSourceAdapter(string? trustedExecutable, PrReviewPolicy? policy = null)
     {
+        _policy = policy;
         if (string.IsNullOrWhiteSpace(trustedExecutable)) return;
         if (!Path.IsPathFullyQualified(trustedExecutable) ||
             !File.Exists(trustedExecutable) ||
@@ -85,6 +87,44 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         return "deleted-review:" + id;
     }
 
+    internal static string PullAuthorIdentity(JsonElement pull)
+    {
+        if (pull.TryGetProperty("user", out var user) &&
+            user.ValueKind == JsonValueKind.Object)
+        {
+            var login = GetString(user, "login");
+            if (!string.IsNullOrWhiteSpace(login)) return login;
+        }
+        var id = pull.GetProperty("id").GetInt64();
+        if (id <= 0) throw new InvalidOperationException("Pull author identity unavailable.");
+        return "deleted-pr-author:" + id;
+    }
+
+    // Only a positively identified line from an authenticated automated
+    // reviewer can clear findings. Unknown formats and unconfigured markers
+    // remain untriaged, regardless of whether the check itself succeeded.
+    internal static bool VerifiedNoFindingsLine(string body, string? marker)
+    {
+        if (string.IsNullOrWhiteSpace(marker) || marker.Length > 200 ||
+            marker.Any(char.IsControl))
+            return false;
+        var fenced = false;
+        foreach (var raw in body.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.StartsWith("```", StringComparison.Ordinal))
+            {
+                fenced = !fenced;
+                continue;
+            }
+            if (!fenced && !line.StartsWith('>') &&
+                string.Equals(line.Trim('*', '_', ' ', '\t', '\r'),
+                    marker, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     internal static string BodyDigest(string body) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
 
@@ -142,7 +182,7 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         var merged = Member(pr, "merged").GetBoolean();
         var mergeable = pr.TryGetProperty("mergeable", out var merge) &&
             merge.ValueKind == JsonValueKind.True;
-        var author = Member(pr, "user", "login").GetString() ?? "";
+        var author = PullAuthorIdentity(pr);
         var canonicalRepository = Member(pr, "base", "repo", "full_name").GetString() ?? "";
         if (!PrWorkflowStore.ValidRepository(canonicalRepository) ||
             !StringComparer.OrdinalIgnoreCase.Equals(canonicalRepository, repository))
@@ -226,12 +266,15 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
                 _ => "unrecognized"
             };
             var body = GetString(r, "body") ?? "";
+            var reviewId = r.GetProperty("id").GetInt64();
+            var authorId = ReviewerIdentity(r);
+            var findingsClear = StringComparer.OrdinalIgnoreCase.Equals(
+                    authorId, _policy?.AutomatedReviewer) &&
+                VerifiedNoFindingsLine(body, _policy?.AutomatedNoFindingsMarker);
             sourceReviews.Add(new PrReview(GetString(r, "html_url") ?? "",
-                ReviewerIdentity(r),
-                GetString(r, "commit_id") ?? "", verdict,
-                !string.IsNullOrWhiteSpace(body) ||
-                    reviewComments.Contains(r.GetProperty("id").GetInt64()),
-                submitted, BodyDigest(body)));
+                authorId, GetString(r, "commit_id") ?? "", verdict,
+                !string.IsNullOrWhiteSpace(body) || reviewComments.Contains(reviewId),
+                submitted, BodyDigest(body), reviewId, findingsClear));
         }
 
         var parts = repository.Split('/');

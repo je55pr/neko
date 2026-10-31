@@ -19,6 +19,7 @@ Set optional `reviewGate` in the local ignored host configuration. There is
     "automatedReviewer": "configured-review-account",
     "automatedCheckProducer": "app:12345",
     "automatedCheckWorkflow": "workflow:400010385",
+    "automatedNoFindingsMarker": "No actionable findings",
     "trustedCheckProducers": {
       "build-and-test": "app:23456",
       "static-analysis": "app:34567"
@@ -35,8 +36,15 @@ These names are examples, not hardcoded rules. The deployment owner must set
 the actual required CI names and automated review account/check name for the
 repository. All configured CI must have a conclusive successful run at the
 exact PR head. The automated reviewer must additionally have a substantive
-posted review against that head. Skipped, neutral, pending, rejected, cancelled,
-and check-only automated responses cannot pass.
+posted review against that head. An automated review also needs a trusted,
+configured no-findings line in the **latest bot review body**. A successful
+check run does not mean the bot found no problems. Unknown body formats and
+reviews with actionable findings block merge until fixes and a new clear
+review have been obtained on the current head. The configured marker is a
+literal line (optionally Markdown-bold), not an arbitrary substring; use a
+positive phrase emitted by the repository's actual reviewer. No marker is
+assumed by default. Skipped, neutral, pending, rejected, cancelled, and
+check-only automated responses cannot pass.
 
 ## Explicit operations
 

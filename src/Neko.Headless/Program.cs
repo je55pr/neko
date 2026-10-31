@@ -50,9 +50,10 @@ try
     using var inbox = new ManagerInboxService(
         new ManagerInboxJournal(config.StateDirectory), managers, runtime);
     inbox.Start();
+    var reviewPolicy = config.ReviewGate ?? new PrReviewPolicy([], "", "");
     var prWorkflows = new PrWorkflowService(new PrWorkflowStore(config.StateDirectory),
-        new GhPrSourceAdapter(config.ExternalPrCliExecutable), runtime,
-        config.ReviewGate ?? new PrReviewPolicy([], "", ""));
+        new GhPrSourceAdapter(config.ExternalPrCliExecutable, reviewPolicy), runtime,
+        reviewPolicy);
 
     var builder = WebApplication.CreateSlimBuilder();
     builder.WebHost.UseUrls($"http://127.0.0.1:{config.Port}");
