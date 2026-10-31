@@ -95,6 +95,15 @@ internal sealed class ManagerInboxJournal
         lock (_gate) return Read(managerId).FirstOrDefault(m => m.Id == messageId);
     }
 
+    // Keep legacy direct manager sends from overwriting the exact completion
+    // proof before the inbox has durably consumed it.
+    public bool HasOutstanding(string managerId)
+    {
+        lock (_gate) return Read(managerId).Any(m => m.State is
+            InboxStates.Queued or InboxStates.Dispatching or InboxStates.Accepted or
+            InboxStates.Generating or InboxStates.Uncertain);
+    }
+
     public (InboxMessage Message, InboxEnqueueStatus Status) Enqueue(
         string managerId, string text, string? key)
     {

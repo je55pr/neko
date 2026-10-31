@@ -65,8 +65,8 @@ fields are unchanged. Additive fields:
 | `lastPublicUpdateAt` | UTC time the host most recently published a public update |
 | `publicEventCount` | Number of accepted public-feed events this process observed for this turn, including a host-generated terminal `Fail` when a stream ends unexpectedly |
 | `lastPublicUpdateType` | Public event kind and operation, e.g. `Final.Append` or `Activity.Start`; no text, title, message ID, or tool details |
-| `isTerminal` | Whether the public event feed ended with `Final.Complete` or `Final.Fail` |
-| `terminalOperation` | `Complete` or `Fail` when such a terminal update was published |
+| `isTerminal` | Whether the public event feed ended with `Final.Complete`, `Final.Fail`, or `Final.ObservationExpired` |
+| `terminalOperation` | `Complete`, `Fail`, or `ObservationExpired` when such a terminal update was published |
 
 For a live turn with **zero public events**, `publicEventCount` is `0`;
 the last-update fields are `null`, and elapsed time still increases.
@@ -191,10 +191,13 @@ Only a durable verification of the exact operation ID can unblock the inbox.
 No background reconciliation or resubmission of accepted/uncertain work occurs.
 
 The journal resides under untracked `stateDirectory/manager-inbox/`,
-protected by the existing exclusive host lease. It stores pending message
-text as well as metadata locally; authenticated API list/inspect responses
-exclude the text. The older `/managers/main/messages` endpoint continues
-its immediate guarded-send behavior for compatibility.
+protected by the existing exclusive host lease. It retains message text,
+including completed entries, and metadata locally; authenticated API
+list/inspect responses exclude the text. Retention and bounded archive
+compaction are not yet implemented, so very large journals require monitoring.
+The older `/managers/main/messages` endpoint remains available for immediate
+guarded sends, but returns `manager_inbox_pending` while an inbox message
+is outstanding, protecting its unconsumed completion evidence.
 
 ## Architecture and reliability
 

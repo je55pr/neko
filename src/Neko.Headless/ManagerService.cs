@@ -24,6 +24,12 @@ internal sealed class ManagerService
     private readonly ChatRuntime _runtime;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sendGates = new();
     private readonly ConcurrentDictionary<string, string> _inboxBlocks = new();
+    private ManagerInboxJournal? _inboxJournal;
+
+    // The inbox remains the authoritative source for outstanding messages.
+    // Legacy direct sends may resume only after it consumes the exact turn.
+    public void AttachInboxJournal(ManagerInboxJournal journal) =>
+        _inboxJournal = journal;
 
     // If the inbox reserved a remote dispatch but the process died before the
     // manager journal took over, fail closed even if the conversation is idle.
@@ -59,6 +65,14 @@ internal sealed class ManagerService
             record.LastReconciliation is { Outcome: "restored" } proof &&
             proof.OperationId == operationId)
             _inboxBlocks.TryRemove(id, out _);
+    }
+
+    // Called only after the inbox has durably consumed the exact restored turn.
+    public void ConfirmVerifiedInboxCompletion(
+        string id, string conversationId, string operationId)
+    {
+        if (_inboxBlocks.TryGetValue(id, out var blocked) && blocked == operationId)
+            ReleaseVerifiedInboxBlock(id, conversationId);
     }
 
     public ManagerService(ManagerRegistry registry, ChatRuntime runtime)
@@ -173,6 +187,9 @@ internal sealed class ManagerService
             if (_inboxBlocks.ContainsKey(id))
                 return new ManagerSendResult(current,
                     new SendReceipt(SendDisposition.Rejected, "inbox_uncertainty_blocked"));
+            if (operationId is null && _inboxJournal?.HasOutstanding(id) == true)
+                return new ManagerSendResult(current,
+                    new SendReceipt(SendDisposition.Rejected, "manager_inbox_pending"));
             if (current.ConversationId is null || current.LifecycleState != "idle")
                 return new ManagerSendResult(current,
                     new SendReceipt(SendDisposition.Rejected, "manager_not_idle"));

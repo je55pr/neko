@@ -25,6 +25,7 @@ internal sealed class ManagerInboxService : IDisposable
         _managers = managers;
         _runtime = runtime;
         _clock = clock ?? TimeProvider.System;
+        _managers.AttachInboxJournal(_journal);
         _journal.MarkInterruptedDispatches();
         foreach (var manager in _managers.List())
         {
@@ -108,13 +109,15 @@ internal sealed class ManagerInboxService : IDisposable
                     checkpoint.LastReconciliation is not { Outcome: "restored" } proof ||
                     proof.OperationId != next.Id)
                     return false;
-                _journal.Transition(managerId, next.Id, InboxStates.Uncertain,
-                    message => message with {
+                var completed = _journal.Transition(managerId, next.Id,
+                    InboxStates.Uncertain, message => message with {
                         State = InboxStates.Completed,
                         CompletedAt = _clock.GetUtcNow(),
                         ConversationId = conversationId,
                         Reason = proof.Reason
                     });
+                if (completed is null) return false;
+                _managers.ConfirmVerifiedInboxCompletion(managerId, conversationId, next.Id);
                 return true;
             }
 
@@ -215,7 +218,7 @@ internal sealed class ManagerInboxService : IDisposable
             // prove no remote submission was made. Keep the original queue
             // entry, with a conservative cool-off before probing again.
             if (receipt.Reason is "provider_history_unavailable" or "manager_not_idle" or
-                "conversation_not_idle")
+                "conversation_not_idle" or "inbox_uncertainty_blocked")
             {
                 var seconds = Math.Max(15, receipt.RetryAfterSeconds ?? 15);
                 try
