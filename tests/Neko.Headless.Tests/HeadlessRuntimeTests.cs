@@ -306,12 +306,12 @@ public sealed partial class HeadlessRuntimeTests
         public bool SupportsStop { get; set; } = true;
         public int StopCalls;
         public bool FailNextRead;
-        public bool ReturnNullHistory;
-        public bool ThrowOnRead;
+        public bool ReturnNullHistory { get; set; }
+        public bool ThrowOnRead { get; set; }
         public int? RateLimitRetryAfterSeconds { get; set; }
         public int ReadCalls;
         public int SendCalls;
-        public TaskCompletionSource<VisibleConversation?>? PendingRead;
+        public TaskCompletionSource<VisibleConversation?>? PendingRead { get; set; }
         public TaskCompletionSource<SendReceipt>? PendingSend;
         public void CompletePending() =>
             _events.Writer.TryWrite(new PublicConversationUpdate(
