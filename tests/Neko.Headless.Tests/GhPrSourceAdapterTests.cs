@@ -132,6 +132,55 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
+    public void CombinedCommitStatusesMustReturnTheEntireVerifiedPage()
+    {
+        const string sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        Assert.Equal("repos/sample/project/commits/" + sha +
+            "/status?per_page=100",
+            GhPrSourceAdapter.CompleteCommitStatusesRoute("sample/project", sha));
+
+        using var complete = JsonDocument.Parse("""
+            {"total_count":2,"statuses":[{"id":1},{"id":2}]}
+            """);
+        Assert.Equal(2, GhPrSourceAdapter.VerifiedCompletePage(
+            complete.RootElement, "statuses").GetArrayLength());
+
+        // GitHub's default 30-entry page may hide a 31st required status.
+        using var truncated = JsonDocument.Parse("""
+            {"total_count":31,"statuses":[{"id":1}]}
+            """);
+        Assert.Throws<InvalidOperationException>(() =>
+            GhPrSourceAdapter.VerifiedCompletePage(truncated.RootElement, "statuses"));
+
+        using var overLimit = JsonDocument.Parse("""
+            {"total_count":101,"statuses":[]}
+            """);
+        Assert.Throws<InvalidOperationException>(() =>
+            GhPrSourceAdapter.VerifiedCompletePage(overLimit.RootElement, "statuses"));
+
+        using var missingCount = JsonDocument.Parse("""
+            {"statuses":[]}
+            """);
+        Assert.Throws<InvalidOperationException>(() =>
+            GhPrSourceAdapter.VerifiedCompletePage(missingCount.RootElement, "statuses"));
+    }
+
+    [Fact]
+    public void SameHeadCheckRunSnapshotsCannotHideEarlierRuns()
+    {
+        using var allRuns = JsonDocument.Parse("""
+            {"total_count":2,"check_runs":[{"id":11},{"id":12}]}
+            """);
+        Assert.Equal(2, GhPrSourceAdapter.VerifiedCompletePage(
+            allRuns.RootElement, "check_runs").GetArrayLength());
+        using var lostRun = JsonDocument.Parse("""
+            {"total_count":2,"check_runs":[{"id":12}]}
+            """);
+        Assert.Throws<InvalidOperationException>(() =>
+            GhPrSourceAdapter.VerifiedCompletePage(lostRun.RootElement, "check_runs"));
+    }
+
+    [Fact]
     public void InlineReviewCommentsOverrideAnyNoFindingsSummary()
     {
         var linked = new HashSet<long> { 77 };

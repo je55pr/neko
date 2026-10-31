@@ -224,6 +224,23 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         "repos/" + repository + "/commits/" + head +
         "/check-runs?per_page=100&filter=all";
 
+    internal static string CompleteCommitStatusesRoute(string repository, string head) =>
+        "repos/" + repository + "/commits/" + head + "/status?per_page=100";
+
+    // Both endpoints report total_count independently of the returned page.
+    // Missing/truncated results must fail closed, not silently hide checks.
+    internal static JsonElement VerifiedCompletePage(JsonElement root, string itemsName)
+    {
+        var entries = Member(root, itemsName);
+        if (entries.ValueKind != JsonValueKind.Array ||
+            !root.TryGetProperty("total_count", out var total) ||
+            total.ValueKind != JsonValueKind.Number ||
+            !total.TryGetInt32(out var count) || count < 0 || count > 100 ||
+            count != entries.GetArrayLength())
+            throw new InvalidOperationException("Source list exceeds verified page.");
+        return entries;
+    }
+
     public async Task<PrSourceStatus> ReadAsync(
         string repository, int number, CancellationToken cancellation)
     {
@@ -250,10 +267,7 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         // Request every run so same-head reruns can be detected and blocked.
         using var checks = await ApiAsync(cancellation,
             CompleteCheckRunsRoute(repository, head));
-        var checkRoot = checks.RootElement;
-        var checkRuns = Member(checkRoot, "check_runs");
-        if (checkRoot.GetProperty("total_count").GetInt32() > 100)
-            throw new InvalidOperationException("Check list exceeds verified page.");
+        var checkRuns = VerifiedCompletePage(checks.RootElement, "check_runs");
         var gathered = new List<PrCheck>();
         var actionWorkflows = new Dictionary<long, string>();
         // Keep distinct publishers and workflows. A same-named untrusted or
@@ -293,10 +307,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
                     ? started : null));
         }
         using var statuses = await ApiAsync(cancellation,
-            "repos/" + repository + "/commits/" + head + "/status");
-        var statusEntries = Member(statuses.RootElement, "statuses");
-        if (statusEntries.GetArrayLength() >= 100)
-            throw new InvalidOperationException("Commit status list exceeds verified page.");
+            CompleteCommitStatusesRoute(repository, head));
+        var statusEntries = VerifiedCompletePage(statuses.RootElement, "statuses");
         foreach (var item in statusEntries.EnumerateArray())
         {
             var name = GetString(item, "context") ?? "";
