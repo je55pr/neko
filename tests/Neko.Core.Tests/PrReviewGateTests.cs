@@ -223,6 +223,31 @@ public sealed class PrReviewGateTests
     }
 
     [Fact]
+    public void AutomatedRunMustMatchConfiguredWorkflowNotJustActionsApp()
+    {
+        var policy = Policy with {
+            AutomatedCheckProducer = "app:15368",
+            AutomatedCheckWorkflow = "workflow:777"
+        };
+        var correct = new PrCheck("review-bot-run", Head, "completed", "success",
+            "app:15368", "workflow:777", true, 200);
+        var differentWorkflow = new PrCheck("review-bot-run", Head, "completed",
+            "success", "app:15368", "workflow:999", true, 300);
+        var source = Source() with {
+            Checks = [Source().Checks[0], correct, differentWorkflow]
+        };
+        Assert.True(Evaluate(policy: policy, source: source).Ready);
+        Assert.Contains("automated_review_run_not_successful",
+            Evaluate(policy: policy with { AutomatedCheckWorkflow = null },
+                source: source).Blockers);
+        Assert.Contains("automated_review_run_not_successful",
+            Evaluate(policy: policy with { AutomatedCheckWorkflow = "workflow:999" },
+                source: source with {
+                    Checks = [Source().Checks[0], correct]
+                }).Blockers);
+    }
+
+    [Fact]
     public void UnresolvedThreadsBlockEvenIfEveryOtherCheckPasses()
     {
         Assert.Contains("unresolved_review_threads:2",

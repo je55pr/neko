@@ -18,6 +18,7 @@ Set optional `reviewGate` in the local ignored host configuration. There is
     "automatedCheck": "configured-review-check",
     "automatedReviewer": "configured-review-account",
     "automatedCheckProducer": "app:12345",
+    "automatedCheckWorkflow": "workflow:400010385",
     "trustedCheckProducers": {
       "build-and-test": "app:23456",
       "static-analysis": "app:34567"

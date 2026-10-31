@@ -151,6 +151,110 @@ public sealed partial class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task ConcurrentRevisionChangeBeforeReviewerReservationCannotMisattributeHead()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = ManagerRuntime(folder.Path, provider);
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
+        var store = new PrWorkflowStore(folder.Path);
+        var service = new PrWorkflowService(store, source, runtime, GatePolicy());
+        await service.CreateAsync("sample/project", 7, "creator", "developer",
+            "manager", CancellationToken.None);
+
+        // Simulate pr-refresh committing B while the launcher's authoritative
+        // source read for A is in flight. The remote assignment was built for
+        // A, so the reservation must abort before any provider dispatch.
+        source.OnRead = _ =>
+        {
+            store.Update("sample/project", 7, w => store.Append(w with {
+                HeadSha = PrChanged, BaseSha = PrBase, ReviewLaunchState = "unstarted",
+                Reviewer = null, LastSourceEvidence = null, LastGateDecision = null
+            }, "revision_rearmed", "concurrent_test"));
+            return source.Current;
+        };
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.LaunchReviewerAsync("sample/project", 7,
+                "Review actual current code.", "independent-account",
+                CancellationToken.None));
+        Assert.Equal(0, provider.ManagerCreationCalls);
+        Assert.Equal(PrChanged, store.Get("sample/project", 7)!.HeadSha);
+        Assert.Equal("unstarted", store.Get("sample/project", 7)!.ReviewLaunchState);
+        Assert.Null(store.Get("sample/project", 7)!.Reviewer);
+    }
+
+    [Fact]
+    public async Task CancelledBeforeReviewerDispatchRestoresSafeLaunchReservation()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = ManagerRuntime(folder.Path, provider);
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
+        var store = new PrWorkflowStore(folder.Path);
+        var service = new PrWorkflowService(store, source, runtime, GatePolicy());
+        await service.CreateAsync("sample/project", 7, "creator", "developer",
+            "manager", CancellationToken.None);
+
+        using var cancellation = new CancellationTokenSource();
+        source.OnRead = _ => {
+            cancellation.Cancel(); // After source read, before creation gate.
+            return source.Current;
+        };
+        var notSent = await service.LaunchReviewerAsync("sample/project", 7,
+            "Review source changes", "independent-account", cancellation.Token);
+        Assert.Equal("unstarted", notSent.ReviewLaunchState);
+        Assert.Null(notSent.ReviewLaunchAt);
+        Assert.Null(notSent.Reviewer);
+        Assert.Equal(0, provider.ManagerCreationCalls);
+        Assert.Contains(notSent.Audit!, e =>
+            e.Action == "review_launch_not_dispatched");
+        Assert.Equal("unstarted", new PrWorkflowStore(folder.Path)
+            .Get("sample/project", 7)!.ReviewLaunchState);
+
+        source.OnRead = null;
+        var sent = await service.LaunchReviewerAsync("sample/project", 7,
+            "Fresh independent review", "independent-account", CancellationToken.None);
+        Assert.Equal("accepted", sent.ReviewLaunchState);
+        Assert.Equal(1, provider.ManagerCreationCalls);
+    }
+
+    [Fact]
+    public async Task ExplicitRefreshRearmsDefinitivelyRejectedReviewerCreation()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider { RejectNextManagerCreation = true };
+        using var runtime = ManagerRuntime(folder.Path, provider);
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
+        var store = new PrWorkflowStore(folder.Path);
+        var service = new PrWorkflowService(store, source, runtime, GatePolicy());
+        await service.CreateAsync("sample/project", 7, "creator", "developer",
+            "manager", CancellationToken.None);
+
+        var rejected = await service.LaunchReviewerAsync("sample/project", 7,
+            "Inspect PR independently.", "independent-account", CancellationToken.None);
+        Assert.Equal("rejected", rejected.ReviewLaunchState);
+        Assert.Null(rejected.Reviewer);
+        Assert.Equal(1, provider.ManagerCreationCalls);
+        Assert.Equal("rejected", new PrWorkflowStore(folder.Path)
+            .Get("sample/project", 7)!.ReviewLaunchState);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.LaunchReviewerAsync("sample/project", 7,
+                "no automatic replay", "independent-account", CancellationToken.None));
+        Assert.Equal(1, provider.ManagerCreationCalls);
+
+        var rearmed = await new PrWorkflowService(new PrWorkflowStore(folder.Path),
+            source, runtime, GatePolicy()).RefreshRevisionAsync(
+                "sample/project", 7, CancellationToken.None);
+        Assert.Equal("unstarted", rearmed.ReviewLaunchState);
+        Assert.Null(rearmed.Reviewer);
+        var created = await service.LaunchReviewerAsync("sample/project", 7,
+            "New explicitly initiated independent review.",
+            "independent-account", CancellationToken.None);
+        Assert.Equal("accepted", created.ReviewLaunchState);
+        Assert.Equal(2, provider.ManagerCreationCalls);
+    }
+
+    [Fact]
     public async Task InFlightInspectionCannotOverwriteNewRevisionOrReportStaleReady()
     {
         using var folder = new TemporaryDirectory();

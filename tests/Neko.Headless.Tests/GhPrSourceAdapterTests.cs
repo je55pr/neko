@@ -24,6 +24,24 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
+    public void DeletedReviewAuthorsRemainDistinctAndCannotMimicAccounts()
+    {
+        using var reviews = JsonDocument.Parse("""
+            [
+              {"id":1001,"user":null},
+              {"id":1002},
+              {"id":1003,"user":{"login":"real-reviewer"}}
+            ]
+            """);
+        var identities = reviews.RootElement.EnumerateArray()
+            .Select(GhPrSourceAdapter.ReviewerIdentity).ToArray();
+        Assert.Equal("deleted-review:1001", identities[0]);
+        Assert.Equal("deleted-review:1002", identities[1]);
+        Assert.NotEqual(identities[0], identities[1]);
+        Assert.Equal("real-reviewer", identities[2]);
+    }
+
+    [Fact]
     public void WorkflowRunIdentityRequiresTrustedHostAndExactRepository()
     {
         using var valid = JsonDocument.Parse("""

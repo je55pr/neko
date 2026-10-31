@@ -51,8 +51,9 @@ public static class PrReviewGate
         if (string.IsNullOrWhiteSpace(producer)) return null;
         return checks.Where(c => c.Name == name && c.HeadSha == head &&
                 c.ProducerId == producer &&
-                (!c.RequiresWorkflowIdentity ||
-                    (!string.IsNullOrWhiteSpace(workflow) && c.WorkflowId == workflow)))
+                (string.IsNullOrWhiteSpace(workflow)
+                    ? !c.RequiresWorkflowIdentity
+                    : c.WorkflowId == workflow))
             .OrderByDescending(c => c.RunId).FirstOrDefault();
     }
 

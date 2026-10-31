@@ -126,16 +126,19 @@ internal sealed class PrWorkflowService
                 throw new InvalidOperationException("Revision change was concurrent.");
             var changed = existing.HeadSha != source.HeadSha ||
                 existing.BaseSha != source.BaseSha;
-            if (!changed && existing.MergeAttemptId is null) return existing;
+            var rearmRejectedReview = existing.ReviewLaunchState == "rejected";
+            if (!changed && existing.MergeAttemptId is null && !rearmRejectedReview)
+                return existing;
             var oldAttempt = existing.MergeAttemptId;
+            var resetReviewer = changed || rearmRejectedReview;
             return _store.Append(existing with {
                 HeadSha = source.HeadSha, BaseSha = source.BaseSha,
-                Reviewer = changed ? null : existing.Reviewer,
-                ReviewLaunchState = changed ? "unstarted" : existing.ReviewLaunchState,
-                ReviewLaunchAt = changed ? null : existing.ReviewLaunchAt,
+                Reviewer = resetReviewer ? null : existing.Reviewer,
+                ReviewLaunchState = resetReviewer ? "unstarted" : existing.ReviewLaunchState,
+                ReviewLaunchAt = resetReviewer ? null : existing.ReviewLaunchAt,
                 MergeAttemptId = null, MergeOutcome = null,
                 MergeAuthorizedBy = null, MergeAuthorizedAt = null,
-                State = changed ? "awaiting_independent_review" : "checks_pending",
+                State = resetReviewer ? "awaiting_independent_review" : "checks_pending",
                 LastSourceEvidence = source, LastGateDecision = null
             }, "revision_rearmed",
                 "previous_head:" + existing.HeadSha +
@@ -173,10 +176,16 @@ internal sealed class PrWorkflowService
             throw new ArgumentException("Reviewer assignment is invalid.");
         var promptSha = Convert.ToHexString(SHA256.HashData(
             Encoding.UTF8.GetBytes(prepared.Text)));
-        current = _store.Update(repository, number, existing =>
+        _store.Update(repository, number, existing =>
         {
-            if (existing.ReviewLaunchState != "unstarted" || existing.MergeAttemptId is not null)
-                throw new InvalidOperationException("Review creation already reserved.");
+            // Bind the remote assignment to the same immutable revision that
+            // was read and included in its prompt. A concurrent pr-refresh
+            // must never turn an A-head review task into B-head evidence.
+            if (existing.HeadSha != current.HeadSha ||
+                existing.BaseSha != current.BaseSha ||
+                existing.ReviewLaunchState != "unstarted" ||
+                existing.MergeAttemptId is not null)
+                throw new InvalidOperationException("Review revision changed during launch.");
             return _store.Append(existing with {
                 ReviewLaunchState = "dispatching", ReviewLaunchAt = _clock.GetUtcNow(),
                 State = "awaiting_independent_review"
@@ -186,6 +195,21 @@ internal sealed class PrWorkflowService
         try
         {
             receipt = await _runtime.CreateAsync(assignment, cancellation);
+        }
+        catch (CreationWaitCancelledException)
+        {
+            // The runtime explicitly proves that the creation gate cancelled
+            // before any provider dispatch. Clear only this reservation.
+            return _store.Update(repository, number, w =>
+            {
+                if (w.ReviewLaunchState != "dispatching" || w.Reviewer is not null ||
+                    w.HeadSha != current.HeadSha || w.BaseSha != current.BaseSha)
+                    throw new InvalidOperationException("Review reservation changed.");
+                return _store.Append(w with {
+                    ReviewLaunchState = "unstarted", ReviewLaunchAt = null,
+                    State = "awaiting_independent_review"
+                }, "review_launch_not_dispatched", "creation_gate_cancelled");
+            });
         }
         catch (Exception)
         {

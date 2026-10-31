@@ -111,11 +111,11 @@ public sealed partial class HeadlessRuntimeTests
         }
     }
 
-    private static PrWorkflow ReadyRecord(PrWorkflowStore store)
+    private static void ReadyRecord(PrWorkflowStore store)
     {
         var created = store.Create("sample/project", 7, PrHead, PrBase,
             "creator-chat", "developer-chat", "manager-chat");
-        return store.Update("sample/project", 7, workflow => store.Append(workflow with {
+        store.Update("sample/project", 7, workflow => store.Append(workflow with {
             State = "awaiting_automated_review", ReviewLaunchState = "accepted",
             ReviewLaunchAt = created.CreatedAt.AddMilliseconds(10),
             Reviewer = new PrWorkerEvidence("fresh-review-chat", PrHead,

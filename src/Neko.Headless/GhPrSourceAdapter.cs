@@ -69,6 +69,22 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         root.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString() : null;
 
+    // A deleted source account has no login. Keep those review identities
+    // distinct so one deleted account's approval cannot erase another's
+    // active change request. Such markers never match configured accounts.
+    internal static string ReviewerIdentity(JsonElement review)
+    {
+        if (review.TryGetProperty("user", out var user) &&
+            user.ValueKind == JsonValueKind.Object)
+        {
+            var login = GetString(user, "login");
+            if (!string.IsNullOrWhiteSpace(login)) return login;
+        }
+        var id = review.GetProperty("id").GetInt64();
+        if (id <= 0) throw new InvalidOperationException("Review identity unavailable.");
+        return "deleted-review:" + id;
+    }
+
     internal static string BodyDigest(string body) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
 
@@ -211,7 +227,7 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             };
             var body = GetString(r, "body") ?? "";
             sourceReviews.Add(new PrReview(GetString(r, "html_url") ?? "",
-                Member(r, "user", "login").GetString() ?? "",
+                ReviewerIdentity(r),
                 GetString(r, "commit_id") ?? "", verdict,
                 !string.IsNullOrWhiteSpace(body) ||
                     reviewComments.Contains(r.GetProperty("id").GetInt64()),
