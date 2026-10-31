@@ -20,6 +20,11 @@ internal static class InboxStates
         Rejected or Uncertain or Cancelled;
 }
 
+internal sealed record InboxAttemptEvidence(
+    DateTimeOffset ObservedAt, string Disposition, string? Reason,
+    bool? Retryable, int? RetryAfterSeconds,
+    string? RemoteMessageId, string? ConversationId);
+
 internal sealed record InboxMessage(
     string Id, string ManagerId, long Sequence, string Text,
     string PayloadSha256, string? IdempotencyKey, string State,
@@ -27,7 +32,8 @@ internal sealed record InboxMessage(
     DateTimeOffset? DispatchedAt = null, DateTimeOffset? AcceptedAt = null,
     DateTimeOffset? CompletedAt = null, DateTimeOffset? NotBefore = null,
     string? Reason = null, bool? Retryable = null,
-    string? RemoteMessageId = null, string? ConversationId = null);
+    string? RemoteMessageId = null, string? ConversationId = null,
+    IReadOnlyList<InboxAttemptEvidence>? Attempts = null);
 
 internal sealed record InboxMessageView(
     string Id, string ManagerId, long Sequence, string State,
@@ -35,14 +41,14 @@ internal sealed record InboxMessageView(
     DateTimeOffset? DispatchedAt, DateTimeOffset? AcceptedAt,
     DateTimeOffset? CompletedAt, DateTimeOffset? NotBefore,
     string? Reason, bool? Retryable, string? RemoteMessageId,
-    string? ConversationId)
+    string? ConversationId, IReadOnlyList<InboxAttemptEvidence>? Attempts)
 {
     public static InboxMessageView From(InboxMessage message) =>
         new(message.Id, message.ManagerId, message.Sequence, message.State,
             message.IdempotencyKey, message.CreatedAt, message.UpdatedAt,
             message.DispatchedAt, message.AcceptedAt, message.CompletedAt,
             message.NotBefore, message.Reason, message.Retryable,
-            message.RemoteMessageId, message.ConversationId);
+            message.RemoteMessageId, message.ConversationId, message.Attempts);
 }
 
 internal sealed record InboxEnqueueResult(InboxMessageView Message, bool Duplicate);
@@ -105,6 +111,8 @@ internal sealed class ManagerInboxJournal
                         StringComparer.Ordinal.Equals(existing.Text, text)
                             ? InboxEnqueueStatus.Duplicate : InboxEnqueueStatus.Conflict);
             }
+            if (messages.Count >= 100000)
+                throw new InvalidOperationException("Manager inbox has reached its capacity.");
             var now = _clock.GetUtcNow();
             var next = messages.Count == 0 ? 1 : checked(messages[^1].Sequence + 1);
             var created = new InboxMessage(Guid.NewGuid().ToString("N"),
@@ -184,7 +192,10 @@ internal sealed class ManagerInboxJournal
                 m.Sequence < 1 || m.CreatedAt == default || m.UpdatedAt == default ||
                 !InboxStates.IsValid(m.State) ||
                 m.Text is null || Hash(m.Text) != m.PayloadSha256 ||
-                m.IdempotencyKey is { Length: > 128 or 0 }) ||
+                m.IdempotencyKey is { Length: > 128 or 0 } ||
+                m.Attempts is { Count: > 1000 } ||
+                m.Attempts?.Any(a => a.ObservedAt == default ||
+                    a.Disposition is not ("accepted" or "rejected" or "uncertain")) == true) ||
             messages.Select(m => m.Id).Distinct(StringComparer.Ordinal).Count() != messages.Count ||
             messages.Where(m => m.IdempotencyKey is not null).Select(m => m.IdempotencyKey)
                 .Distinct(StringComparer.Ordinal).Count() !=

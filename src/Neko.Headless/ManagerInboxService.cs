@@ -73,7 +73,8 @@ internal sealed class ManagerInboxService : IDisposable
     // follows an accepted, uncertain or interrupted-dispatch record.
     public InboxMessageView? Retry(string managerId, string messageId) =>
         _journal.Transition(managerId, messageId, InboxStates.Rejected,
-            message => message.Retryable == true
+            message => message.Retryable == true &&
+                (message.Attempts?.Count ?? 0) < 1000
                 ? message with { State = InboxStates.Queued, Reason = "explicit_retry",
                     Retryable = null, DispatchedAt = null, AcceptedAt = null,
                     RemoteMessageId = null, ConversationId = null }
@@ -86,9 +87,36 @@ internal sealed class ManagerInboxService : IDisposable
         await gate.WaitAsync(cancellation);
         try
         {
-            var next = _journal.List(managerId).FirstOrDefault(m =>
-                m.State is not (InboxStates.Completed or InboxStates.Cancelled));
+            var all = _journal.List(managerId);
+            // Definitive rejection is terminal for this delivery attempt. It
+            // must not permanently halt unrelated later queued messages.
+            var next = all.FirstOrDefault(m =>
+                m.State is not (InboxStates.Completed or InboxStates.Cancelled or InboxStates.Rejected));
             if (next is null) return false;
+
+            if (next.State == InboxStates.Uncertain)
+            {
+                var manager = _managers.Get(managerId);
+                if (manager?.ConversationId is not { } conversationId ||
+                    manager.LifecycleState != "idle")
+                    return false;
+                var checkpoint = _runtime.Get(conversationId);
+                // No remote guesswork: only #19 authoritative reconciliation
+                // of this exact operation can complete an uncertain inbox item.
+                if (checkpoint?.Status != "idle" ||
+                    checkpoint.PendingTurn is not null ||
+                    checkpoint.LastReconciliation is not { Outcome: "restored" } proof ||
+                    proof.OperationId != next.Id)
+                    return false;
+                _journal.Transition(managerId, next.Id, InboxStates.Uncertain,
+                    message => message with {
+                        State = InboxStates.Completed,
+                        CompletedAt = _clock.GetUtcNow(),
+                        ConversationId = conversationId,
+                        Reason = proof.Reason
+                    });
+                return true;
+            }
 
             if (next.State is InboxStates.Accepted or InboxStates.Generating)
             {
@@ -122,7 +150,9 @@ internal sealed class ManagerInboxService : IDisposable
             }
 
             if (next.State != InboxStates.Queued ||
-                next.NotBefore is { } notBefore && notBefore > _clock.GetUtcNow())
+                next.NotBefore is { } notBefore && notBefore > _clock.GetUtcNow() ||
+                all.Any(message => message.State == InboxStates.Rejected &&
+                    message.NotBefore is { } cooldown && cooldown > _clock.GetUtcNow()))
                 return false;
 
             var current = _managers.Get(managerId);
@@ -157,7 +187,7 @@ internal sealed class ManagerInboxService : IDisposable
             var receipt = outcome.Receipt;
             if (receipt.Disposition == SendDisposition.Uncertain)
             {
-                TryMarkUncertain(managerId, next.Id, receipt.Reason);
+                TryMarkUncertain(managerId, next.Id, receipt.Reason, receipt);
                 return false;
             }
             if (receipt.Disposition == SendDisposition.Accepted)
@@ -170,7 +200,8 @@ internal sealed class ManagerInboxService : IDisposable
                             AcceptedAt = _clock.GetUtcNow(),
                             ConversationId = current.ConversationId,
                             RemoteMessageId = receipt.MessageId,
-                            Reason = receipt.Reason
+                            Reason = receipt.Reason,
+                            Attempts = AppendEvidence(message, receipt)
                         });
                 }
                 catch
@@ -208,6 +239,7 @@ internal sealed class ManagerInboxService : IDisposable
                 _journal.Transition(managerId, next.Id, InboxStates.Dispatching,
                     message => message with { State = InboxStates.Rejected,
                         Reason = receipt.Reason, Retryable = receipt.Retryable,
+                        Attempts = AppendEvidence(message, receipt),
                         NotBefore = receipt.RetryAfterSeconds is int seconds
                             ? _clock.GetUtcNow().AddSeconds(Math.Max(0, seconds)) : null });
             }
@@ -254,12 +286,22 @@ internal sealed class ManagerInboxService : IDisposable
         });
     }
 
-    private void TryMarkUncertain(string managerId, string messageId, string reason)
+    private IReadOnlyList<InboxAttemptEvidence> AppendEvidence(
+        InboxMessage message, SendReceipt receipt) =>
+        (message.Attempts ?? []).Append(new InboxAttemptEvidence(
+            _clock.GetUtcNow(), receipt.Disposition.ToString().ToLowerInvariant(),
+            receipt.Reason, receipt.Retryable, receipt.RetryAfterSeconds,
+            receipt.MessageId, receipt.ConversationId)).ToArray();
+
+    private void TryMarkUncertain(string managerId, string messageId, string reason,
+        SendReceipt? receipt = null)
     {
         try
         {
             _journal.Transition(managerId, messageId, InboxStates.Dispatching,
-                message => message with { State = InboxStates.Uncertain, Reason = reason });
+                message => message with { State = InboxStates.Uncertain, Reason = reason,
+                    Attempts = receipt is null ? message.Attempts
+                        : AppendEvidence(message, receipt) });
         }
         catch (Exception) { /* Durable dispatching remains fail-closed on restart. */ }
         // Hold the in-process manager gate even if disk persistence failed.

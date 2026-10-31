@@ -215,8 +215,12 @@ internal sealed class ManagerService
                 return new(Get(id)!, new("guard_cleared",
                     "durable_creation_binding", current.ConversationId));
             if (current.LifecycleState != "uncertain")
+            {
+                if (current.ConversationId is not null)
+                    ReleaseVerifiedInboxBlock(id, current.ConversationId);
                 return new(current, new("not_applicable", "manager_not_uncertain",
                     current.ConversationId));
+            }
             if (current.ConversationId is null)
             {
                 var creation = await _runtime.ReconcileCreationAsync(id, cancellation);
