@@ -245,28 +245,14 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         return entries;
     }
 
-    // gh api --paginate --slurp produces one array per fetched page.
-    // Unlike the combined-status endpoint, this lists every publisher's
-    // status for a context. Refuse >=100 statuses until bounded pagination
-    // beyond the first page is explicitly supported by policy.
-    internal static IReadOnlyList<JsonElement> VerifiedIndividualStatusPages(JsonElement pages)
+    // Unlike the combined endpoint, individual statuses preserve every
+    // publisher's identity. Fetch one page only: a full page means there may
+    // be more statuses, so refuse to make a source-trust decision.
+    internal static JsonElement VerifiedIndividualStatusPage(JsonElement page)
     {
-        if (pages.ValueKind != JsonValueKind.Array || pages.GetArrayLength() == 0)
-            throw new InvalidOperationException("Commit status pages unavailable.");
-        var entries = new List<JsonElement>();
-        var pageIndex = 0;
-        foreach (var page in pages.EnumerateArray())
-        {
-            if (page.ValueKind != JsonValueKind.Array ||
-                page.GetArrayLength() > 100 ||
-                (pageIndex < pages.GetArrayLength() - 1 &&
-                 page.GetArrayLength() != 100) ||
-                entries.Count + page.GetArrayLength() >= 100)
-                throw new InvalidOperationException("Commit status list exceeds verified limit.");
-            entries.AddRange(page.EnumerateArray());
-            pageIndex++;
-        }
-        return entries;
+        if (page.ValueKind != JsonValueKind.Array || page.GetArrayLength() >= 100)
+            throw new InvalidOperationException("Commit status list exceeds verified limit.");
+        return page;
     }
 
     public async Task<PrSourceStatus> ReadAsync(
@@ -336,11 +322,11 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         }
         // The combined endpoint collapses same-context statuses across
         // publishers, losing trusted evidence behind newer untrusted posts.
-        // Read every individual status (with exhaustive page retrieval).
+        // Avoid reading unbounded history. A full first page fails closed.
         using var statuses = await ApiAsync(cancellation,
-            "--paginate", "--slurp", IndividualCommitStatusesRoute(repository, head));
-        var statusEntries = VerifiedIndividualStatusPages(statuses.RootElement);
-        foreach (var item in statusEntries)
+            IndividualCommitStatusesRoute(repository, head));
+        var statusEntries = VerifiedIndividualStatusPage(statuses.RootElement);
+        foreach (var item in statusEntries.EnumerateArray())
         {
             var name = GetString(item, "context") ?? "";
             gathered.Add(new PrCheck(name, head, "completed",

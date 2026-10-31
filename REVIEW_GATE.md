@@ -115,9 +115,9 @@ hidden them. Bracketed severity headings such as `### [P1]` are treated as
 findings rather than an all-clear. Repository identities use the
 canonical name returned by the source, and the durable PR journal treats
 repository casing aliases as the same identifier. Pagination remains deliberately
-fail-closed: 100 or more review comments or reviews are rejected;
-more than 100 statuses, check runs, or review threads are rejected until
-exhaustive pagination is implemented.
+fail-closed: 100 or more individual commit statuses, review comments or
+reviews are rejected; more than 100 check runs or review threads are rejected
+until exhaustive pagination is implemented.
 
 For merge, the server re-fetches authoritative state, evaluates all blockers,
 durably reserves a one-use attempt, re-fetches state, then submits a merge

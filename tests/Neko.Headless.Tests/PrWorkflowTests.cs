@@ -333,9 +333,31 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Equal("one-shot", fromDisk.MergeAttemptId);
         Assert.Contains(fromDisk.Audit!, a => a.Action == "merge_reserved");
         Assert.Throws<InvalidOperationException>(() => store.ReserveForDispatch(
-            "sample/project", 7, w => w.MergeAttemptId is not null
-                ? throw new InvalidOperationException("Attempt already consumed.")
-                : w with { MergeAttemptId = "two-shot" }));
+            "sample/project", 7, w => w));
+        Assert.Equal("one-shot", new PrWorkflowStore(folder.Path)
+            .Get("sample/project", 7)!.MergeAttemptId);
+    }
+
+    [Fact]
+    public void DispatchGuardTruncatesShorterCheckpointBeforeReturning()
+    {
+        using var folder = new TemporaryDirectory();
+        var store = new PrWorkflowStore(folder.Path);
+        store.Create("sample/project", 7, PrHead, PrBase,
+            "creator-chat", "developer-chat", "manager-chat");
+        store.Update("sample/project", 7,
+            w => store.Append(w, "long_prior_audit", new string('x', 1024)));
+        var checkpoint = Directory.GetFiles(Path.Combine(folder.Path, "pr-workflows"),
+            "*.json").Single();
+        var originalSize = new FileInfo(checkpoint).Length;
+        store.ReserveForDispatch("sample/project", 7,
+            w => w with { MergeAttemptId = "short-guard", MergeOutcome = "uncertain",
+                Audit = [new PrAuditEvent(DateTimeOffset.UtcNow, "merge_reserved",
+                    "before_external_dispatch")] });
+        Assert.True(new FileInfo(checkpoint).Length < originalSize);
+        var reloaded = new PrWorkflowStore(folder.Path).Get("sample/project", 7)!;
+        Assert.Equal("short-guard", reloaded.MergeAttemptId);
+        Assert.Single(reloaded.Audit!);
     }
 
     [Fact]
