@@ -32,10 +32,23 @@ internal sealed class ManagerService
     {
         if (_registry.Get(id) is null) return;
         _inboxBlocks[id] = operationId;
-        _registry.Update(id, record =>
-            record.LifecycleState is "idle" or "generating" or "sending"
-                ? record with { LifecycleState = "uncertain",
-                    PendingOperationId = operationId } : record);
+        try
+        {
+            _registry.Update(id, record =>
+                record.LifecycleState is "idle" or "generating" or "sending"
+                    ? record with { LifecycleState = "uncertain",
+                        PendingOperationId = operationId } : record);
+        }
+        catch (IOException)
+        {
+            // The inbox journal is already uncertain on disk, and the
+            // process-local block was established before this failed write.
+            // Do not make the service unusable or permit another send.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Keep the in-process block; the durable inbox guard is retained.
+        }
     }
 
     private void ReleaseVerifiedInboxBlock(string id, string conversationId)

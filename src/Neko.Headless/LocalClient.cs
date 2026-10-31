@@ -23,40 +23,32 @@ internal static class LocalClient
         HttpClient client, string command, string[] args, TextWriter output, TextWriter error)
     {
         var positional = new List<string>();
-        var skipConfigValue = false;
-        for (var i = 1; i < args.Length; i++)
+        string? idempotencyKey = null;
+        var i = 1;
+        while (i < args.Length)
         {
-            if (skipConfigValue) { skipConfigValue = false; continue; }
             if (args[i] == "--config")
             {
                 if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
                     throw new ArgumentException("--config requires a file path.");
-                skipConfigValue = true;
+                i += 2;
                 continue;
             }
-            if (args[i] == "--wait") continue;
+            if (args[i] == "--wait") { i++; continue; }
             if (args[i] == "--key")
             {
                 if (command != "manager-queue" || i + 1 >= args.Length ||
                     args[i + 1].StartsWith("--"))
                     throw new ArgumentException("--key requires a value for manager-queue.");
-                i++;
+                idempotencyKey ??= args[i + 1];
+                i += 2;
                 continue;
             }
             positional.Add(args[i]);
+            i++;
         }
 
         var wait = args.Contains("--wait");
-        string? idempotencyKey = null;
-        var keyIndex = Array.IndexOf(args, "--key");
-        if (keyIndex >= 0)
-        {
-            if (command != "manager-queue" || keyIndex + 1 >= args.Length ||
-                args[keyIndex + 1].StartsWith("--"))
-                throw new ArgumentException("--key requires a value for manager-queue.");
-            idempotencyKey = args[keyIndex + 1];
-            // The generic positional parser already removed these tokens.
-        }
         string route;
         HttpMethod method = HttpMethod.Get;
         string? body = null;
