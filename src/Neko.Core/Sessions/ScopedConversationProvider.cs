@@ -30,7 +30,7 @@ public interface IConversationProviderFactory
 /// Other operations delegate to the original provider without changing transport data.
 /// </summary>
 public sealed class ScopedConversationProvider :
-    IConversationProvider, IPreparedConversationProvider, IDisposable
+    IConversationProvider, IPreparedConversationProvider, IProviderRateLimitStatus, IDisposable
 {
     private readonly IScopedConversationProvider _provider;
     private readonly string _scope;
@@ -48,6 +48,8 @@ public sealed class ScopedConversationProvider :
     public Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation) =>
         _provider.ReadAsync(id, cancellation);
     public bool SupportsStop => _provider.SupportsStop;
+    public int? RateLimitRetryAfterSeconds =>
+        (_provider as IProviderRateLimitStatus)?.RateLimitRetryAfterSeconds;
     public Task<StopReceipt> StopAsync(string id, CancellationToken cancellation) =>
         _provider.StopAsync(id, cancellation);
     public IAsyncEnumerable<PublicConversationUpdate> WatchAsync(string id, CancellationToken cancellation) =>
@@ -111,7 +113,14 @@ public sealed class ScopedConversationProvider :
                 "scope_verification_cancelled_before_send");
         }
         if (!scoped)
-            return new SendReceipt(SendDisposition.Rejected, "scope_not_verified");
+        {
+            var retryAfter=RateLimitRetryAfterSeconds;
+            return new SendReceipt(SendDisposition.Rejected,"scope_not_verified")
+            {
+                Retryable=retryAfter.HasValue?true:null,
+                RetryAfterSeconds=retryAfter
+            };
+        }
         return _provider is IPreparedConversationProvider prepared
             ? await prepared.SendPreparedAsync(submission, cancellation)
             : await _provider.SendAsync(submission.ConversationId, submission.Text, cancellation);

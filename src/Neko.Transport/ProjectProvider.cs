@@ -17,7 +17,7 @@ public sealed class Factory : IConversationProviderFactory
     }
 }
 
-internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
+internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRateLimitStatus, IDisposable
 {
     // Project-scoped creation was verified by an independent saved-history
     // read on 2026-10-30, without any per-chat WebView2 navigation.
@@ -40,6 +40,49 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
     private bool IsRateLimited()
     {
         lock (_cooldownGate) return DateTimeOffset.UtcNow < _readCooldownUntil;
+    }
+
+    internal static int? RemainingCooldownSeconds(DateTimeOffset until,DateTimeOffset now)
+    {
+        var seconds=(until-now).TotalSeconds;
+        return seconds>0?(int)Math.Min(600,Math.Ceiling(seconds)):null;
+    }
+
+    public int? RateLimitRetryAfterSeconds
+    {
+        get
+        {
+            lock(_cooldownGate)
+                return RemainingCooldownSeconds(_readCooldownUntil,DateTimeOffset.UtcNow);
+        }
+    }
+
+    private SendReceipt RateLimitedReceipt() =>
+        new(SendDisposition.Rejected,"provider_rate_limited")
+        { Retryable=true, RetryAfterSeconds=RateLimitRetryAfterSeconds };
+
+    // Only a correlated, definitively rejected HTTP response is safe to retry.
+    // A timeout or lost native response still has ambiguous delivery.
+    internal static SendReceipt? ConfirmedNative429Receipt(
+        NativeDispatchSender.Result result,int? retryAfterSeconds) =>
+        result.Dispatched && !result.SseAccepted && result.HttpStatus==429
+            ? new SendReceipt(SendDisposition.Rejected,result.State)
+              { Retryable=true, RetryAfterSeconds=retryAfterSeconds }
+            : null;
+
+    // A correlated 429 is known rejected even when the native POST ran.
+    // An attempted send without that confirmation may have been delivered.
+    internal static string SendArchiveOutcome(bool attempted,bool confirmedRejected) =>
+        attempted && !confirmedRejected?"submission_uncertain":"rejected";
+
+    private void ObserveHttpRateLimit(int? status)
+    {
+        if(status!=429)return;
+        lock(_cooldownGate)
+        {
+            var until=DateTimeOffset.UtcNow.AddSeconds(60);
+            if(until>_readCooldownUntil)_readCooldownUntil=until;
+        }
     }
 
     internal static TimeSpan? RetryAfter(JsonElement root)
@@ -213,23 +256,27 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
         if(!EnableNativeCreation)
             return new SendReceipt(SendDisposition.Rejected,
                 "native_creation_not_verified");
-        if(IsRateLimited())
-            return new SendReceipt(SendDisposition.Rejected,"provider_rate_limited");
+        if(IsRateLimited())return RateLimitedReceipt();
 
         await _sendGate.WaitAsync(cancellation);
         var dispatched=false;
+        var confirmedRejected=false;
         NativeLiveStreamHub.Attempt? capture=null;
         var stage="scope_preflight";
         try
         {
+            // Another concurrent read may have received 429 while waiting.
+            if(IsRateLimited())return RateLimitedReceipt();
             // BrowserSession loads one authenticated page at startup.
             // Do not navigate to a project to create its conversation.
             // Pass the requested scope explicitly to the native operation.
             var existing=await ProjectIdsAsync(scope,cancellation);
             if(existing is null)
-                return new SendReceipt(SendDisposition.Rejected,
-                    "project_unavailable");
+                return IsRateLimited()?RateLimitedReceipt():
+                    new SendReceipt(SendDisposition.Rejected,"project_unavailable")
+                    { Retryable=true };
 
+            if(IsRateLimited())return RateLimitedReceipt();
             stage="native_dispatch";
             var parentId=Guid.NewGuid().ToString("D");
             capture=await _live.BeginAsync(parentId,null,scope,submission.Text);
@@ -237,9 +284,16 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                 parentId,submission.Text,scope,cancellation,
                 externalStreamObserver:true);
             dispatched=result.Dispatched;
+            ObserveHttpRateLimit(result.HttpStatus);
             if(!dispatched)
             {
                 return new SendReceipt(SendDisposition.Rejected,result.State);
+            }
+            var throttled=ConfirmedNative429Receipt(result,RateLimitRetryAfterSeconds);
+            if(throttled is not null)
+            {
+                confirmedRejected=true;
+                return throttled;
             }
 
             // A page-side submission can succeed even if WebView2 loses
@@ -301,7 +355,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
         {
             if(capture is not null)
                 await _live.FinishAsync(capture,
-                    dispatched?"submission_uncertain":"rejected",null);
+                    dispatched && !confirmedRejected?"submission_uncertain":"rejected",null);
             _sendGate.Release();
         }
     }
@@ -318,21 +372,29 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
         await _sendGate.WaitAsync(cancellation);
         var stage="preflight";
         var attempted=false;
+        var confirmedRejected=false;
         NativeLiveStreamHub.Attempt? capture=null;
         try
         {
+            // Cooldown is provider-wide; do not poll again on an active 429.
+            if(IsRateLimited())return RateLimitedReceipt();
             // The local journal is never an authoritative parent.
             var before=await SnapshotAsync(id,allowRecent:true);
             if(before is null)
-                return new SendReceipt(SendDisposition.Rejected,"history_unavailable");
+                return IsRateLimited()?RateLimitedReceipt():
+                    new SendReceipt(SendDisposition.Rejected,"history_unavailable")
+                    { Retryable=true };
             if(!Guid.TryParse(before.CurrentNode,out _) ||
                before.CurrentNode!=before.LastAssistantId ||
                before.LastAssistantStatus!="finished_successfully")
                 return new SendReceipt(SendDisposition.Rejected,"parent_not_complete");
+            if(IsRateLimited())return RateLimitedReceipt();
             using(var status=await _browser.ReadAsync(
                 _settings.Format(_settings.StreamStatusPath,"id",id),"status"))
             {
                 var root=status.RootElement;
+                ObserveReadThrottle(root);
+                if(IsRateLimited())return RateLimitedReceipt();
                 if(!root.TryGetProperty("ok",out var ok)||!ok.GetBoolean()||
                    !root.TryGetProperty("streamState",out var state)||
                    state.GetString()!="COMPLETE")
@@ -341,6 +403,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
             }
             // Use the already-loaded authenticated runtime. The existing
             // conversation and authoritative parent are explicit arguments.
+            if(IsRateLimited())return RateLimitedReceipt();
             stage="native_dispatch";
             // The native sender makes exactly one invocation. HTTP 200 SSE
             // is required before reporting acceptance to the headless host.
@@ -349,14 +412,23 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
                 id,before.CurrentNode,text,null,cancellation,
                 externalStreamObserver:true);
             attempted=result.Dispatched;
+            ObserveHttpRateLimit(result.HttpStatus);
             if(!result.Dispatched)
             {
                 return new SendReceipt(SendDisposition.Rejected,result.State);
             }
             if(!result.SseAccepted)
+            {
+                var throttled=ConfirmedNative429Receipt(result,RateLimitRetryAfterSeconds);
+                if(throttled is not null)
+                {
+                    confirmedRejected=true;
+                    return throttled;
+                }
                 return new SendReceipt(
                     result.HttpStatus is >=400 ? SendDisposition.Rejected:
                     SendDisposition.Uncertain,result.State);
+            }
             StartPolling(id,before.LastAssistantId,capture);
             capture=null; // Polling now owns the live observer.
             return new SendReceipt(SendDisposition.Accepted);
@@ -382,7 +454,7 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IDisposable
         {
             if(capture is not null)
                 await _live.FinishAsync(capture,
-                    attempted?"submission_uncertain":"rejected",id);
+                    SendArchiveOutcome(attempted,confirmedRejected),id);
             _sendGate.Release();
         }
     }

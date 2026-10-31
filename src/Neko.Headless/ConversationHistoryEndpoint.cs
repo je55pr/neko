@@ -3,7 +3,7 @@ using Neko;
 
 namespace Neko.Headless;
 
-internal readonly record struct HistoryReadResult(bool Known, VisibleConversation? History);
+public readonly record struct HistoryReadResult(bool Known, VisibleConversation? History);
 
 internal static class ConversationHistoryEndpoint
 {
