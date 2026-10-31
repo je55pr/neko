@@ -137,13 +137,10 @@ internal static class LocalClient
                     reviewerAccount = positional[2], task = positional[3]
                 });
                 break;
-            case "pr-review-proof" when positional.Count == 4 &&
+            case "pr-publish-review" when positional.Count == 2 &&
                 int.TryParse(positional[1], out var reviewNumber) && reviewNumber > 0:
-                route = PrRoute(positional[0], reviewNumber) + "/review-proof";
+                route = PrRoute(positional[0], reviewNumber) + "/publish-review";
                 method = HttpMethod.Post;
-                body = JsonSerializer.Serialize(new {
-                    reviewUrl = positional[2], verdict = positional[3]
-                });
                 break;
             case "pr-merge" when positional.Count == 2 &&
                 int.TryParse(positional[1], out var mergeNumber) && mergeNumber > 0:

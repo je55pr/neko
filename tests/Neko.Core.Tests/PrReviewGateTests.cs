@@ -8,11 +8,16 @@ public sealed class PrReviewGateTests
     private const string Base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     private const string Changed = "cccccccccccccccccccccccccccccccccccccccc";
     private static readonly DateTimeOffset Now = new(2026, 10, 31, 4, 0, 0, TimeSpan.Zero);
-    private static readonly PrReviewPolicy Policy = new(["build"], "review-bot-run", "review-bot");
+    private static readonly PrReviewPolicy Policy = new(
+        ["build"], "review-bot-run", "review-bot",
+        TrustedCheckProducers: new Dictionary<string, string> { ["build"] = "app:100" },
+        AutomatedCheckProducer: "app:200");
 
     private static PrWorkerEvidence Worker() => new("fresh-review-worker", Head,
         Now.AddMinutes(-30), true, Now.AddMinutes(-10), "https://example.org/review/12",
-        "approved", "review-account");
+        "approved", "review-account", CompletionMessageId: "worker-result",
+        ReviewPostAttemptId: "post-attempt", ReviewPostOutcome: "posted",
+        PostedBodySha256: "verified-body-digest", ReviewerVerdict: "no_blockers");
 
     private static PrWorkflow Workflow() => new("sample/project", 12, Head, Base,
         "author-worker", "developer-worker", "manager-worker", Now.AddHours(-1),
@@ -21,12 +26,12 @@ public sealed class PrReviewGateTests
     private static PrSourceStatus Source() => new("sample/project", 12, Head, Base,
         "open", "author-account", false, true,
         [
-            new("build", Head, "completed", "success"),
-            new("review-bot-run", Head, "completed", "success")
+            new("build", Head, "completed", "success", "app:100"),
+            new("review-bot-run", Head, "completed", "success", "app:200")
         ],
         [
             new("https://example.org/review/12", "review-account", Head, "approved",
-                true, Now.AddMinutes(-9)),
+                true, Now.AddMinutes(-9), "verified-body-digest"),
             new("https://example.org/review/13", "review-bot", Head, "commented",
                 true, Now.AddMinutes(-8))
         ], 0);
@@ -56,12 +61,22 @@ public sealed class PrReviewGateTests
     }
 
     [Fact]
-    public void CreatorAccountCannotBeIndependentSourceReviewer()
+    public void SharedSourceAccountStillRequiresIndependentChatAndPostedWorkerReceipt()
     {
+        // The local source credential may be shared. Independence is proven
+        // by the newly created worker conversation and host-authored receipt.
         var workflow = Workflow() with {
             Reviewer = Worker() with { ReviewerAccount = "author-account" }
         };
-        Assert.Contains("reviewer_not_independent", Evaluate(workflow).Blockers);
+        var source = Source() with {
+            Reviews = [Source().Reviews[0] with { Author = "author-account" },
+                Source().Reviews[1]]
+        };
+        Assert.True(Evaluate(workflow, source).Ready);
+        Assert.Contains("review_post_receipt_missing",
+            Evaluate(workflow with {
+                Reviewer = workflow.Reviewer! with { ReviewPostAttemptId = null }
+            }, source).Blockers);
     }
 
     [Fact]
@@ -101,8 +116,8 @@ public sealed class PrReviewGateTests
     public void AutomatedReviewerRunMustConcludeSuccess(string status, string? conclusion)
     {
         var source = Source() with {
-            Checks = [new("build", Head, "completed", "success"),
-                new("review-bot-run", Head, status, conclusion)]
+            Checks = [new("build", Head, "completed", "success", "app:100"),
+                new("review-bot-run", Head, status, conclusion, "app:200")]
         };
         Assert.Contains("automated_review_run_not_successful", Evaluate(source: source).Blockers);
     }
@@ -133,9 +148,39 @@ public sealed class PrReviewGateTests
     public void NonPassingRequiredCheckBlocks(string status, string? conclusion)
     {
         var source = Source() with {
-            Checks = [new("build", Head, status, conclusion), Source().Checks[1]]
+            Checks = [new("build", Head, status, conclusion, "app:100"), Source().Checks[1]]
         };
         Assert.Contains("required_check_not_successful:build", Evaluate(source: source).Blockers);
+    }
+
+    [Fact]
+    public void APassingCheckFromAnUntrustedProducerCannotSatisfyPolicy()
+    {
+        var spoofedRequired = Source() with {
+            Checks = [Source().Checks[0] with { ProducerId = "user:999" },
+                Source().Checks[1]]
+        };
+        Assert.Contains("required_check_not_successful:build",
+            Evaluate(source: spoofedRequired).Blockers);
+
+        var spoofedAutomated = Source() with {
+            Checks = [Source().Checks[0],
+                Source().Checks[1] with { ProducerId = "app:999" }]
+        };
+        Assert.Contains("automated_review_run_not_successful",
+            Evaluate(source: spoofedAutomated).Blockers);
+    }
+
+    [Fact]
+    public void MissingCheckProducerPolicyCannotSilentlyPass()
+    {
+        var policy = Policy with {
+            AutomatedCheckProducer = null,
+            TrustedCheckProducers = null
+        };
+        var result = Evaluate(policy: policy);
+        Assert.Contains("automated_review_producer_missing", result.Blockers);
+        Assert.Contains("required_check_producer_missing:build", result.Blockers);
     }
 
     [Fact]
@@ -154,6 +199,35 @@ public sealed class PrReviewGateTests
                     "changes_requested", true, Now.AddMinutes(-1))]
         };
         Assert.Contains("changes_requested", Evaluate(source: source).Blockers);
+    }
+
+    [Fact]
+    public void AutomatedReviewerCannotBeReusedAsIndependentReviewer()
+    {
+        var workflow = Workflow() with {
+            Reviewer = Worker() with {
+                ReviewerAccount = "REVIEW-BOT",
+                ReviewUrl = "https://example.org/review/13"
+            }
+        };
+        Assert.Contains("reviewer_not_independent", Evaluate(workflow).Blockers);
+        Assert.Contains("substantive_automated_review_missing", Evaluate(workflow).Blockers);
+    }
+
+    [Fact]
+    public void OlderHeadChangeRequestRemainsBindingUntilLatestDecisiveApproval()
+    {
+        var requested = new PrReview("https://example.org/review/14", "reviewer-x",
+            Changed, "changes_requested", true, Now.AddMinutes(-2));
+        var commented = new PrReview("https://example.org/review/15", "reviewer-x",
+            Head, "commented", true, Now.AddMinutes(-1));
+        var source = Source() with { Reviews = [..Source().Reviews, requested, commented] };
+        Assert.Contains("changes_requested", Evaluate(source: source).Blockers);
+
+        var approved = new PrReview("https://example.org/review/16", "REVIEWER-X",
+            Head, "approved", true, Now.AddMinutes(1));
+        var resolved = source with { Reviews = [..source.Reviews, approved] };
+        Assert.DoesNotContain("changes_requested", Evaluate(source: resolved).Blockers);
     }
 
     [Fact]

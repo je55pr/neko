@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using Neko;
 
 namespace Neko.Headless;
@@ -5,6 +7,10 @@ namespace Neko.Headless;
 internal interface IPrSourceAdapter
 {
     Task<PrSourceStatus> ReadAsync(string repository, int number, CancellationToken cancellation);
+    // Publish the exact verified worker output at the expected commit. The
+    // caller persists a one-use reservation before this external write.
+    Task<PrReview> PostReviewAsync(string repository, int number, string expectedHead,
+        string body, CancellationToken cancellation);
     // Implementations MUST send expectedHead as an atomic server-side precondition.
     Task<string> MergeAsync(string repository, int number, string expectedHead,
         CancellationToken cancellation);
@@ -59,9 +65,15 @@ internal sealed class PrWorkflowService
         var status = await _source.ReadAsync(repository, number, cancellation);
         var decision = PrReviewGate.Evaluate(record, _policy, status, _clock.GetUtcNow());
         // Persist source-verifiable checks and reviewer facts before reporting readiness.
-        var observed = _store.Update(repository, number, current => current with {
-            LastSourceEvidence = status, LastGateDecision = decision
-        });
+        var observed = _store.Update(repository, number, current =>
+            current.MergeAttemptId is not null ? current : current with {
+                LastSourceEvidence = status, LastGateDecision = decision
+            });
+        // Concurrent merge reservations must never be shown as ready merely
+        // because inspection began before they were persisted.
+        if (observed.MergeAttemptId is not null)
+            decision = PrReviewGate.Evaluate(
+                observed, _policy, status, _clock.GetUtcNow());
         return new PrWorkflowReport(observed, decision);
     }
 
@@ -71,7 +83,8 @@ internal sealed class PrWorkflowService
     {
         var current = _store.Get(repository, number)
             ?? throw new KeyNotFoundException("Workflow unavailable.");
-        if (current.MergeAttemptId is not null ||
+        if ((current.MergeAttemptId is not null &&
+            current.MergeOutcome != "rejected_before_dispatch") ||
             current.ReviewLaunchState is "dispatching" or "uncertain")
             throw new InvalidOperationException("Unresolved external action blocks revision rearm.");
         var source = await _source.ReadAsync(repository, number, cancellation);
@@ -81,19 +94,29 @@ internal sealed class PrWorkflowService
             throw new InvalidOperationException("Source revision unavailable.");
         return _store.Update(repository, number, existing =>
         {
-            if (existing.MergeAttemptId is not null ||
+            if ((existing.MergeAttemptId is not null &&
+                existing.MergeOutcome != "rejected_before_dispatch") ||
                 existing.ReviewLaunchState is "dispatching" or "uncertain" ||
-                existing.HeadSha != current.HeadSha || existing.BaseSha != current.BaseSha)
+                existing.HeadSha != current.HeadSha || existing.BaseSha != current.BaseSha ||
+                existing.MergeAttemptId != current.MergeAttemptId)
                 throw new InvalidOperationException("Revision change was concurrent.");
-            if (existing.HeadSha == source.HeadSha && existing.BaseSha == source.BaseSha)
-                return existing;
+            var changed = existing.HeadSha != source.HeadSha ||
+                existing.BaseSha != source.BaseSha;
+            if (!changed && existing.MergeAttemptId is null) return existing;
+            var oldAttempt = existing.MergeAttemptId;
             return _store.Append(existing with {
                 HeadSha = source.HeadSha, BaseSha = source.BaseSha,
-                Reviewer = null, ReviewLaunchState = "unstarted", ReviewLaunchAt = null,
-                State = "awaiting_independent_review", LastSourceEvidence = source,
-                LastGateDecision = null
+                Reviewer = changed ? null : existing.Reviewer,
+                ReviewLaunchState = changed ? "unstarted" : existing.ReviewLaunchState,
+                ReviewLaunchAt = changed ? null : existing.ReviewLaunchAt,
+                MergeAttemptId = null, MergeOutcome = null,
+                MergeAuthorizedBy = null, MergeAuthorizedAt = null,
+                State = changed ? "awaiting_independent_review" : "checks_pending",
+                LastSourceEvidence = source, LastGateDecision = null
             }, "revision_rearmed",
-                "previous_head:" + existing.HeadSha + ";previous_base:" + existing.BaseSha);
+                "previous_head:" + existing.HeadSha +
+                ";previous_base:" + existing.BaseSha +
+                ";safe_attempt:" + (oldAttempt ?? "none"));
         });
     }
 
@@ -104,15 +127,18 @@ internal sealed class PrWorkflowService
     {
         if (string.IsNullOrWhiteSpace(task) || task.Length > 12000 ||
             string.IsNullOrWhiteSpace(reviewerAccount) ||
-            reviewerAccount.Length > 100 || reviewerAccount.Any(char.IsControl))
-            throw new ArgumentException("Invalid reviewer request.");
+            reviewerAccount.Length > 100 || reviewerAccount.Any(char.IsControl) ||
+            StringComparer.OrdinalIgnoreCase.Equals(reviewerAccount,
+                _policy.AutomatedReviewer))
+            throw new ArgumentException("Independent reviewer must be distinct.");
         var current = _store.Get(repository, number)
             ?? throw new KeyNotFoundException("Workflow unavailable.");
         if (current.ReviewLaunchState != "unstarted" || current.MergeAttemptId is not null)
             throw new InvalidOperationException("Review creation already reserved.");
         var source = await _source.ReadAsync(repository, number, cancellation);
-        if (source.HeadSha != current.HeadSha || source.BaseSha != current.BaseSha ||
-            source.State != "open" || source.Author == reviewerAccount)
+        if (source.Repository != repository || source.Number != number ||
+            source.HeadSha != current.HeadSha || source.BaseSha != current.BaseSha ||
+            source.State != "open" || source.Merged)
             throw new InvalidOperationException("Source head/base changed.");
         current = _store.Update(repository, number, existing =>
         {
@@ -128,7 +154,10 @@ internal sealed class PrWorkflowService
         {
             receipt = await _runtime.CreateAsync(
                 "Independent review assignment for " + repository + "#" + number +
-                " at head " + current.HeadSha + ". Do not merge. " + task,
+                " at head " + current.HeadSha +
+                ". Do not merge or post a source review yourself. Return a final" +
+                " substantive review starting with exactly REVIEW_VERDICT: NO_BLOCKERS" +
+                " or REVIEW_VERDICT: BLOCKERS, followed by findings. " + task,
                 cancellation);
         }
         catch (Exception)
@@ -152,40 +181,106 @@ internal sealed class PrWorkflowService
         }, "reviewer_bound", "created_for_current_head"));
     }
 
-    /// <summary>Only a verified local terminal turn can become worker completion evidence.</summary>
-    public async Task<PrWorkflow> ConfirmReviewAsync(string repository, int number,
-        string reviewUrl, string verdict, CancellationToken cancellation)
+    /// <summary>
+    /// The host posts the verified worker output itself. A URL echoed by a
+    /// worker is never evidence that the worker authored a source review.
+    /// </summary>
+    public async Task<PrWorkflow> PublishReviewAsync(string repository, int number,
+        CancellationToken cancellation)
     {
         var record = _store.Get(repository, number)
             ?? throw new KeyNotFoundException("Workflow unavailable.");
         var worker = record.Reviewer ??
             throw new InvalidOperationException("No bound reviewer.");
         if (record.ReviewLaunchState != "accepted" ||
-            record.MergeAttemptId is not null || worker.CreatedForHead != record.HeadSha)
-            throw new InvalidOperationException("Reviewer cannot be confirmed.");
-        if (verdict is not ("approved" or "commented") ||
-            !Uri.TryCreate(reviewUrl, UriKind.Absolute, out var uri) || uri.Scheme != "https")
-            throw new ArgumentException("Invalid source review evidence.");
+            record.MergeAttemptId is not null || worker.CreatedForHead != record.HeadSha ||
+            worker.ReviewPostAttemptId is not null)
+            throw new InvalidOperationException("Reviewer posting is blocked.");
+
         var history = await _runtime.ReadAsync(worker.ConversationId, cancellation);
-        if (!history.ProviderVerified || history.History is null ||
+        var response = history.History?.Messages.LastOrDefault(
+            message => message.Role == VisibleMessageRole.Assistant);
+        if (!history.ProviderVerified || response is null ||
             _runtime.Get(worker.ConversationId)?.Status != "idle" ||
-            !history.History.Messages.Any(m => m.Role == VisibleMessageRole.Assistant &&
-                m.Text.Contains(reviewUrl, StringComparison.Ordinal)))
+            string.IsNullOrWhiteSpace(response.Id))
             throw new InvalidOperationException("Reviewer has not durably completed.");
+        var body = response.Text.Trim();
+        if (body.Length is < 50 or > 12000 ||
+            !body.StartsWith("REVIEW_VERDICT: ", StringComparison.Ordinal))
+            throw new InvalidOperationException("Structured reviewer verdict missing.");
+        var verdict = body.Split('\n')[0].Trim() switch {
+            "REVIEW_VERDICT: NO_BLOCKERS" => "no_blockers",
+            "REVIEW_VERDICT: BLOCKERS" => "blockers",
+            _ => throw new InvalidOperationException("Reviewer verdict unknown.")
+        };
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
         var source = await _source.ReadAsync(repository, number, cancellation);
-        var match = source.Reviews.Any(r => r.Url == reviewUrl &&
-            r.Author == worker.ReviewerAccount && r.HeadSha == record.HeadSha &&
-            r.Verdict == verdict && r.Substantive && r.SubmittedAt >= worker.CreatedAt);
-        if (source.HeadSha != record.HeadSha || source.BaseSha != record.BaseSha || !match)
-            throw new InvalidOperationException("Source-side independent review unverified.");
-        var posted = history.History.Messages.Last(m =>
-            m.Role == VisibleMessageRole.Assistant &&
-            m.Text.Contains(reviewUrl, StringComparison.Ordinal));
-        return _store.Update(repository, number, w => _store.Append(w with {
-            Reviewer = worker with { Completed = true, CompletedAt = _clock.GetUtcNow(),
-                ReviewUrl = reviewUrl, Verdict = verdict,
-                CompletionMessageId = posted.Id }, LastSourceEvidence = source
-        }, "review_verified", "local_terminal_and_source_review"));
+        if (source.Repository != repository || source.Number != number ||
+            source.State != "open" || source.HeadSha != record.HeadSha ||
+            source.BaseSha != record.BaseSha)
+            throw new InvalidOperationException("PR revision changed before review posting.");
+        var attemptId = Guid.NewGuid().ToString("N");
+
+        // This one-use durable reservation comes before any external write.
+        _store.Update(repository, number, current =>
+        {
+            if (current.Reviewer?.ReviewPostAttemptId is not null ||
+                current.HeadSha != record.HeadSha || current.BaseSha != record.BaseSha)
+                throw new InvalidOperationException("Concurrent review posting.");
+            return _store.Append(current with {
+                Reviewer = current.Reviewer! with {
+                    ReviewPostAttemptId = attemptId,
+                    ReviewPostOutcome = "uncertain",
+                    CompletionMessageId = response.Id,
+                    PostedBodySha256 = digest,
+                    ReviewerVerdict = verdict
+                }, State = "blocked"
+            }, "review_post_reserved", "exact_worker_message:" + response.Id, attemptId);
+        });
+
+        try
+        {
+            var receipt = await _source.PostReviewAsync(
+                repository, number, record.HeadSha, body, cancellation);
+            if (receipt.HeadSha != record.HeadSha ||
+                !StringComparer.Ordinal.Equals(receipt.BodySha256, digest) ||
+                !StringComparer.OrdinalIgnoreCase.Equals(receipt.Author, worker.ReviewerAccount) ||
+                StringComparer.OrdinalIgnoreCase.Equals(receipt.Author, _policy.AutomatedReviewer) ||
+                receipt.Verdict is not ("commented" or "approved") ||
+                string.IsNullOrWhiteSpace(receipt.Url))
+                throw new InvalidOperationException("Published review receipt mismatched.");
+
+            // Re-read authoritative source. Merely receiving a publish receipt
+            // is not sufficient to mark independently-reviewed work complete.
+            var verified = await _source.ReadAsync(repository, number, cancellation);
+            if (verified.HeadSha != record.HeadSha || verified.BaseSha != record.BaseSha ||
+                !verified.Reviews.Any(r => r.Url == receipt.Url &&
+                    r.Author == receipt.Author && r.HeadSha == record.HeadSha &&
+                    r.BodySha256 == digest && r.Substantive &&
+                    r.Verdict == receipt.Verdict))
+                throw new InvalidOperationException("Published review could not be verified.");
+            return _store.Update(repository, number, current =>
+                _store.Append(current with {
+                    Reviewer = current.Reviewer! with {
+                        Completed = true, CompletedAt = _clock.GetUtcNow(),
+                        ReviewUrl = receipt.Url, Verdict = receipt.Verdict,
+                        ReviewerAccount = receipt.Author,
+                        ReviewPostOutcome = "posted"
+                    }, LastSourceEvidence = verified,
+                    State = verdict == "no_blockers" ? "checks_pending" : "changes_requested"
+                }, "review_post_verified", "source_receipt_verified", attemptId));
+        }
+        catch
+        {
+            // The remote review may have been accepted. Never repeat this
+            // write automatically or simply discard its one-use reservation.
+            _store.Update(repository, number, current =>
+                _store.Append(current with {
+                    Reviewer = current.Reviewer! with { ReviewPostOutcome = "uncertain" },
+                    State = "blocked"
+                }, "review_post_uncertain", "manual_source_reconciliation_required", attemptId));
+            throw;
+        }
     }
 
     public async Task<PrMergeReport> MergeAsync(string repository, int number,
@@ -208,10 +303,11 @@ internal sealed class PrWorkflowService
                 return _store.Append(w with {
                     MergeAttemptId = attemptId, MergeOutcome = "uncertain", State = "blocked",
                     MergeAuthorizedAt = _clock.GetUtcNow(),
-                    MergeAuthorizedBy = w.ManagerConversationId
+                    MergeAuthorizedBy = "authenticated_host_operator"
                 }, "merge_reserved", "expected_head:" + w.HeadSha +
-                    ";manager:" + w.ManagerConversationId, attemptId);
+                    ";authenticated_host_operator", attemptId);
             });
+            var externalMergeInvoked = false;
             try
             {
                 // Post-reservation source recheck detects races before the remote write.
@@ -222,14 +318,15 @@ internal sealed class PrWorkflowService
                 if (!recheck.Ready)
                 {
                     var stopped = _store.Update(repository, number, w =>
-                        _store.Append(w with { MergeOutcome = "rejected" },
+                        _store.Append(w with { MergeOutcome = "rejected_before_dispatch" },
                             "merge_preflight_rejected", string.Join(",", recheck.Blockers), attemptId));
-                    return new PrMergeReport(stopped, recheck, "rejected");
+                    return new PrMergeReport(stopped, recheck, "rejected_before_dispatch");
                 }
                 // Fresh preflight proof must also be durable before the merge write.
                 _store.Update(repository, number, w => _store.Append(w with {
                     LastSourceEvidence = latest, LastGateDecision = recheck
                 }, "merge_preflight_verified", "exact_head_and_policy_pass", attemptId));
+                externalMergeInvoked = true;
                 var mergedSha = await _source.MergeAsync(repository, number,
                     reserved.HeadSha, cancellation);
                 if (!PrReviewGate.ValidSha(mergedSha))
@@ -241,11 +338,17 @@ internal sealed class PrWorkflowService
             }
             catch (Exception)
             {
-                // Even errors before dispatch stay blocked; never infer safe replay.
-                var uncertain = _store.Update(repository, number, w =>
-                    _store.Append(w with { MergeOutcome = "uncertain", State = "blocked" },
-                        "merge_uncertain", "manual_reconciliation_required", attemptId));
-                return new PrMergeReport(uncertain, checkedReport.Gate, "uncertain");
+                // Reads and durable preflight writes cannot dispatch the merge.
+                // Once the external call is entered, the outcome stays uncertain.
+                var outcome = externalMergeInvoked
+                    ? "uncertain" : "rejected_before_dispatch";
+                var result = _store.Update(repository, number, w =>
+                    _store.Append(w with { MergeOutcome = outcome, State = "blocked" },
+                        externalMergeInvoked ? "merge_uncertain" : "merge_preflight_failed",
+                        externalMergeInvoked
+                            ? "manual_reconciliation_required" : "no_external_merge_invoked",
+                        attemptId));
+                return new PrMergeReport(result, checkedReport.Gate, outcome);
             }
         }
         finally { _mergeGate.Release(); }

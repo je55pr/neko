@@ -7,7 +7,7 @@ namespace Neko.Headless;
 internal sealed record HostConfiguration(
     string ProviderAssembly, string ProviderFactory, string ProviderSettings,
     string CreationScope, string AccessToken, string StateDirectory, int Port = 8765,
-    PrReviewPolicy? ReviewGate = null)
+    PrReviewPolicy? ReviewGate = null, string? ExternalPrCliExecutable = null)
 {
     public static HostConfiguration Read(string path)
     {

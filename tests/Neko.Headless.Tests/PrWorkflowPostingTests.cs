@@ -1,0 +1,130 @@
+using Neko;
+using Neko.Headless;
+
+namespace Neko.Headless.Tests;
+
+public sealed partial class HeadlessRuntimeTests
+{
+    private async Task<(PrWorkflowService Service, PrSourceFake Source, string ReviewerId)>
+        ReadyToPublishReview(TemporaryDirectory folder, FakeProvider provider,
+            ChatRuntime runtime)
+    {
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
+        var service = new PrWorkflowService(new PrWorkflowStore(folder.Path),
+            source, runtime, GatePolicy());
+        await service.CreateAsync("sample/project", 7, "creator", "developer",
+            "manager", CancellationToken.None);
+        var record = await service.LaunchReviewerAsync("sample/project", 7,
+            "Review actual diff, tests, and surrounding source.",
+            "independent-account", CancellationToken.None);
+        await WaitForTerminal(runtime, record.Reviewer!.ConversationId);
+        return (service, source, record.Reviewer.ConversationId);
+    }
+
+    [Fact]
+    public async Task PostedBlockersAreDurableButMustNeverPermitMerge()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = ManagerRuntime(folder.Path, provider);
+        var (service, source, _) = await ReadyToPublishReview(folder, provider, runtime);
+        provider.AddReviewerResult(
+            "REVIEW_VERDICT: BLOCKERS\nA material correctness issue was found in " +
+            "merge reservations; fix the source, update the head, and re-review.");
+        var reviewed = await service.PublishReviewAsync("sample/project", 7,
+            CancellationToken.None);
+        Assert.True(reviewed.Reviewer!.Completed);
+        Assert.Equal("blockers", reviewed.Reviewer.ReviewerVerdict);
+        Assert.Equal("changes_requested", reviewed.State);
+        Assert.Equal(1, source.PostCalls);
+        var decision = await service.InspectAsync("sample/project", 7, CancellationToken.None);
+        Assert.Contains("independent_reviewer_found_blockers", decision.Gate.Blockers);
+        var merged = await service.MergeAsync("sample/project", 7, CancellationToken.None);
+        Assert.Equal("blocked", merged.Outcome);
+        Assert.Equal(0, source.MergeCalls);
+        Assert.Equal("blockers", new PrWorkflowStore(folder.Path)
+            .Get("sample/project", 7)!.Reviewer!.ReviewerVerdict);
+    }
+
+    [Fact]
+    public async Task UnknownReviewPublicationIsNotReplayedAfterRestart()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = ManagerRuntime(folder.Path, provider);
+        var (service, source, _) = await ReadyToPublishReview(folder, provider, runtime);
+        provider.AddReviewerResult(
+            "REVIEW_VERDICT: NO_BLOCKERS\nThe verified diff and regression " +
+            "tests have no blocking correctness findings on this commit.");
+        source.ThrowAfterReviewDispatch = true;
+        await Assert.ThrowsAsync<IOException>(() =>
+            service.PublishReviewAsync("sample/project", 7, CancellationToken.None));
+        Assert.Equal(1, source.PostCalls);
+        var pending = new PrWorkflowStore(folder.Path).Get("sample/project", 7)!;
+        Assert.Equal("uncertain", pending.Reviewer!.ReviewPostOutcome);
+        Assert.NotNull(pending.Reviewer.ReviewPostAttemptId);
+        Assert.Contains(pending.Audit!, e => e.Action == "review_post_reserved");
+        Assert.Contains(pending.Audit!, e => e.Action == "review_post_uncertain");
+
+        var restarted = new PrWorkflowService(new PrWorkflowStore(folder.Path),
+            source, runtime, GatePolicy());
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            restarted.PublishReviewAsync("sample/project", 7, CancellationToken.None));
+        Assert.Equal(1, source.PostCalls);
+        var result = await restarted.MergeAsync("sample/project", 7, CancellationToken.None);
+        Assert.Equal("blocked", result.Outcome);
+        Assert.Equal(0, source.MergeCalls);
+    }
+
+    [Fact]
+    public async Task ProvenNeverDispatchedMergeCanBeExplicitlyRearmedAfterRestart()
+    {
+        using var folder = new TemporaryDirectory();
+        using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
+        ReadyRecord(new PrWorkflowStore(folder.Path), DateTimeOffset.UtcNow);
+        source.OnRead = count => count == 2
+            ? source.Current with { HeadSha = PrChanged } : source.Current;
+        var first = await new PrWorkflowService(new PrWorkflowStore(folder.Path),
+            source, runtime, GatePolicy()).MergeAsync(
+                "sample/project", 7, CancellationToken.None);
+        Assert.Equal("rejected_before_dispatch", first.Outcome);
+        Assert.Equal(0, source.MergeCalls);
+        source.OnRead = null;
+
+        var restarted = new PrWorkflowService(new PrWorkflowStore(folder.Path),
+            source, runtime, GatePolicy());
+        var stillBlocked = await restarted.MergeAsync(
+            "sample/project", 7, CancellationToken.None);
+        Assert.Equal("blocked", stillBlocked.Outcome);
+        Assert.Equal(0, source.MergeCalls);
+        var rearmed = await restarted.RefreshRevisionAsync(
+            "sample/project", 7, CancellationToken.None);
+        Assert.Null(rearmed.MergeAttemptId);
+        Assert.Contains(rearmed.Audit!, e => e.Action == "revision_rearmed");
+        Assert.True((await restarted.InspectAsync(
+            "sample/project", 7, CancellationToken.None)).Gate.Ready);
+        var merged = await restarted.MergeAsync(
+            "sample/project", 7, CancellationToken.None);
+        Assert.Equal("merged", merged.Outcome);
+        Assert.Equal(1, source.MergeCalls);
+    }
+
+    [Fact]
+    public async Task ReviewPostMustUseCurrentRevisionAndCannotBeReplayed()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = ManagerRuntime(folder.Path, provider);
+        var (service, source, _) = await ReadyToPublishReview(folder, provider, runtime);
+        provider.AddReviewerResult(
+            "REVIEW_VERDICT: NO_BLOCKERS\nThe implementation passed a " +
+            "complete source and test review with no blocking findings.");
+        source.Current = source.Current with { HeadSha = PrChanged };
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.PublishReviewAsync("sample/project", 7, CancellationToken.None));
+        Assert.Equal(0, source.PostCalls);
+        Assert.Null(new PrWorkflowStore(folder.Path)
+            .Get("sample/project", 7)!.Reviewer!.ReviewPostAttemptId);
+    }
+}

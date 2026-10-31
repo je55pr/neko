@@ -1,20 +1,25 @@
 namespace Neko;
 
 /// <summary>Provider-neutral facts. Source-side reviews and checks must be re-read before merge.</summary>
-public sealed record PrCheck(string Name, string HeadSha, string Status, string? Conclusion);
+public sealed record PrCheck(string Name, string HeadSha, string Status, string? Conclusion,
+    string? ProducerId = null);
 public sealed record PrReview(string Url, string Author, string HeadSha, string Verdict,
-    bool Substantive, DateTimeOffset SubmittedAt);
+    bool Substantive, DateTimeOffset SubmittedAt, string? BodySha256 = null);
 public sealed record PrSourceStatus(string Repository, int Number, string HeadSha,
     string BaseSha, string State, string Author, bool Merged, bool Mergeable,
     IReadOnlyList<PrCheck> Checks, IReadOnlyList<PrReview> Reviews,
     int UnresolvedThreads);
 public sealed record PrReviewPolicy(
     IReadOnlyList<string> RequiredChecks, string AutomatedCheck, string AutomatedReviewer,
-    bool RequireNoUnresolvedThreads = true);
+    bool RequireNoUnresolvedThreads = true,
+    IReadOnlyDictionary<string, string>? TrustedCheckProducers = null,
+    string? AutomatedCheckProducer = null);
 public sealed record PrWorkerEvidence(string ConversationId, string CreatedForHead,
     DateTimeOffset CreatedAt, bool Completed, DateTimeOffset? CompletedAt,
     string? ReviewUrl, string? Verdict, string? ReviewerAccount,
-    string? CompletionMessageId = null);
+    string? CompletionMessageId = null,
+    string? ReviewPostAttemptId = null, string? ReviewPostOutcome = null,
+    string? PostedBodySha256 = null, string? ReviewerVerdict = null);
 public sealed record PrAuditEvent(DateTimeOffset At, string Action, string Detail,
     string? AttemptId = null);
 public sealed record PrWorkflow(string Repository, int Number, string HeadSha, string BaseSha,
@@ -58,21 +63,30 @@ public static class PrReviewGate
             if (worker.ConversationId == workflow.CreatorConversationId ||
                 worker.ConversationId == workflow.DeveloperConversationId ||
                 worker.ConversationId == workflow.ManagerConversationId ||
-                worker.ReviewerAccount == source.Author)
+                StringComparer.OrdinalIgnoreCase.Equals(worker.ReviewerAccount,
+                    policy.AutomatedReviewer))
                 blockers.Add("reviewer_not_independent");
             if (worker.CreatedForHead != workflow.HeadSha ||
                 worker.CreatedAt < workflow.CreatedAt)
                 blockers.Add("reviewer_not_created_for_head");
             if (!worker.Completed || worker.CompletedAt is null ||
-                worker.CompletedAt < worker.CreatedAt)
+                worker.CompletedAt < worker.CreatedAt || worker.CompletionMessageId is null)
                 blockers.Add("review_worker_not_completed");
+            if (worker.ReviewerVerdict != "no_blockers")
+                blockers.Add("independent_reviewer_found_blockers");
+            if (worker.ReviewPostOutcome != "posted" ||
+                string.IsNullOrWhiteSpace(worker.ReviewPostAttemptId) ||
+                string.IsNullOrWhiteSpace(worker.PostedBodySha256))
+                blockers.Add("review_post_receipt_missing");
             if (string.IsNullOrWhiteSpace(worker.ReviewUrl) ||
                 string.IsNullOrWhiteSpace(worker.ReviewerAccount) ||
                 worker.Verdict is not ("approved" or "commented"))
                 blockers.Add("review_post_evidence_missing");
             else if (!source.Reviews.Any(r => r.Url == worker.ReviewUrl &&
-                r.Author == worker.ReviewerAccount && r.HeadSha == workflow.HeadSha &&
+                StringComparer.OrdinalIgnoreCase.Equals(r.Author, worker.ReviewerAccount) &&
+                r.HeadSha == workflow.HeadSha &&
                 r.Substantive && r.SubmittedAt >= worker.CreatedAt &&
+                r.BodySha256 == worker.PostedBodySha256 &&
                 r.Verdict == worker.Verdict))
                 blockers.Add("independent_review_not_verified_at_source");
         }
@@ -82,12 +96,18 @@ public static class PrReviewGate
             blockers.Add("automated_review_policy_missing");
         else
         {
+            if (string.IsNullOrWhiteSpace(policy.AutomatedCheckProducer))
+                blockers.Add("automated_review_producer_missing");
             if (!source.Checks.Any(c => c.Name == policy.AutomatedCheck &&
                 c.HeadSha == workflow.HeadSha && c.Status == "completed" &&
-                c.Conclusion == "success"))
+                c.Conclusion == "success" &&
+                c.ProducerId == policy.AutomatedCheckProducer &&
+                !string.IsNullOrWhiteSpace(c.ProducerId)))
                 blockers.Add("automated_review_run_not_successful");
-            if (!source.Reviews.Any(r => r.Author == policy.AutomatedReviewer &&
+            if (!source.Reviews.Any(r =>
+                StringComparer.OrdinalIgnoreCase.Equals(r.Author, policy.AutomatedReviewer) &&
                 r.HeadSha == workflow.HeadSha && r.Substantive &&
+                r.Url != worker?.ReviewUrl &&
                 r.Verdict is "approved" or "commented"))
                 blockers.Add("substantive_automated_review_missing");
         }
@@ -95,13 +115,25 @@ public static class PrReviewGate
             blockers.Add("required_checks_policy_missing");
         else
             foreach (var name in policy.RequiredChecks.Distinct(StringComparer.Ordinal))
-                if (!source.Checks.Any(c => c.Name == name && c.HeadSha == workflow.HeadSha &&
+            {
+                if (policy.TrustedCheckProducers is null ||
+                    !policy.TrustedCheckProducers.TryGetValue(name, out var producer) ||
+                    string.IsNullOrWhiteSpace(producer))
+                    blockers.Add("required_check_producer_missing:" + name);
+                else if (!source.Checks.Any(c => c.Name == name &&
+                    c.HeadSha == workflow.HeadSha && c.ProducerId == producer &&
                     c.Status == "completed" && c.Conclusion == "success"))
                     blockers.Add("required_check_not_successful:" + name);
+            }
         if (policy.RequireNoUnresolvedThreads && source.UnresolvedThreads != 0)
             blockers.Add("unresolved_review_threads:" + source.UnresolvedThreads);
-        if (source.Reviews.Any(r => r.HeadSha == workflow.HeadSha &&
-            r.Verdict == "changes_requested"))
+        // An earlier head's active change request remains binding until that
+        // reviewer issues a newer decisive approval or the review is dismissed.
+        // A mere COMMENTED review does not supersede a change request.
+        if (source.Reviews
+            .Where(r => r.Verdict is "approved" or "changes_requested")
+            .GroupBy(r => r.Author, StringComparer.OrdinalIgnoreCase)
+            .Any(g => g.MaxBy(r => r.SubmittedAt)!.Verdict == "changes_requested"))
             blockers.Add("changes_requested");
         var state = blockers.Count == 0 ? "merge_ready" :
             blockers.Contains("head_sha_changed") || blockers.Contains("base_sha_changed")

@@ -6,7 +6,6 @@ internal sealed record PrWorkflowCreateRequest(string? Repository, int Number,
     string? CreatorConversationId, string? DeveloperConversationId,
     string? ManagerConversationId);
 internal sealed record PrReviewerRequest(string? Task, string? ReviewerAccount);
-internal sealed record PrReviewProofRequest(string? ReviewUrl, string? Verdict);
 
 internal static class PrWorkflowEndpoints
 {
@@ -54,14 +53,13 @@ internal static class PrWorkflowEndpoints
         catch (Exception) { return Results.Conflict(new { reason = "review_launch_blocked" }); }
     }
 
-    public static async Task<IResult> ConfirmAsync(PrWorkflowService service,
-        string repository, int number, PrReviewProofRequest body, CancellationToken cancellation)
+    public static async Task<IResult> PublishAsync(PrWorkflowService service,
+        string repository, int number, CancellationToken cancellation)
     {
         if (service.Get(repository, number) is null) return Results.NotFound();
-        try { return Results.Json(await service.ConfirmReviewAsync(repository, number,
-            body.ReviewUrl ?? "", body.Verdict ?? "", cancellation)); }
-        catch (ArgumentException) { return Results.BadRequest(new { reason = "invalid_review_evidence" }); }
-        catch (Exception) { return Results.Conflict(new { reason = "review_not_verified" }); }
+        try { return Results.Json(await service.PublishReviewAsync(
+            repository, number, cancellation)); }
+        catch (Exception) { return Results.Conflict(new { reason = "review_post_unverified_or_blocked" }); }
     }
 
     public static async Task<IResult> MergeAsync(PrWorkflowService service,

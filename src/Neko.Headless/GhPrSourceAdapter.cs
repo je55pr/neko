@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Neko;
 
@@ -7,20 +9,45 @@ namespace Neko.Headless;
 /// <summary>Repository-specific infrastructure. Domain policy knows no hosting vendor.</summary>
 internal sealed class GhPrSourceAdapter : IPrSourceAdapter
 {
-    private static async Task<JsonDocument> ApiAsync(
+    private readonly string? _trustedExecutable;
+
+    // This is an opt-in adapter: missing configuration disables external PR
+    // operations without preventing legacy headless hosting.
+    public GhPrSourceAdapter(string? trustedExecutable)
+    {
+        if (string.IsNullOrWhiteSpace(trustedExecutable)) return;
+        if (!Path.IsPathFullyQualified(trustedExecutable) ||
+            !File.Exists(trustedExecutable) ||
+            !StringComparer.OrdinalIgnoreCase.Equals(
+                Path.GetFileName(trustedExecutable), OperatingSystem.IsWindows() ? "gh.exe" : "gh"))
+            throw new ArgumentException("A trusted absolute PR CLI executable is required.");
+        _trustedExecutable = Path.GetFullPath(trustedExecutable);
+    }
+
+    private async Task<JsonDocument> ApiAsync(
         CancellationToken cancellation, params string[] args)
     {
-        var start = new ProcessStartInfo("gh") {
+        if (_trustedExecutable is null)
+            throw new InvalidOperationException("External PR adapter is not configured.");
+        var start = new ProcessStartInfo(_trustedExecutable) {
             UseShellExecute = false, RedirectStandardOutput = true,
             RedirectStandardError = true, CreateNoWindow = true
         };
         start.ArgumentList.Add("api");
         foreach (var arg in args) start.ArgumentList.Add(arg);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        timeout.CancelAfter(TimeSpan.FromSeconds(90));
         using var process = Process.Start(start)
             ?? throw new InvalidOperationException("External PR adapter unavailable.");
-        var output = process.StandardOutput.ReadToEndAsync(cancellation);
-        var errors = process.StandardError.ReadToEndAsync(cancellation);
-        await process.WaitForExitAsync(cancellation);
+        using var killOnCancel = timeout.Token.Register(() =>
+        {
+            try { if (!process.HasExited) process.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { }
+            catch (System.ComponentModel.Win32Exception) { }
+        });
+        var output = process.StandardOutput.ReadToEndAsync(timeout.Token);
+        var errors = process.StandardError.ReadToEndAsync(timeout.Token);
+        await process.WaitForExitAsync(timeout.Token);
         var json = await output;
         await errors; // Never expose CLI diagnostics or credential-bearing paths.
         if (process.ExitCode != 0)
@@ -37,6 +64,29 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     private static string? GetString(JsonElement root, string key) =>
         root.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString() : null;
+
+    internal static string BodyDigest(string body) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
+
+    private static string? ProducerId(JsonElement source, string entity, string prefix)
+    {
+        if (!source.TryGetProperty(entity, out var publisher) ||
+            publisher.ValueKind != JsonValueKind.Object ||
+            !publisher.TryGetProperty("id", out var id) ||
+            id.ValueKind != JsonValueKind.Number || !id.TryGetInt64(out var value))
+            return null;
+        return prefix + ":" + value;
+    }
+
+    internal static HashSet<long> AssociatedReviewIds(JsonElement comments) =>
+        comments.EnumerateArray()
+            .Where(c => !string.IsNullOrWhiteSpace(GetString(c, "body")))
+            .Select(c => c.TryGetProperty("pull_request_review_id", out var linked) &&
+                linked.ValueKind == JsonValueKind.Number &&
+                linked.TryGetInt64(out var value) ? (long?)value : null)
+            .Where(value => value.HasValue)
+            .Select(value => value!.Value)
+            .ToHashSet();
 
     public async Task<PrSourceStatus> ReadAsync(
         string repository, int number, CancellationToken cancellation)
@@ -69,7 +119,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         {
             var name = Member(run, "name").GetString() ?? "";
             gathered.TryAdd(name, new PrCheck(name, head,
-                GetString(run, "status") ?? "", GetString(run, "conclusion")));
+                GetString(run, "status") ?? "", GetString(run, "conclusion"),
+                ProducerId(run, "app", "app")));
         }
         using var statuses = await ApiAsync(cancellation,
             "repos/" + repository + "/commits/" + head + "/status");
@@ -80,7 +131,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         {
             var name = GetString(item, "context") ?? "";
             gathered.TryAdd(name, new PrCheck(name, head, "completed",
-                GetString(item, "state") == "success" ? "success" : "failure"));
+                GetString(item, "state") == "success" ? "success" : "failure",
+                ProducerId(item, "creator", "user")));
         }
 
         using var reviews = await ApiAsync(cancellation, route + "/reviews?per_page=100");
@@ -88,10 +140,9 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         if (reviews.RootElement.GetArrayLength() >= 100 ||
             comments.RootElement.GetArrayLength() >= 100)
             throw new InvalidOperationException("Review list exceeds verified page.");
-        var reviewComments = comments.RootElement.EnumerateArray()
-            .Where(c => !string.IsNullOrWhiteSpace(GetString(c, "body")))
-            .Select(c => c.GetProperty("pull_request_review_id").GetInt64())
-            .ToHashSet();
+        // Standalone PR comments can legitimately have a null review ID.
+        // They do not count as evidence for a particular submitted review.
+        var reviewComments = AssociatedReviewIds(comments.RootElement);
         var sourceReviews = new List<PrReview>();
         foreach (var r in reviews.RootElement.EnumerateArray())
         {
@@ -103,12 +154,13 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
                 "changes_requested" => "changes_requested",
                 _ => "unrecognized"
             };
+            var body = GetString(r, "body") ?? "";
             sourceReviews.Add(new PrReview(GetString(r, "html_url") ?? "",
                 Member(r, "user", "login").GetString() ?? "",
                 GetString(r, "commit_id") ?? "", verdict,
-                !string.IsNullOrWhiteSpace(GetString(r, "body")) ||
+                !string.IsNullOrWhiteSpace(body) ||
                     reviewComments.Contains(r.GetProperty("id").GetInt64()),
-                submitted));
+                submitted, BodyDigest(body)));
         }
 
         var parts = repository.Split('/');
@@ -124,6 +176,29 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             .Count(n => !Member(n, "isResolved").GetBoolean());
         return new PrSourceStatus(repository, number, head, baseSha, state, author,
             merged, mergeable, gathered.Values.ToArray(), sourceReviews, unresolved);
+    }
+
+    public async Task<PrReview> PostReviewAsync(string repository, int number,
+        string expectedHead, string body, CancellationToken cancellation)
+    {
+        if (!PrWorkflowStore.ValidRepository(repository) || number < 1 ||
+            !PrReviewGate.ValidSha(expectedHead) ||
+            string.IsNullOrWhiteSpace(body) || body.Length > 12000)
+            throw new ArgumentException("Invalid external review post request.");
+        using var result = await ApiAsync(cancellation, "-X", "POST",
+            "repos/" + repository + "/pulls/" + number + "/reviews",
+            "-f", "commit_id=" + expectedHead, "-f", "event=COMMENT",
+            "-f", "body=" + body);
+        var root = result.RootElement;
+        if (GetString(root, "commit_id") != expectedHead ||
+            GetString(root, "body") != body ||
+            !DateTimeOffset.TryParse(GetString(root, "submitted_at"), out var submitted) ||
+            !Uri.TryCreate(GetString(root, "html_url"), UriKind.Absolute, out var url) ||
+            url.Scheme != "https")
+            throw new InvalidOperationException("Published review receipt is incomplete.");
+        return new PrReview(url.ToString(), Member(root, "user", "login").GetString() ?? "",
+            expectedHead, (GetString(root, "state") ?? "").ToLowerInvariant(),
+            true, submitted, BodyDigest(body));
     }
 
     public async Task<string> MergeAsync(string repository, int number,

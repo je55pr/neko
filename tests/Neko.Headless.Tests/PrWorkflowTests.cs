@@ -18,17 +18,20 @@ public sealed partial class HeadlessRuntimeTests
     private const string PrMerged = "dddddddddddddddddddddddddddddddddddddddd";
     private const string PrReviewUrl = "https://example.org/reviews/7";
 
-    private static PrReviewPolicy GatePolicy() => new(["build"], "review-job", "auto-account");
+    private static PrReviewPolicy GatePolicy() => new(
+        ["build"], "review-job", "auto-account",
+        TrustedCheckProducers: new Dictionary<string, string> { ["build"] = "app:100" },
+        AutomatedCheckProducer: "app:200");
 
     private static PrSourceStatus GoodSource(DateTimeOffset now) =>
         new("sample/project", 7, PrHead, PrBase, "open", "creator-account", false, true,
         [
-            new("build", PrHead, "completed", "success"),
-            new("review-job", PrHead, "completed", "success")
+            new("build", PrHead, "completed", "success", "app:100"),
+            new("review-job", PrHead, "completed", "success", "app:200")
         ],
         [
             new(PrReviewUrl, "independent-account", PrHead, "approved",
-                true, now.AddMinutes(1)),
+                true, now.AddMinutes(1), "test-review-body"),
             new("https://example.org/reviews/8", "auto-account", PrHead, "commented",
                 true, now.AddMinutes(1))
         ], 0);
@@ -39,7 +42,25 @@ public sealed partial class HeadlessRuntimeTests
         public Func<int, PrSourceStatus>? OnRead;
         public int Reads;
         public int MergeCalls;
+        public int PostCalls;
         public bool ThrowAfterMergeDispatch;
+        public bool ThrowAfterReviewDispatch;
+
+        public Task<PrReview> PostReviewAsync(string repository, int number,
+            string expectedHead, string body, CancellationToken cancellation)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            PostCalls++;
+            if (expectedHead != Current.HeadSha)
+                throw new InvalidOperationException("PR moved during review posting.");
+            if (ThrowAfterReviewDispatch)
+                throw new IOException("Review dispatch accepted but reply lost.");
+            var posted = new PrReview(PrReviewUrl, "independent-account",
+                expectedHead, "commented", true, DateTimeOffset.UtcNow,
+                GhPrSourceAdapter.BodyDigest(body));
+            Current = Current with { Reviews = [.. Current.Reviews, posted] };
+            return Task.FromResult(posted);
+        }
 
         public Task<PrSourceStatus> ReadAsync(string repository, int number,
             CancellationToken cancellation)
@@ -70,7 +91,10 @@ public sealed partial class HeadlessRuntimeTests
             ReviewLaunchAt = created.CreatedAt.AddMilliseconds(10),
             Reviewer = new PrWorkerEvidence("fresh-review-chat", PrHead,
                 created.CreatedAt.AddMilliseconds(10), true,
-                created.CreatedAt.AddMilliseconds(20), PrReviewUrl, "approved", "independent-account")
+                created.CreatedAt.AddMilliseconds(20), PrReviewUrl, "approved",
+                "independent-account", CompletionMessageId: "worker-reply",
+                ReviewPostAttemptId: "review-attempt", ReviewPostOutcome: "posted",
+                PostedBodySha256: "test-review-body", ReviewerVerdict: "no_blockers")
         }, "review_verified", "test_source_proof"));
     }
 
@@ -91,7 +115,7 @@ public sealed partial class HeadlessRuntimeTests
         var persisted = new PrWorkflowStore(folder.Path).Get("sample/project", 7)!;
         Assert.Equal(PrMerged, persisted.MergedSha);
         Assert.Equal("merged", persisted.MergeOutcome);
-        Assert.Equal("manager-chat", persisted.MergeAuthorizedBy);
+        Assert.Equal("authenticated_host_operator", persisted.MergeAuthorizedBy);
         Assert.NotNull(persisted.LastSourceEvidence);
         Assert.Equal(PrHead, persisted.LastSourceEvidence.HeadSha);
         Assert.True(persisted.LastGateDecision!.Ready);
@@ -117,9 +141,9 @@ public sealed partial class HeadlessRuntimeTests
             ? source.Current with { HeadSha = PrChanged } : source.Current;
         var result = await new PrWorkflowService(store, source, runtime, GatePolicy())
             .MergeAsync("sample/project", 7, CancellationToken.None);
-        Assert.Equal("rejected", result.Outcome);
+        Assert.Equal("rejected_before_dispatch", result.Outcome);
         Assert.Equal(0, source.MergeCalls);
-        Assert.Equal("rejected", new PrWorkflowStore(folder.Path)
+        Assert.Equal("rejected_before_dispatch", new PrWorkflowStore(folder.Path)
             .Get("sample/project", 7)!.MergeOutcome);
     }
 
@@ -214,25 +238,28 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Equal("accepted", created.ReviewLaunchState);
         Assert.Equal("generating", runtime.Get(created.Reviewer!.ConversationId)!.Status);
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            service.ConfirmReviewAsync("sample/project", 7, PrReviewUrl,
-                "approved", CancellationToken.None));
+            service.PublishReviewAsync("sample/project", 7, CancellationToken.None));
         provider.CompletePending();
         await WaitForTerminal(runtime, created.Reviewer.ConversationId);
-        // Source may contain review but its timestamp cannot precede creation.
-        source.Current = GoodSource(DateTimeOffset.UtcNow) with {
-            Reviews = [new(PrReviewUrl, "independent-account", PrHead,
-                "approved", true, DateTimeOffset.UtcNow.AddSeconds(1)),
-                GoodSource(DateTimeOffset.UtcNow).Reviews[1]]
-        };
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            service.ConfirmReviewAsync("sample/project", 7,
-                PrReviewUrl, "approved", CancellationToken.None));
+
+        // An echoed URL cannot become source-side review provenance.
         provider.AddReviewerResult("Review posted: " + PrReviewUrl);
-        var finished = await service.ConfirmReviewAsync("sample/project", 7,
-            PrReviewUrl, "approved", CancellationToken.None);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.PublishReviewAsync("sample/project", 7, CancellationToken.None));
+        Assert.Equal(0, source.PostCalls);
+
+        provider.AddReviewerResult("REVIEW_VERDICT: NO_BLOCKERS\n\n" +
+            "Independent source, tests, and failure-boundary review found no blockers.");
+        var finished = await service.PublishReviewAsync(
+            "sample/project", 7, CancellationToken.None);
         Assert.True(finished.Reviewer!.Completed);
         Assert.False(string.IsNullOrWhiteSpace(finished.Reviewer.CompletionMessageId));
-        Assert.Contains(finished.Audit!, e => e.Action == "review_verified");
+        Assert.Equal("posted", finished.Reviewer.ReviewPostOutcome);
+        Assert.Equal("no_blockers", finished.Reviewer.ReviewerVerdict);
+        Assert.Equal(1, source.PostCalls);
+        Assert.Contains(finished.Audit!, e => e.Action == "review_post_verified");
+        Assert.True((await service.InspectAsync("sample/project", 7, CancellationToken.None))
+            .Gate.Ready);
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             service.LaunchReviewerAsync("sample/project", 7,
                 "repeat", "independent-account", CancellationToken.None));

@@ -24,9 +24,9 @@ var configPath = configIndex >= 0 && configIndex + 1 < args.Length
 
 if (command == "help")
 {
-    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry|pr-register|pr-status|pr-refresh|pr-reviewer|pr-review-proof|pr-merge [args] [--config path]");
+    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry|pr-register|pr-status|pr-refresh|pr-reviewer|pr-publish-review|pr-merge [args] [--config path] [--wait]");
     Console.WriteLine("pr-register <repo> <number> <creator> <developer> <manager>; pr-status|pr-merge <repo> <number>");
-    Console.WriteLine("pr-reviewer <repo> <number> <reviewer-account> <task>; pr-review-proof <repo> <number> <review-url> <verdict>");
+    Console.WriteLine("pr-reviewer <repo> <number> <reviewer-account> <task>; pr-publish-review <repo> <number>");
     Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch|reconcile <id>; reconcile-creation; reconcile-manager <manager/name>");
     Console.WriteLine("manager-queue <manager/name> <text> [--key key]; manager-messages <manager/name>; manager-message|manager-cancel|manager-retry <manager/name> <message-id>");
     Console.WriteLine("Stop requires provider support; otherwise it returns Unsupported/stop_not_supported without cancelling.");
@@ -51,7 +51,7 @@ try
         new ManagerInboxJournal(config.StateDirectory), managers, runtime);
     inbox.Start();
     var prWorkflows = new PrWorkflowService(new PrWorkflowStore(config.StateDirectory),
-        new GhPrSourceAdapter(), runtime,
+        new GhPrSourceAdapter(config.ExternalPrCliExecutable), runtime,
         config.ReviewGate ?? new PrReviewPolicy([], "", ""));
 
     var builder = WebApplication.CreateSlimBuilder();
@@ -87,9 +87,9 @@ try
     app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/reviewer",
         (string owner, string repo, int number, PrReviewerRequest body, CancellationToken ct) =>
             PrWorkflowEndpoints.LaunchAsync(prWorkflows, owner + "/" + repo, number, body, ct));
-    app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/review-proof",
-        (string owner, string repo, int number, PrReviewProofRequest body, CancellationToken ct) =>
-            PrWorkflowEndpoints.ConfirmAsync(prWorkflows, owner + "/" + repo, number, body, ct));
+    app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/publish-review",
+        (string owner, string repo, int number, CancellationToken ct) =>
+            PrWorkflowEndpoints.PublishAsync(prWorkflows, owner + "/" + repo, number, ct));
     app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/merge",
         (string owner, string repo, int number, CancellationToken ct) =>
             PrWorkflowEndpoints.MergeAsync(prWorkflows, owner + "/" + repo, number, ct));

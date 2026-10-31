@@ -12,10 +12,16 @@ Set optional `reviewGate` in the local ignored host configuration. There is
 
 ```json
 {
+  "externalPrCliExecutable": "C:\\Program Files\\GitHub CLI\\gh.exe",
   "reviewGate": {
     "requiredChecks": ["build-and-test", "static-analysis"],
     "automatedCheck": "configured-review-check",
     "automatedReviewer": "configured-review-account",
+    "automatedCheckProducer": "app:12345",
+    "trustedCheckProducers": {
+      "build-and-test": "app:23456",
+      "static-analysis": "app:34567"
+    },
     "requireNoUnresolvedThreads": true
   }
 }
@@ -38,34 +44,49 @@ pr-register <owner/repo> <number> <creator-conversation> <developer-conversation
 pr-status <owner/repo> <number>
 pr-refresh <owner/repo> <number>  # explicit new head/base review cycle
 pr-reviewer <owner/repo> <number> <reviewer-account> <review-task>
-pr-review-proof <owner/repo> <number> <posted-review-url> approved|commented
+pr-publish-review <owner/repo> <number>
 pr-merge <owner/repo> <number>
 ```
 
 The matching API is `POST /pr-workflows`, `GET
 /pr-workflows/{owner}/{repo}/{number}`, and `POST` to the `/reviewer`,
-`/review-proof`, or `/merge` suffixes. The host's existing bearer
-authentication protects all routes. The review worker is created by the host
-specifically for the recorded head after a durable launch reservation. The
-accepted creation is **not** completion. The review-proof operation verifies a
-locally completed, readable assistant turn and an actual source-side posted
-review with matching account, URL, verdict, and head.
+`/publish-review`, or `/merge` suffixes. The host's existing bearer
+authentication protects all routes. The host creates a fresh reviewer worker
+for the recorded head after a durable launch reservation; acceptance is **not**
+completion. The reviewer must provide a substantive terminal response with
+`REVIEW_VERDICT: NO_BLOCKERS` or `REVIEW_VERDICT: BLOCKERS` on its first line.
+After observing authoritative completion, the host durably reserves a one-use
+review post and submits the **actual worker response**. The source review
+receipt must match the response's SHA-256 digest, the current head, the
+configured publishing account and the subsequently verified source-side review.
+An echoed review URL or an uncertain publication cannot pass. This publisher
+may use the same repository account as the developer; independence comes from
+the distinct provider conversation and its correlated output, not the Git
+account signing the host transport.
 
-The external adapter uses an authenticated local `gh` executable for
+The external adapter requires an explicitly configured, fully qualified
+`gh` executable path, and does not use a shell or search PATH. It reads
 authoritative PR state, check runs, posted reviews, and unresolved threads.
-Only a narrowly scoped infrastructure adapter contains repository-service
-calls; policy evaluation and journal records are service-neutral. The adapter
-fails closed on incomplete paginated results; currently it deliberately
-rejects >100 checks, reviews, comments, or review threads until exhaustive
+Check policies must include trusted producer IDs such as `app:<numeric-id>`
+or `user:<numeric-id>`, not only the reported check names; those numeric
+identities must be set from verified source metadata. Policy evaluation and
+journal records are service-neutral. Pagination remains deliberately
+fail-closed: 100 or more statuses, review comments, or reviews are rejected;
+more than 100 check runs or review threads are rejected until exhaustive
 pagination is implemented.
 
 For merge, the server re-fetches authoritative state, evaluates all blockers,
 durably reserves a one-use attempt, re-fetches state, then submits a merge
-with the **expected head SHA as a server-side precondition**. An ambiguous
-merge response is journalled `uncertain`, never automatically retried. A
-storage failure before reservation prevents any merge write. Failure to
-persist success after a remote merge leaves the original attempt reservation
-on disk, so subsequent requests cannot repeat the merge.
+with the **expected head SHA as a server-side precondition**. The source
+merge endpoint does not atomically compare the base SHA, CI or review status:
+repository branch protection/rulesets must independently enforce those
+requirements, and the adapter only narrows the remaining time-of-check/use
+window. An ambiguous merge response is journalled `uncertain`, never
+automatically retried. A provable pre-dispatch rejection is recorded separately
+and may be explicitly rearmed using `pr-refresh` after authoritative source
+inspection. A storage failure before reservation prevents any merge write.
+Failure to persist success after a remote merge leaves the original attempt
+reservation on disk, so subsequent requests cannot repeat the merge.
 
 Changing the head or base closes this workflow's review proof. The explicit
 `pr-refresh` command rebinds the head/base only after fetching their current
@@ -75,11 +96,13 @@ merge attempt is unresolved. This stage does not offer a hidden override or
 a human waiver endpoint.
 
 The durable `stateDirectory/pr-workflows/` journal is local and excluded from
-version control. Each entry includes reviewer binding, terminal proof, source
-review URL/verdict, attempted merge and audit events. Live check snapshots are
-read from the external source for each inspection, not trusted from manager
-claims. The evidence report enumerates blockers. Keep this directory protected
-and backed up with the other local state journals.
+version control. Each entry includes reviewer binding, terminal proof,
+one-use review-post and merge-attempt markers, content digests, source review
+URL/verdict and audit events. A review-post attempt with an uncertain external
+outcome cannot be automatically retried. Live check snapshots are read from
+the external source for each inspection, not trusted from manager claims.
+The evidence report enumerates blockers. Keep this directory protected and
+backed up with the other local state journals.
 
 ## Current limitations
 
