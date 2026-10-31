@@ -233,17 +233,17 @@ public sealed class GhPrSourceAdapterTests
 
         const string sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         using var olderBotComment = JsonDocument.Parse("""
-            [{"user":{"login":"review-bot"},"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+            [{"user":{"login":"review-bot"},"commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
             """);
         Assert.True(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
             olderBotComment.RootElement, sha, "review-bot"));
         using var currentBotComment = JsonDocument.Parse("""
-            [{"user":{"login":"review-bot"},"commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]
+            [{"user":{"login":"review-bot"},"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]
             """);
         Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
             currentBotComment.RootElement, sha, "review-bot"));
         using var unknownAuthor = JsonDocument.Parse("""
-            [{"user":null,"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+            [{"user":null,"original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
             """);
         Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
             unknownAuthor.RootElement, sha, "review-bot"));

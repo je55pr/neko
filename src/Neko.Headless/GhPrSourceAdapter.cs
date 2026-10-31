@@ -203,7 +203,10 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
                 !comment.TryGetProperty("user", out var user) ||
                 user.ValueKind != JsonValueKind.Object) return false;
             var author = GetString(user, "login");
-            var revision = GetString(comment, "commit_id");
+            // GitHub can re-anchor an old review comment onto a newer
+            // commit_id. Only original_commit_id identifies the revision on
+            // which this automated finding was actually reported.
+            var revision = GetString(comment, "original_commit_id");
             if (string.IsNullOrWhiteSpace(author) ||
                 string.IsNullOrWhiteSpace(revision)) return false;
             if (StringComparer.OrdinalIgnoreCase.Equals(author, configuredReviewer) &&

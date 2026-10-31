@@ -66,8 +66,11 @@ operator may explicitly set `allowVerifiedEmptyAutomatedReview: true` instead
 of a no-findings marker. This narrower alternative accepts a truly empty review
 body only when the trusted automated review check completes successfully, the
 single run and submitted review can be bound to the exact current head, and
-the complete source inline-comment page verifies **no comments from that bot
-on that head**. Unknown comment authors or revisions fail closed. An empty
+the complete source inline-comment page verifies **no comments originally
+reported by that bot on that head**. GitHub may re-anchor older comments to a
+newer `commit_id`; their `original_commit_id` is used for provenance. All
+unresolved review threads block this mode even when the ordinary thread gate
+is disabled. Unknown comment authors or original revisions fail closed. An empty
 body without a trusted successful run or a submitted review never counts.
 Only enable this for a reviewer whose documented clean-review behaviour is a
 blank review; the source must not report actionable findings solely through

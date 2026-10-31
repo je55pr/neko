@@ -88,6 +88,12 @@ public sealed class PrReviewGateTests
         };
         Assert.Contains("automated_review_run_not_successful",
             Evaluate(source: untrusted, policy: policy).Blockers);
+        // Older review findings cannot be ignored merely because the current
+        // bot submitted an empty review on a newer head.
+        var unresolved = Source() with { UnresolvedThreads = 1 };
+        Assert.Contains("unresolved_review_threads:1", Evaluate(
+            source: unresolved,
+            policy: policy with { RequireNoUnresolvedThreads = false }).Blockers);
     }
 
     [Theory]

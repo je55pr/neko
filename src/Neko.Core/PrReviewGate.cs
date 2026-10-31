@@ -237,7 +237,10 @@ public static class PrReviewGate
                         blockers.Add("required_check_not_successful:" + name);
                 }
             }
-        if (policy.RequireNoUnresolvedThreads && source.UnresolvedThreads != 0)
+        // Empty automated-review evidence must never clear unresolved older
+        // findings, even when an operator disables the ordinary thread gate.
+        if ((policy.RequireNoUnresolvedThreads ||
+             policy.AllowVerifiedEmptyAutomatedReview) && source.UnresolvedThreads != 0)
             blockers.Add("unresolved_review_threads:" + source.UnresolvedThreads);
         // An earlier head's active change request remains binding until that
         // reviewer issues a newer decisive approval or the review is dismissed.
