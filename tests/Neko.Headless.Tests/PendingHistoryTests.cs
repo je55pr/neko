@@ -9,6 +9,14 @@ namespace Neko.Headless.Tests;
 
 public sealed partial class HeadlessRuntimeTests
 {
+    // Controls for the pending-history scenarios live alongside the tests that assign them.
+    private sealed partial class FakeProvider
+    {
+        public bool ReturnNullHistory { get; set; }
+        public bool ThrowOnRead { get; set; }
+        public TaskCompletionSource<VisibleConversation?>? PendingRead { get; set; }
+    }
+
     [Fact]
     public async Task GeneratingConversationWithUnavailableHistoryReturns202ThenAuthoritative200()
     {
