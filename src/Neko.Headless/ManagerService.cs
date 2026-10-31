@@ -122,7 +122,8 @@ internal sealed class ManagerService
     }
 
     public async Task<ManagerSendResult?> SendAsync(
-        string id, string text, CancellationToken cancellation)
+        string id, string text, CancellationToken cancellation,
+        string? operationId = null)
     {
         // Unknown names must not allocate permanent per-manager gates.
         if (_registry.Get(id) is null) return null;
@@ -141,7 +142,7 @@ internal sealed class ManagerService
 
             // Persist the guard before the remote operation, including before
             // potentially slow history preflight. A crash requires review.
-            var operationId = Guid.NewGuid().ToString("N");
+            operationId ??= Guid.NewGuid().ToString("N");
             _registry.Update(id, record => record with {
                 LifecycleState = "sending", PendingOperationId = operationId
             });
