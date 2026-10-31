@@ -20,6 +20,7 @@ Set optional `reviewGate` in the local ignored host configuration. There is
     "automatedCheckProducer": "app:12345",
     "automatedCheckWorkflow": "workflow:400010385",
     "automatedNoFindingsMarker": "Actionable findings: 0",
+    "allowVerifiedEmptyAutomatedReview": false,
     "allowedRepositories": ["owner/repository"],
     "trustedCheckProducers": {
       "build-and-test": "app:23456",
@@ -57,8 +58,32 @@ When multiple trusted automated runs exist for the same head, even if the
 latest passes, Neko cannot prove which run produced a review, so merge stays
 blocked until a new commit or an eventual per-run evidence contract. This is
 an intentional conservative availability limit, not a signed run/review pair.
+Standalone automated inline comments with no linked submitted review are
+preserved as separate current-head finding evidence and generate durable,
+deduplicated manager notifications. They never masquerade as submitted reviews or as zero-findings approvals.
+The merge gate explicitly blocks current-head standalone automated findings
+even if another review contains a positive zero-count marker or the ordinary
+unresolved-thread restriction is disabled. The adapter uses the comment's
+`original_commit_id` for head attribution and rejects unverifiable bot
+comment identities.
+
 No marker is assumed by default. Skipped, neutral, pending, rejected,
 cancelled, and check-only responses cannot pass.
+
+For automated reviewers that submit a **blank COMMENTED review when clean**, the
+operator may explicitly set `allowVerifiedEmptyAutomatedReview: true` instead
+of a no-findings marker. This narrower alternative accepts a truly empty review
+body only when the trusted automated review check completes successfully, the
+single run and submitted review can be bound to the exact current head, and
+the complete source inline-comment page verifies **no comments originally
+reported by that bot on that head**. GitHub may re-anchor older comments to a
+newer `commit_id`; their `original_commit_id` is used for provenance. All
+unresolved review threads block this mode even when the ordinary thread gate
+is disabled. Unknown comment authors or original revisions fail closed. An empty
+body without a trusted successful run or a submitted review never counts.
+Only enable this for a reviewer whose documented clean-review behaviour is a
+blank review; the source must not report actionable findings solely through
+another channel. Normal positive zero-count markers remain preferred.
 
 ## Explicit operations
 
@@ -150,12 +175,14 @@ backed up with the other local state journals.
 
 ## Current limitations
 
-This foundation does not yet launch an independent reviewer autonomously when
-a developer finishes, track worker jobs with #33, notify an idle manager through
-the inbox, triage general discussion comments, or reconcile uncertain external
-merge outcomes. A successful policy result is not authorization to merge this
-feature PR without an external fresh-conversation review and completed automated
-review. Requiring a substantive posted source review (not merely a bot comment)
+The PR workflow still does not autonomously launch an independent reviewer
+when a developer finishes, triage general discussion comments, or reconcile
+uncertain external merge outcomes. The separate #33 worker-job watcher now
+tracks registered workers, checks and source review findings, and sends
+deduplicated, durable notifications to an idle manager through its inbox.
+Those alerts are not automatic remediation or merge authorization.
+A successful policy result is not authorization to merge this feature PR
+without an external fresh-conversation review and completed automated review. Requiring a substantive posted source review (not merely a bot comment)
 is intentionally strict; adapters can later add authenticated, head-correlated
 review-summary evidence for repositories whose automated reviewers publish only
 discussion comments.

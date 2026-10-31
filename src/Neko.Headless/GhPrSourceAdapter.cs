@@ -11,6 +11,7 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
 {
     private readonly string? _trustedExecutable;
     private readonly PrReviewPolicy? _policy;
+    private readonly Func<CancellationToken, string[], Task<JsonDocument>>? _testSource;
 
     // This is an opt-in adapter: missing configuration disables external PR
     // operations without preventing legacy headless hosting.
@@ -24,6 +25,15 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
                 Path.GetFileName(trustedExecutable), OperatingSystem.IsWindows() ? "gh.exe" : "gh"))
             throw new ArgumentException("A trusted absolute PR CLI executable is required.");
         _trustedExecutable = Path.GetFullPath(trustedExecutable);
+    }
+
+    // Tests exercise ReadAsync's complete source classification with synthetic
+    // GitHub responses. Production still uses the validated local gh executable.
+    internal GhPrSourceAdapter(PrReviewPolicy policy,
+        Func<CancellationToken, string[], Task<JsonDocument>> testSource)
+    {
+        _policy = policy;
+        _testSource = testSource;
     }
 
     // Trust only the allowlisted canonical identifier from local host policy.
@@ -46,6 +56,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     private async Task<JsonDocument> ApiAsync(
         CancellationToken cancellation, params string[] args)
     {
+        if (_testSource is not null)
+            return await _testSource(cancellation, args);
         if (_trustedExecutable is null)
             throw new InvalidOperationException("External PR adapter is not configured.");
         // The executable is validated as an existing fully-qualified local
@@ -87,6 +99,14 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     private static string? GetString(JsonElement root, string key) =>
         root.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString() : null;
+
+    // A missing, null or non-string review body is not an explicit blank
+    // automated review. Never grant a no-findings assertion on parsing failure.
+    internal static bool ExplicitEmptyReviewBody(JsonElement review) =>
+        review.ValueKind == JsonValueKind.Object &&
+        review.TryGetProperty("body", out var body) &&
+        body.ValueKind == JsonValueKind.String &&
+        body.GetString() == "";
 
     // A deleted source account has no login. Keep those review identities
     // distinct so one deleted account's approval cannot erase another's
@@ -178,10 +198,79 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
 
     internal static bool SourceAutomatedNoFindings(
         string author, string? configuredReviewer, long reviewId,
-        IReadOnlySet<long> reviewsWithInlineComments, string body, string? marker) =>
+        IReadOnlySet<long> reviewsWithInlineComments, string body, string? marker,
+        bool allowVerifiedEmptyReview = false,
+        bool noAutomatedCommentsOnHead = false) =>
         StringComparer.OrdinalIgnoreCase.Equals(author, configuredReviewer) &&
         !reviewsWithInlineComments.Contains(reviewId) &&
-        VerifiedNoFindingsLine(body, marker);
+        (VerifiedNoFindingsLine(body, marker) ||
+         (allowVerifiedEmptyReview && body.Length == 0 &&
+          noAutomatedCommentsOnHead));
+
+    // Optional, explicitly configured no-findings evidence for automated
+    // reviewers that submit an empty COMMENTED review on a clean run.
+    // An empty review is never enough by itself: the gate still requires a
+    // single trusted successful check run, matching revision and submitted
+    // review. Unknown comment authors/revisions fail closed here.
+    internal static bool NoAutomatedInlineCommentsOnHead(
+        JsonElement comments, string head, string? configuredReviewer)
+    {
+        if (string.IsNullOrWhiteSpace(configuredReviewer) ||
+            comments.ValueKind != JsonValueKind.Array) return false;
+        foreach (var comment in comments.EnumerateArray())
+        {
+            if (comment.ValueKind != JsonValueKind.Object ||
+                !comment.TryGetProperty("user", out var user) ||
+                user.ValueKind != JsonValueKind.Object) return false;
+            var author = GetString(user, "login");
+            // GitHub can re-anchor an old review comment onto a newer
+            // commit_id. Only original_commit_id identifies the revision on
+            // which this automated finding was actually reported.
+            var revision = GetString(comment, "original_commit_id");
+            if (string.IsNullOrWhiteSpace(author) ||
+                !PrReviewGate.ValidSha(revision)) return false;
+            if (StringComparer.OrdinalIgnoreCase.Equals(author, configuredReviewer) &&
+                revision == head) return false;
+        }
+        return true;
+    }
+
+    // Standalone inline comments have no source review ID. Preserve them
+    // separately, rather than inventing a submitted review that could falsely
+    // satisfy approval or no-findings gates. Use original_commit_id, not the
+    // reanchored commit_id, for precise current-head attribution.
+    internal static IReadOnlyList<PrInlineFinding> StandaloneAutomatedFindings(
+        JsonElement comments, string head, string? automatedReviewer)
+    {
+        var result = new List<PrInlineFinding>();
+        if (string.IsNullOrWhiteSpace(automatedReviewer)) return result;
+        foreach (var comment in comments.EnumerateArray())
+        {
+            if (comment.ValueKind != JsonValueKind.Object ||
+                !comment.TryGetProperty("user", out var user) ||
+                user.ValueKind != JsonValueKind.Object) continue;
+            var author = GetString(user, "login");
+            if (!StringComparer.OrdinalIgnoreCase.Equals(author, automatedReviewer))
+                continue;
+            var revision = GetString(comment, "original_commit_id");
+            if (!PrReviewGate.ValidSha(revision))
+                throw new InvalidOperationException(
+                    "Automated comment original revision unverified.");
+            if (revision != head) continue;
+            if (comment.TryGetProperty("pull_request_review_id", out var review) &&
+                review.ValueKind == JsonValueKind.Number &&
+                review.TryGetInt64(out var linkedId) && linkedId > 0)
+                continue; // The associated submitted review already carries evidence.
+            if (!comment.TryGetProperty("id", out var idElement) ||
+                !idElement.TryGetInt64(out var id) || id <= 0 ||
+                !Uri.TryCreate(GetString(comment, "html_url"),
+                    UriKind.Absolute, out var url) || url.Scheme != Uri.UriSchemeHttps)
+                throw new InvalidOperationException(
+                    "Standalone automated comment identity unverified.");
+            result.Add(new PrInlineFinding(url.ToString(), author!, revision!, id));
+        }
+        return result;
+    }
 
     internal static string BodyDigest(string body) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
@@ -345,6 +434,10 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         // Standalone PR comments can legitimately have a null review ID.
         // They do not count as evidence for a particular submitted review.
         var reviewComments = AssociatedReviewIds(comments.RootElement);
+        var emptyReviewCommentsClear = NoAutomatedInlineCommentsOnHead(
+            comments.RootElement, head, _policy?.AutomatedReviewer);
+        var inlineFindings = StandaloneAutomatedFindings(
+            comments.RootElement, head, _policy?.AutomatedReviewer);
         var sourceReviews = new List<PrReview>();
         foreach (var r in reviews.RootElement.EnumerateArray())
         {
@@ -363,10 +456,15 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             // were later resolved. A clear body marker cannot override them.
             var findingsClear = SourceAutomatedNoFindings(authorId,
                 _policy?.AutomatedReviewer, reviewId, reviewComments,
-                body, _policy?.AutomatedNoFindingsMarker);
+                body, _policy?.AutomatedNoFindingsMarker,
+                _policy?.AllowVerifiedEmptyAutomatedReview == true &&
+                    verdict == "commented" && GetString(r, "commit_id") == head &&
+                    ExplicitEmptyReviewBody(r),
+                emptyReviewCommentsClear);
             sourceReviews.Add(new PrReview(GetString(r, "html_url") ?? "",
                 authorId, GetString(r, "commit_id") ?? "", verdict,
-                !string.IsNullOrWhiteSpace(body) || reviewComments.Contains(reviewId),
+                !string.IsNullOrWhiteSpace(body) || reviewComments.Contains(reviewId) ||
+                (_policy?.AllowVerifiedEmptyAutomatedReview == true && findingsClear),
                 submitted, BodyDigest(body), reviewId, findingsClear));
         }
 
@@ -382,7 +480,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         var unresolved = Member(threadsRoot, "nodes").EnumerateArray()
             .Count(n => !Member(n, "isResolved").GetBoolean());
         return new PrSourceStatus(canonicalRepository, number, head, baseSha, state, author,
-            merged, mergeable, gathered.ToArray(), sourceReviews, unresolved);
+            merged, mergeable, gathered.ToArray(), sourceReviews, unresolved,
+            inlineFindings);
     }
 
     public async Task<string> AuthenticatedPublisherAsync(CancellationToken cancellation)

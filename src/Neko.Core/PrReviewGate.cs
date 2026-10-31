@@ -8,10 +8,12 @@ public sealed record PrCheck(string Name, string HeadSha, string Status, string?
 public sealed record PrReview(string Url, string Author, string HeadSha, string Verdict,
     bool Substantive, DateTimeOffset SubmittedAt, string? BodySha256 = null,
     long? SourceReviewId = null, bool AutomatedNoFindings = false);
+public sealed record PrInlineFinding(string Url, string Author,
+    string OriginalHeadSha, long CommentId);
 public sealed record PrSourceStatus(string Repository, int Number, string HeadSha,
     string BaseSha, string State, string Author, bool Merged, bool Mergeable,
     IReadOnlyList<PrCheck> Checks, IReadOnlyList<PrReview> Reviews,
-    int UnresolvedThreads);
+    int UnresolvedThreads, IReadOnlyList<PrInlineFinding>? InlineFindings = null);
 public sealed record PrReviewPolicy(
     IReadOnlyList<string> RequiredChecks, string AutomatedCheck, string AutomatedReviewer,
     bool RequireNoUnresolvedThreads = true,
@@ -20,7 +22,8 @@ public sealed record PrReviewPolicy(
     IReadOnlyDictionary<string, string>? TrustedCheckWorkflows = null,
     string? AutomatedCheckWorkflow = null,
     string? AutomatedNoFindingsMarker = null,
-    IReadOnlyList<string>? AllowedRepositories = null);
+    IReadOnlyList<string>? AllowedRepositories = null,
+    bool AllowVerifiedEmptyAutomatedReview = false);
 public sealed record PrWorkerEvidence(string ConversationId, string CreatedForHead,
     DateTimeOffset CreatedAt, bool Completed, DateTimeOffset? CompletedAt,
     string? ReviewUrl, string? Verdict, string? ReviewerAccount,
@@ -194,7 +197,8 @@ public static class PrReviewGate
                 .ThenByDescending(r => r.SourceReviewId ?? long.MinValue).ToArray();
             if (botReviews.Length == 0)
                 blockers.Add("substantive_automated_review_missing");
-            if (string.IsNullOrWhiteSpace(policy.AutomatedNoFindingsMarker))
+            if (string.IsNullOrWhiteSpace(policy.AutomatedNoFindingsMarker) &&
+                !policy.AllowVerifiedEmptyAutomatedReview)
                 blockers.Add("automated_finding_policy_missing");
             // A successful check says a reviewer ran, NOT that it found no
             // defects. Only a configured, source-derived positive conclusion
@@ -235,8 +239,19 @@ public static class PrReviewGate
                         blockers.Add("required_check_not_successful:" + name);
                 }
             }
-        if (policy.RequireNoUnresolvedThreads && source.UnresolvedThreads != 0)
+        // Empty automated-review evidence must never clear unresolved older
+        // findings, even when an operator disables the ordinary thread gate.
+        if ((policy.RequireNoUnresolvedThreads ||
+             policy.AllowVerifiedEmptyAutomatedReview) && source.UnresolvedThreads != 0)
             blockers.Add("unresolved_review_threads:" + source.UnresolvedThreads);
+        // A standalone current-head automated finding without a submitted
+        // review is not an approval and cannot be cleared by a separate
+        // zero-count review marker or a successful automated check.
+        if (source.InlineFindings?.Any(f =>
+                f.OriginalHeadSha == workflow.HeadSha &&
+                StringComparer.OrdinalIgnoreCase.Equals(
+                    f.Author, policy.AutomatedReviewer)) == true)
+            blockers.Add("automated_inline_findings_untriaged");
         // An earlier head's active change request remains binding until that
         // reviewer issues a newer decisive approval or the review is dismissed.
         // A mere COMMENTED review does not supersede a change request.

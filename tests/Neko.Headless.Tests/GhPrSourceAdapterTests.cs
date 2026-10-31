@@ -210,6 +210,137 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
+    public void StandaloneBotCommentsOnOriginalHeadRemainFindingEvidence()
+    {
+        const string head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        using var comments = JsonDocument.Parse("""
+            [
+              {"id":15,"user":{"login":"review-bot"},
+               "original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+               "commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+               "pull_request_review_id":null,
+               "html_url":"https://github.com/example/pr#comment-15"},
+              {"id":16,"user":{"login":"review-bot"},
+               "original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+               "pull_request_review_id":100,
+               "html_url":"https://github.com/example/pr#comment-16"},
+              {"id":17,"user":{"login":"review-bot"},
+               "original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+               "pull_request_review_id":null,
+               "html_url":"https://github.com/example/pr#comment-17"},
+              {"id":18,"user":{"login":"human"},
+               "original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+               "pull_request_review_id":null,
+               "html_url":"https://github.com/example/pr#comment-18"}
+            ]
+            """);
+        var found = GhPrSourceAdapter.StandaloneAutomatedFindings(
+            comments.RootElement, head, "review-bot");
+        Assert.Single(found);
+        Assert.Equal(15, found[0].CommentId);
+        Assert.Equal(head, found[0].OriginalHeadSha);
+        Assert.Contains("comment-15", found[0].Url);
+        using var missingOriginal = JsonDocument.Parse("""
+            [{"id":20,"user":{"login":"review-bot"},
+              "html_url":"https://github.com/example/pr#comment-20"}]
+            """);
+        Assert.Throws<InvalidOperationException>(() =>
+            GhPrSourceAdapter.StandaloneAutomatedFindings(
+                missingOriginal.RootElement, head, "review-bot"));
+    }
+
+    [Fact]
+    public void InvalidStandaloneBotFindingProvenanceFailsClosed()
+    {
+        const string head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        var invalid = new[] {
+            // Even a reanchored, OLD-head comment must have a valid original.
+            """{"id":20,"user":{"login":"review-bot"},"original_commit_id":"bogus","commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","html_url":"https://github.com/example/pr#comment-20"}""",
+            // Current-head unlinked findings require stable positive IDs.
+            """{"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"https://github.com/example/pr#comment"}""",
+            """{"id":0,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"https://github.com/example/pr#comment-0"}""",
+            """{"id":-1,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"https://github.com/example/pr#comment-negative"}""",
+            // URLs must be present and use HTTPS.
+            """{"id":21,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}""",
+            """{"id":22,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"http://github.com/example/pr#comment-22"}""",
+            """{"id":23,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"not-a-url"}"""
+        };
+        foreach (var entry in invalid)
+        {
+            using var comments = JsonDocument.Parse("[" + entry + "]");
+            Assert.Throws<InvalidOperationException>(() =>
+                GhPrSourceAdapter.StandaloneAutomatedFindings(
+                    comments.RootElement, head, "review-bot"));
+        }
+    }
+
+    [Theory]
+    [InlineData("{\"body\":\"\"}", true)]
+    [InlineData("{}", false)]
+    [InlineData("{\"body\":null}", false)]
+    [InlineData("{\"body\":7}", false)]
+    [InlineData("{\"body\":[]}", false)]
+    [InlineData("{\"body\":\" \"}", false)]
+    [InlineData("{\"body\":\"finding\"}", false)]
+    public void OnlyExplicitJsonEmptyStringCanBeAZeroFindingReview(
+        string json, bool valid)
+    {
+        using var document = JsonDocument.Parse(json);
+        Assert.Equal(valid, GhPrSourceAdapter.ExplicitEmptyReviewBody(
+            document.RootElement));
+    }
+
+    [Fact]
+    public void VerifiedEmptyAutomatedReviewRequiresOptInAndExhaustiveCommentEvidence()
+    {
+        var linked = new HashSet<long>();
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, linked, "", null));
+        Assert.True(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, linked, "", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: true));
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, linked, "", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: false));
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "other-bot", 9, linked, "", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: true));
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, new HashSet<long> { 9 }, "", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: true));
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "review-bot", "review-bot", 9, linked, "Some prose", null,
+            allowVerifiedEmptyReview: true, noAutomatedCommentsOnHead: true));
+
+        const string sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        using var olderBotComment = JsonDocument.Parse("""
+            [{"user":{"login":"review-bot"},"commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+            """);
+        Assert.True(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            olderBotComment.RootElement, sha, "review-bot"));
+        using var currentBotComment = JsonDocument.Parse("""
+            [{"user":{"login":"review-bot"},"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]
+            """);
+        Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            currentBotComment.RootElement, sha, "review-bot"));
+        using var unknownAuthor = JsonDocument.Parse("""
+            [{"user":null,"original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+            """);
+        Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            unknownAuthor.RootElement, sha, "review-bot"));
+        using var unknownRevision = JsonDocument.Parse("""
+            [{"user":{"login":"other"}}]
+            """);
+        Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            unknownRevision.RootElement, sha, "review-bot"));
+        using var malformedRevision = JsonDocument.Parse("""
+            [{"user":{"login":"review-bot"},"original_commit_id":"bogus"}]
+            """);
+        Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            malformedRevision.RootElement, sha, "review-bot"));
+    }
+
+    [Fact]
     public void WorkflowRunIdentityRequiresTrustedHostAndExactRepository()
     {
         using var valid = JsonDocument.Parse("""

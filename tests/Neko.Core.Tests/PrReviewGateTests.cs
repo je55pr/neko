@@ -58,12 +58,64 @@ public sealed class PrReviewGateTests
     }
 
     [Fact]
+    public void StandaloneAutomatedFindingBlocksMergeEvenWithPositiveMarker()
+    {
+        var changed = Source() with {
+            InlineFindings = [new PrInlineFinding(
+                "https://example.org/pull/12#comment-15", "review-bot", Head, 15)]
+        };
+        var decision = Evaluate(source: changed);
+        Assert.False(decision.Ready);
+        Assert.Contains("automated_inline_findings_untriaged", decision.Blockers);
+        Assert.Contains("automated_inline_findings_untriaged",
+            Evaluate(source: changed, policy: Policy with {
+                RequireNoUnresolvedThreads = false
+            }).Blockers);
+        var oldHead = changed with {
+            InlineFindings = [changed.InlineFindings![0] with {
+                OriginalHeadSha = Changed
+            }]
+        };
+        Assert.True(Evaluate(source: oldHead).Ready);
+    }
+
+    [Fact]
     public void CompleteIndependentAndAutomatedReviewsPermitMerge()
     {
         var result = Evaluate();
         Assert.True(result.Ready);
         Assert.Equal("merge_ready", result.State);
         Assert.Empty(result.Blockers);
+    }
+
+    [Fact]
+    public void EmptyAutomatedReviewOptInStillRequiresTrustworthyReviewAndCheck()
+    {
+        var policy = Policy with {
+            AutomatedNoFindingsMarker = null,
+            AllowVerifiedEmptyAutomatedReview = true
+        };
+        Assert.True(Evaluate(policy: policy).Ready);
+        Assert.Contains("automated_finding_policy_missing",
+            Evaluate(policy: Policy with { AutomatedNoFindingsMarker = null }).Blockers);
+        var incomplete = Source() with {
+            Reviews = [Source().Reviews[0],
+                Source().Reviews[1] with { Substantive = false }]
+        };
+        Assert.Contains("substantive_automated_review_missing",
+            Evaluate(source: incomplete, policy: policy).Blockers);
+        var untrusted = Source() with {
+            Checks = [Source().Checks[0],
+                Source().Checks[1] with { ProducerId = "app:untrusted" }]
+        };
+        Assert.Contains("automated_review_run_not_successful",
+            Evaluate(source: untrusted, policy: policy).Blockers);
+        // Older review findings cannot be ignored merely because the current
+        // bot submitted an empty review on a newer head.
+        var unresolved = Source() with { UnresolvedThreads = 1 };
+        Assert.Contains("unresolved_review_threads:1", Evaluate(
+            source: unresolved,
+            policy: policy with { RequireNoUnresolvedThreads = false }).Blockers);
     }
 
     [Theory]

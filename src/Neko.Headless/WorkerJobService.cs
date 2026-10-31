@@ -302,8 +302,12 @@ internal sealed class WorkerJobService : IDisposable
                         job = AddEvent(job, "review_findings",
                             "Source review requested changes.",
                             "review." + Hash(review.Url), reviewUrl: review.Url);
+                    // Marker-free empty reviews are a valid opt-in policy.
+                    // Continue notifying the manager whenever the trusted bot
+                    // instead publishes substantive findings on that head.
                     if (!string.IsNullOrWhiteSpace(_policy.AutomatedReviewer) &&
-                        !string.IsNullOrWhiteSpace(_policy.AutomatedNoFindingsMarker))
+                        (!string.IsNullOrWhiteSpace(_policy.AutomatedNoFindingsMarker) ||
+                         _policy.AllowVerifiedEmptyAutomatedReview))
                         foreach (var review in source.Reviews.Where(r =>
                             r.Substantive && r.HeadSha == job.HeadSha &&
                             StringComparer.OrdinalIgnoreCase.Equals(
@@ -312,6 +316,20 @@ internal sealed class WorkerJobService : IDisposable
                             job = AddEvent(job, "review_findings",
                                 "Automated review contains findings requiring triage.",
                                 "review." + Hash(review.Url), reviewUrl: review.Url);
+                    // An inline bot comment without an associated submitted
+                    // review must still wake the manager, but must never be
+                    // mistaken for an approving or no-findings review.
+                    var standalone = (source.InlineFindings ?? [])
+                        .Where(f => f.OriginalHeadSha == job.HeadSha &&
+                            StringComparer.OrdinalIgnoreCase.Equals(
+                                f.Author, _policy.AutomatedReviewer))
+                        .OrderBy(f => f.CommentId).ToArray();
+                    foreach (var finding in standalone)
+                        job = AddEvent(job, "review_findings",
+                            "Automated reviewer posted a standalone inline " +
+                            "finding requiring triage.",
+                            "inline." + Hash(job.HeadSha + ":" + finding.CommentId),
+                            reviewUrl: finding.Url);
                     if (source.State != "open" || source.Merged)
                         job = job with { WatchClosed = true };
                 }
