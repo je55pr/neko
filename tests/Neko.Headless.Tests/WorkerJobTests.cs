@@ -363,6 +363,25 @@ public sealed partial class HeadlessRuntimeTests
         await jobs.ProcessAllAsync(CancellationToken.None);
         Assert.Single(jobs.Get("manager/main", registered.Job.Id)!.Events);
         Assert.Single(setup.InboxJournal.List("manager/main"));
+
+        // A later comment gets its OWN URL and durable one-use event, while
+        // the old comment never generates a second notification.
+        const string secondUrl = "https://github.com/example/pull/7#comment-45";
+        source.Current = source.Current with {
+            InlineFindings = [.. source.Current.InlineFindings!,
+                new PrInlineFinding(secondUrl, "auto-account", PrHead, 45)]
+        };
+        clock.AdvanceSeconds(180);
+        await jobs.ProcessAllAsync(CancellationToken.None);
+        var afterSecond = jobs.Get("manager/main", registered.Job.Id)!.Events;
+        Assert.Equal(2, afterSecond.Count);
+        Assert.Contains(afterSecond, e => e.ReviewUrl == findingUrl);
+        Assert.Contains(afterSecond, e => e.ReviewUrl == secondUrl);
+        Assert.Equal(2, setup.InboxJournal.List("manager/main").Count);
+        clock.AdvanceSeconds(180);
+        await jobs.ProcessAllAsync(CancellationToken.None);
+        Assert.Equal(2, jobs.Get("manager/main", registered.Job.Id)!.Events.Count);
+        Assert.Equal(2, setup.InboxJournal.List("manager/main").Count);
         Assert.Equal(0, provider.SendCalls);
         Assert.Equal(0, source.PostCalls);
         Assert.Equal(0, source.MergeCalls);

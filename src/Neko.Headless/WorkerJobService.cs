@@ -324,13 +324,12 @@ internal sealed class WorkerJobService : IDisposable
                             StringComparer.OrdinalIgnoreCase.Equals(
                                 f.Author, _policy.AutomatedReviewer))
                         .OrderBy(f => f.CommentId).ToArray();
-                    if (standalone.Length > 0)
+                    foreach (var finding in standalone)
                         job = AddEvent(job, "review_findings",
-                            $"Automated reviewer posted {standalone.Length} standalone " +
-                            "inline finding(s) requiring triage.",
-                            "inline." + Hash(job.HeadSha + ":" +
-                                string.Join(",", standalone.Select(f => f.CommentId))),
-                            reviewUrl: standalone[0].Url);
+                            "Automated reviewer posted a standalone inline " +
+                            "finding requiring triage.",
+                            "inline." + Hash(job.HeadSha + ":" + finding.CommentId),
+                            reviewUrl: finding.Url);
                     if (source.State != "open" || source.Merged)
                         job = job with { WatchClosed = true };
                 }

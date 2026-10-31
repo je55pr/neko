@@ -175,12 +175,14 @@ backed up with the other local state journals.
 
 ## Current limitations
 
-This foundation does not yet launch an independent reviewer autonomously when
-a developer finishes, track worker jobs with #33, notify an idle manager through
-the inbox, triage general discussion comments, or reconcile uncertain external
-merge outcomes. A successful policy result is not authorization to merge this
-feature PR without an external fresh-conversation review and completed automated
-review. Requiring a substantive posted source review (not merely a bot comment)
+The PR workflow still does not autonomously launch an independent reviewer
+when a developer finishes, triage general discussion comments, or reconcile
+uncertain external merge outcomes. The separate #33 worker-job watcher now
+tracks registered workers, checks and source review findings, and sends
+deduplicated, durable notifications to an idle manager through its inbox.
+Those alerts are not automatic remediation or merge authorization.
+A successful policy result is not authorization to merge this feature PR
+without an external fresh-conversation review and completed automated review. Requiring a substantive posted source review (not merely a bot comment)
 is intentionally strict; adapters can later add authenticated, head-correlated
 review-summary evidence for repositories whose automated reviewers publish only
 discussion comments.
