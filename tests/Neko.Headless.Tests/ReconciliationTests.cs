@@ -316,6 +316,73 @@ public sealed partial class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task AcceptedManagerCreationCrashBeforeRegistryBindingRetainsGlobalGuard()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using (var first = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path)))
+        {
+            var registry = new ManagerRegistry(folder.Path, beforePersist: record => {
+                if (record.ConversationId is not null)
+                    throw new IOException("Injected manager binding failure.");
+            });
+            var managers = new ManagerService(registry, first);
+            await Assert.ThrowsAsync<IOException>(() =>
+                managers.CreateAsync("manager/main", "first", CancellationToken.None));
+            var marker = new ChatJournal(folder.Path).GetPendingCreation();
+            Assert.Equal("manager/main", marker!.OwnerId);
+            Assert.Equal("chat-1", marker.CorrelatedConversationId);
+            Assert.Null(registry.Get("manager/main")!.ConversationId);
+        }
+        provider.AuthoritativeComplete = true;
+        using var recovered = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path));
+        var managersAgain = new ManagerService(new ManagerRegistry(folder.Path), recovered);
+        var restored = (await managersAgain.ReconcileAsync("manager/main", CancellationToken.None))!;
+        Assert.Equal("restored", restored.Reconciliation.Outcome);
+        Assert.Equal("chat-1", restored.Manager.ConversationId);
+        Assert.Equal("idle", restored.Manager.LifecycleState);
+        Assert.Null(new ChatJournal(folder.Path).GetPendingCreation());
+        Assert.Equal(1, provider.ManagerCreationCalls);
+    }
+
+    [Fact]
+    public async Task FailedCreationCorrelationCheckpointCannotInventBinding()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider {
+            UncertainNextCreation = true, CorrelatedUncertainCreationId = "chat-1",
+            AuthoritativeComplete = true
+        };
+        var journal = new ChatJournal(folder.Path,
+            beforeCreationPersist: record => {
+                if (record.CorrelatedConversationId is not null)
+                    throw new IOException("Injected pending creation update failure.");
+            });
+        using (var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"), journal))
+        {
+            var managers = new ManagerService(new ManagerRegistry(folder.Path), runtime);
+            var creation = await managers.CreateAsync(
+                "manager/main", "first", CancellationToken.None);
+            Assert.Equal(SendDisposition.Uncertain, creation.Receipt.Disposition);
+            Assert.Null(creation.Manager.ConversationId);
+            Assert.Null(journal.GetPendingCreation()!.CorrelatedConversationId);
+        }
+        using var recovered = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path));
+        var managersAgain = new ManagerService(new ManagerRegistry(folder.Path), recovered);
+        var blocked = (await managersAgain.ReconcileAsync("manager/main", CancellationToken.None))!;
+        Assert.Equal("missing_creation_correlation", blocked.Reconciliation.Reason);
+        Assert.Null(blocked.Manager.ConversationId);
+        Assert.Equal(1, provider.ManagerCreationCalls);
+    }
+
+    [Fact]
     public async Task CreationMarkerCanReconcileAfterPreexistingJournalCheckpoint()
     {
         using var folder = new TemporaryDirectory();
@@ -363,6 +430,66 @@ public sealed partial class HeadlessRuntimeTests
         provider.AuthoritativeComplete = true;
         Assert.Equal("restored",
             (await recovered.ReconcileAsync("chat-1", CancellationToken.None)).Outcome);
+    }
+
+    private static async Task AssertObservationExpired(ChatRuntime runtime, string id)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await foreach (var update in runtime.WatchAsync(id, timeout.Token))
+        {
+            if (update.Operation == PublicUpdateOperation.ObservationExpired)
+                return;
+        }
+        Assert.Fail("Observer expiration was not published.");
+    }
+
+    [Fact]
+    public async Task ObserverDeadlineOnAcceptedFirstTurnCanRecoverLateCompletion()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider { DeferCompletion = true };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path));
+        Assert.Equal(SendDisposition.Accepted,
+            (await runtime.CreateAsync("first", CancellationToken.None)).Disposition);
+        Assert.True(runtime.Get("chat-1")!.PendingTurn!.AcceptedSubmission);
+        provider.Publish(new PublicConversationUpdate("timeout", PublicUpdateKind.Final,
+            PublicUpdateOperation.ObservationExpired));
+        await AssertObservationExpired(runtime, "chat-1");
+        Assert.Equal("uncertain", runtime.Get("chat-1")!.Status);
+        Assert.Equal("remote_not_verified_complete",
+            (await runtime.ReconcileAsync("chat-1", CancellationToken.None)).Reason);
+        provider.AuthoritativeComplete = true;
+        Assert.Equal("restored",
+            (await runtime.ReconcileAsync("chat-1", CancellationToken.None)).Outcome);
+        Assert.Equal("idle", runtime.Get("chat-1")!.Status);
+        Assert.Equal(1, provider.ManagerCreationCalls);
+        Assert.Equal(0, provider.SendCalls);
+    }
+
+    [Fact]
+    public async Task ObserverDeadlineOnAcceptedFollowupNeverAutomaticallyResends()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path));
+        await runtime.CreateAsync("first", CancellationToken.None);
+        await WaitForTerminal(runtime, "chat-1");
+        provider.DeferCompletion = true;
+        await runtime.SendAsync("chat-1", "second", CancellationToken.None);
+        provider.Publish(new PublicConversationUpdate("timeout", PublicUpdateKind.Final,
+            PublicUpdateOperation.ObservationExpired));
+        await AssertObservationExpired(runtime, "chat-1");
+        Assert.Equal("uncertain", runtime.Get("chat-1")!.Status);
+        Assert.Equal("conversation_not_idle",
+            (await runtime.SendAsync("chat-1", "duplicate", CancellationToken.None)).Reason);
+        provider.AuthoritativeComplete = true;
+        Assert.Equal("restored",
+            (await runtime.ReconcileAsync("chat-1", CancellationToken.None)).Outcome);
+        Assert.Equal(1, provider.SendCalls);
     }
 
     [Fact]

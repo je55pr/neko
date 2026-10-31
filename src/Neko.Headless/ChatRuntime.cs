@@ -110,7 +110,11 @@ internal sealed class ChatRuntime : IDisposable
             else if (receipt.Disposition == SendDisposition.Accepted)
             {
                 _journal.Set(new ChatRecord(receipt.ConversationId!, "generating",
-                    ProgressTurnId: feed.TurnId));
+                    ProgressTurnId: feed.TurnId,
+                    PendingTurn: new PendingTurnEvidence(
+                        PromptHash(prepared.Message.Text), Array.Empty<string>(),
+                        AcceptedSubmission: true,
+                        CorrelatedUserMessageId: receipt.MessageId)));
                 // Manager creation must bind its registry identity durably
                 // before the global creation guard can be released.
                 if (ownerId is null) _journal.ClearCreation();
@@ -357,9 +361,14 @@ internal sealed class ChatRuntime : IDisposable
             }
             var id = pending.CorrelatedConversationId;
             var prior = _journal.Get(id);
-            if (prior?.Status == "idle" &&
-                prior.LastReconciliation is { Outcome: "restored" } decision &&
-                decision.PromptSha256 == pending.PromptSha256)
+            if (prior?.Status == "idle" && prior.PendingTurn is null &&
+                prior.LastReconciliation is { Outcome: "restored", OperationId: null } decision &&
+                decision.PromptSha256 == pending.PromptSha256 &&
+                prior.History is { } previousHistory &&
+                previousHistory.Messages.Count(message =>
+                    message.Role == VisibleMessageRole.User) == 1 &&
+                prior.History.Messages[0].Role == VisibleMessageRole.User &&
+                PromptHash(prior.History.Messages[0].Text) == pending.PromptSha256)
             {
                 if (ownerId is null) _journal.ClearCreation();
                 return new("restored", "authoritative_turn_complete", id,
@@ -368,8 +377,12 @@ internal sealed class ChatRuntime : IDisposable
             // A crash may have persisted the conversation but not yet cleared
             // creation.pending. This is safe to examine only if no follow-up
             // turn has been recorded under the same identity.
-            if (prior is not null && (prior.PendingTurn is not null ||
-                prior.Status is not ("idle" or "generating" or "uncertain")))
+            if (prior is not null &&
+                (prior.PendingTurn is { } active &&
+                    (active.PromptSha256 != pending.PromptSha256 ||
+                     active.BaselineMessageIds.Count != 0 ||
+                     !active.AcceptedSubmission) ||
+                 prior.Status is not ("idle" or "generating" or "uncertain")))
                 return new("blocked", "conversation_identity_already_registered", id);
 
             var probe = new ReconciliationProbe(id, pending.PromptSha256,
@@ -392,10 +405,13 @@ internal sealed class ChatRuntime : IDisposable
             else
             {
                 var saved=_journal.Update(id, current =>
-                    current.PendingTurn is null &&
+                    (current.PendingTurn is null ||
+                     current.PendingTurn.PromptSha256 == pending.PromptSha256 &&
+                     current.PendingTurn.BaselineMessageIds.Count == 0 &&
+                     current.PendingTurn.AcceptedSubmission) &&
                     current.Status is "idle" or "generating" or "uncertain"
                         ? current with { Status="idle", History=inspection.History,
-                            LastReconciliation=proof }
+                            PendingTurn=null, LastReconciliation=proof }
                         : current);
                 if (saved?.LastReconciliation != proof)
                     return new("blocked", "concurrent_state_change", id);
@@ -415,7 +431,8 @@ internal sealed class ChatRuntime : IDisposable
         var record = _journal.Get(conversationId);
         if (pending?.OwnerId != managerId ||
             pending.CorrelatedConversationId != conversationId ||
-            record is null || record.ProgressTurnId is null)
+            record is null || (record.ProgressTurnId is null &&
+                record.LastReconciliation is not { Outcome: "restored" }))
             return false;
         _journal.ClearCreation();
         return true;
@@ -533,7 +550,15 @@ internal sealed class ChatRuntime : IDisposable
                                     ? "idle" : "uncertain",
                                 History = snapshot ?? latest.History,
                                 PendingTurn = update.Operation == PublicUpdateOperation.Complete
-                                    ? null : latest.PendingTurn
+                                    ? null : latest.PendingTurn,
+                                LastReconciliation = update.Operation == PublicUpdateOperation.Complete &&
+                                    latest.PendingTurn is { } completed
+                                    ? new ReconciliationDecision(_timeProvider.GetUtcNow(),
+                                        "restored", "provider_terminal_observed",
+                                        completed.PromptSha256,
+                                        AssistantMessageId: update.MessageId,
+                                        OperationId: completed.OperationId)
+                                    : latest.LastReconciliation
                             }) is null)
                         throw new IOException("The terminal checkpoint is unavailable.");
                     feed.Publish(update);
