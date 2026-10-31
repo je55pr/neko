@@ -40,7 +40,8 @@ internal static class PrWorkflowEndpoints
         if (service.Get(repository, number) is null) return Results.NotFound();
         try { return Results.Json(await service.RefreshRevisionAsync(
             repository, number, cancellation)); }
-        catch (OperationCanceledException) { throw; }
+        // Distinguish a cancelled HTTP request from an upstream source timeout.
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
         catch (InvalidOperationException) {
             return Results.Conflict(new { reason = "revision_refresh_blocked" });
         }

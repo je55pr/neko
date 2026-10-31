@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http;
 using Neko;
 using Neko.Headless;
 
@@ -93,7 +94,8 @@ public sealed partial class HeadlessRuntimeTests
             CancellationToken cancellation)
         {
             cancellation.ThrowIfCancellationRequested();
-            if (repository != Current.Repository || number != Current.Number)
+            if (!StringComparer.OrdinalIgnoreCase.Equals(repository, Current.Repository) ||
+                number != Current.Number)
                 throw new ArgumentException("Unexpected test PR identity.");
             Reads++;
             return Task.FromResult(OnRead?.Invoke(Reads) ?? Current);
@@ -130,6 +132,50 @@ public sealed partial class HeadlessRuntimeTests
                 PostedBodySha256: "test-review-body", ReviewerVerdict: "no_blockers",
                 CreationPromptSha256: new string('A', 64))
         }, "review_verified", "test_source_proof"));
+    }
+
+    [Fact]
+    public async Task AuthorizedRepositoryCasingAliasPersistsCanonicalIdentity()
+    {
+        using var folder = new TemporaryDirectory();
+        using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow) with {
+            Repository = "Sample/Project"
+        });
+        var policy = GatePolicy() with { AllowedRepositories = ["Sample/Project"] };
+        var service = new PrWorkflowService(new PrWorkflowStore(folder.Path),
+            source, runtime, policy);
+
+        var created = await service.CreateAsync("sample/project", 7,
+            "creator-chat", "developer-chat", "manager-chat", CancellationToken.None);
+        Assert.Equal("Sample/Project", created.Repository);
+        Assert.Equal("Sample/Project", service.Get("SAMPLE/PROJECT", 7)!.Repository);
+        Assert.Equal("Sample/Project", new PrWorkflowStore(folder.Path)
+            .Get("sample/project", 7)!.Repository);
+    }
+
+    [Fact]
+    public async Task RefreshDistinguishesSourceTimeoutFromRequestCancellation()
+    {
+        using var folder = new TemporaryDirectory();
+        using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow)) {
+            OnRead = _ => throw new OperationCanceledException("Source timed out")
+        };
+        var store = new PrWorkflowStore(folder.Path);
+        store.Create("sample/project", 7, PrHead, PrBase,
+            "creator-chat", "developer-chat", "manager-chat");
+        var service = new PrWorkflowService(store, source, runtime, GatePolicy());
+
+        var result = await PrWorkflowEndpoints.RefreshAsync(
+            service, "sample/project", 7, CancellationToken.None);
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable,
+            Assert.IsAssignableFrom<IStatusCodeHttpResult>(result).StatusCode);
+        using var requestCancelled = new CancellationTokenSource();
+        requestCancelled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            PrWorkflowEndpoints.RefreshAsync(service, "sample/project", 7,
+                requestCancelled.Token));
     }
 
     [Fact]

@@ -91,11 +91,14 @@ internal sealed class PrWorkflowService
         if (!IsAuthorizedRepository(repository) || number < 1)
             throw new ArgumentException("Repository not authorized.");
         var source = await _source.ReadAsync(repository, number, cancellation);
-        if (source.Repository != repository || source.Number != number ||
-            source.State != "open" || !PrReviewGate.ValidSha(source.HeadSha) ||
+        if (!StringComparer.OrdinalIgnoreCase.Equals(source.Repository, repository) ||
+            source.Number != number || source.State != "open" ||
+            !PrReviewGate.ValidSha(source.HeadSha) ||
             !PrReviewGate.ValidSha(source.BaseSha))
             throw new InvalidOperationException("Source PR identity or state invalid.");
-        return _store.Create(repository, number, source.HeadSha, source.BaseSha,
+        // Store the source's canonical case so future inspections compare the
+        // same identity even when the caller used an authorized casing alias.
+        return _store.Create(source.Repository, number, source.HeadSha, source.BaseSha,
             creator, developer, manager);
     }
 
