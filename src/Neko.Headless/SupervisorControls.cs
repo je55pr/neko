@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Win32;
 
@@ -11,6 +12,7 @@ internal sealed record SupervisorLaunchManifest(
 internal static class SupervisorControls
 {
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string ManifestKey = @"Software\Neko\SupervisorManifests";
 
     internal static string StartupValueName(string stateDirectory) =>
         "NekoSupervisor-" + SupervisorIdentity.StateId(stateDirectory)[..16];
@@ -29,13 +31,36 @@ internal static class SupervisorControls
 
     // Windows Run entry command lines are limited to 260 characters.
     // Keep the entry short: paths and the pinned configuration identity live
-    // in an ignored local manifest next to the tracked launcher script.
+    // in a per-user private app-data manifest, not the source checkout.
     internal static string StartupCommand(string script, string key) =>
         "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden " +
         "-ExecutionPolicy Bypass -File " + Quote(script) + " -Key " + Quote(key);
 
-    internal static string ManifestPath(string script, string key) =>
-        Path.Combine(Path.GetDirectoryName(script)!, "supervisor-" + key + ".local.json");
+    internal static string ManifestPath(string key) =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Neko", "Supervision", "supervisor-" + key + ".local.json");
+
+    internal static string InstalledLauncherPath(string key) =>
+        Path.Combine(Path.GetDirectoryName(ManifestPath(key))!,
+            "supervisor-launch-" + key + ".ps1");
+
+    internal static string ManifestDigest(string path) =>
+        Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+
+    private static bool ManifestVerified(string key)
+    {
+        using var values = Registry.CurrentUser.OpenSubKey(ManifestKey, writable: false);
+        var stored = values?.GetValue(key) as string;
+        var launcher = values?.GetValue(key + "-launcher") as string;
+        if (stored is not { Length: 64 } || launcher is not { Length: 64 })
+            return false;
+        try { return StringComparer.OrdinalIgnoreCase.Equals(
+            stored, ManifestDigest(ManifestPath(key))) &&
+            StringComparer.OrdinalIgnoreCase.Equals(
+                launcher, ManifestDigest(InstalledLauncherPath(key))); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { return false; }
+    }
 
     private static string Quote(string value) =>
         "\"" + value.Replace("\"", "\\\"") + "\"";
@@ -46,8 +71,31 @@ internal static class SupervisorControls
                 new JsonSerializerOptions(JsonSerializerDefaults.Web))
             : null;
 
+    // The source checkout is not a logon-time trust boundary. Install a
+    // private, fixed copy of the launcher, refusing silent replacement.
+    private static void WriteLauncher(string source, string destination)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        if (File.Exists(destination))
+        {
+            if (!StringComparer.OrdinalIgnoreCase.Equals(
+                    ManifestDigest(source), ManifestDigest(destination)))
+                throw new InvalidOperationException(
+                    "Installed launcher differs. Remove previous registration first.");
+            return;
+        }
+        var temp = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            File.Copy(source, temp);
+            File.Move(temp, destination);
+        }
+        finally { if (File.Exists(temp)) File.Delete(temp); }
+    }
+
     private static void WriteManifest(string path, SupervisorLaunchManifest manifest)
     {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var existing = ReadManifest(path);
         if (existing is not null)
         {
@@ -114,12 +162,13 @@ internal static class SupervisorControls
         {
             if (!File.Exists(assembly) || !File.Exists(executable))
                 throw new InvalidOperationException("Build the headless host before installation.");
-            var script = FindLaunchScript(assembly);
+            var sourceScript = FindLaunchScript(assembly);
+            var script = InstalledLauncherPath(keyId);
             var launch = StartupCommand(script, keyId);
             if (launch.Length > 260)
                 throw new InvalidOperationException(
-                    "Checkout path is too long for Windows logon startup. Use a shorter install path.");
-            var manifestPath = ManifestPath(script, keyId);
+                    "Private launcher path is too long for Windows logon startup.");
+            var manifestPath = ManifestPath(keyId);
             var manifest = new SupervisorLaunchManifest(
                 executable, assembly, configPath, SupervisorIdentity.For(config));
             using var key = Registry.CurrentUser.CreateSubKey(RunKey, writable: true)
@@ -128,7 +177,22 @@ internal static class SupervisorControls
                 throw new InvalidOperationException(
                     "A different supervisor is already registered for this state directory. " +
                     "Remove that installation explicitly before changing it.");
+            WriteLauncher(sourceScript, script);
             WriteManifest(manifestPath, manifest);
+            using var digests = Registry.CurrentUser.CreateSubKey(ManifestKey, writable: true)
+                ?? throw new InvalidOperationException("Cannot open trusted startup registry.");
+            var digest = ManifestDigest(manifestPath);
+            var scriptDigest = ManifestDigest(script);
+            if (digests.GetValue(keyId + "-launcher") is string oldScript &&
+                !StringComparer.OrdinalIgnoreCase.Equals(oldScript, scriptDigest))
+                throw new InvalidOperationException(
+                    "Registered launcher digest differs. Remove and reinstall deliberately.");
+            if (digests.GetValue(keyId) is string previousDigest &&
+                !StringComparer.OrdinalIgnoreCase.Equals(previousDigest, digest))
+                throw new InvalidOperationException(
+                    "Registered startup manifest digest differs. Remove and reinstall deliberately.");
+            digests.SetValue(keyId, digest, RegistryValueKind.String);
+            digests.SetValue(keyId + "-launcher", scriptDigest, RegistryValueKind.String);
             key.SetValue(valueName, launch, RegistryValueKind.String);
             Console.WriteLine("Per-user logon startup installed. No host was started.");
             return 0;
@@ -136,7 +200,7 @@ internal static class SupervisorControls
 
         if (command == "supervisor-remove")
         {
-            var script = FindLaunchScript(assembly);
+            var script = InstalledLauncherPath(keyId);
             var launch = StartupCommand(script, keyId);
             using var key = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
             if (key?.GetValue(valueName) is string existing)
@@ -147,8 +211,12 @@ internal static class SupervisorControls
                 key.DeleteValue(valueName);
             }
             // This is only a local launcher manifest, not host state or a credential.
-            var manifestPath = ManifestPath(script, keyId);
+            using var digests = Registry.CurrentUser.OpenSubKey(ManifestKey, writable: true);
+            digests?.DeleteValue(keyId, throwOnMissingValue: false);
+            digests?.DeleteValue(keyId + "-launcher", throwOnMissingValue: false);
+            var manifestPath = ManifestPath(keyId);
             if (File.Exists(manifestPath)) File.Delete(manifestPath);
+            if (File.Exists(script)) File.Delete(script);
             Console.WriteLine("Per-user logon startup removed. Running hosts and state were untouched.");
             return 0;
         }
@@ -171,6 +239,7 @@ internal static class SupervisorControls
             {
                 supervisorActive = active,
                 installedForUser = installed,
+                startupManifestVerified = installed && ManifestVerified(keyId),
                 lastRecorded = store.Read(),
                 hostProbe = health.Kind.ToString().ToLowerInvariant(),
                 hostHealth = health.Health

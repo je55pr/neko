@@ -21,12 +21,20 @@ The prepare script builds the host and transport and stages the native runtime
 dependency **without launching a host**. The installer registers a single entry
 for this state directory under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` containing only
-the tracked PowerShell launcher path and a short registration key. An ignored
-`scripts/supervisor-<key>.local.json` manifest retains the absolute executable,
-assembly and private config paths plus the pinned instance identity. The manifest
-contains no access token. Windows limits Run-key commands to 260 characters;
-installation fails safely if the checkout path makes even this short entry too
-long. Installation does **not** start, stop, restart or inspect a live host.
+a private copy of the installed PowerShell launcher and a short registration
+key. The launcher's source checkout cannot be modified to redirect startup
+after installation. A private
+`%LOCALAPPDATA%\Neko\Supervision\supervisor-<key>.local.json` manifest retains
+the absolute executable, assembly and private config paths plus the pinned
+instance identity. The manifest contains no access token, and its SHA-256 digest
+is separately pinned under `HKCU\Software\Neko\SupervisorManifests`. The
+launcher verifies this registry-backed digest *before* executing any path from
+the manifest, so modifying a writable checkout or manifest alone cannot redirect
+logon execution. A digest of the installed private launcher copy is also pinned
+and shown in `supervisor-status` integrity verification. This does not claim security against malware already running
+as the same user, which can also modify that user's registry. Windows limits Run-key commands to 260 characters;
+installation fails safely if the private launcher path makes even this short
+entry too long. Installation does **not** start, stop, restart or inspect a live host.
 The launcher runs at the next supported interactive user logon.
 
 To run supervision interactively, instead of installing automatic startup:
@@ -50,7 +58,8 @@ dotnet run --no-build -c Release --project src/Neko.Headless -- supervisor-remov
 ```
 
 `supervisor-status` reports whether the exclusive supervisor lock is actively
-held, whether a Run entry exists, the last recorded status, and the result of
+held, whether a Run entry exists, whether the private startup manifest still
+matches its registered digest, the last recorded status, and the result of
 an **authenticated, read-only** localhost health probe. The last status is
 historical if the supervisor lock is not held. `supervisor-logs` prints the
 last 60 supervisor events; it never reads transcripts or talks to a provider.
@@ -58,10 +67,13 @@ Local operator-only files live under `stateDirectory/supervision/status.json`
 and `stateDirectory/supervision/supervisor.log`. Existing conversation,
 manager, inbox, review and creation checkpoints remain where they already
 were. Logs and status may contain local lifecycle metadata, not bearer tokens
-or prompt text. Protect the state directory as private data.
+or prompt text. Protect the state directory as private data. Missing supervisor
+log/status directories are reported as empty rather than crashing. Diagnostic
+writes are best-effort, so an inaccessible status or log file cannot terminate
+a healthy host supervisor; the error type is reported to stderr.
 
-Removal deletes the matching per-user Run entry and its ignored local launch
-manifest only. It does not remove host state, pending markers, credentials,
+Removal deletes the matching per-user Run entry, trusted registry digest and
+private local launch manifest only. It does not remove host state, pending markers, credentials,
 private browser profiles, an active supervisor or its child. An installation from another checkout is
 not silently overwritten or removed; use that original checkout to remove
 it first. Keep the checkout and compiled host executable in place while the
@@ -77,7 +89,11 @@ therefore cannot simultaneously own one state directory. If the host lease is
 busy, supervision waits for the existing owner rather than killing it. If the
 localhost port is occupied without the state lease, or a health check returns
 a different authenticated instance identity, supervision blocks rather than
-attaching to an unknown host.
+attaching to an unknown host. If the child launched by this supervisor later
+reports a proven authentication/identity conflict, supervision stops promptly
+with an operator-visible blocked status and child PID, *leaving that child
+running* rather than killing an uncertain host. Investigate and stop it manually
+before attempting another startup.
 
 When a **child process actually exits**, supervision relaunches the normal
 `serve` command with the same config. It backs off 1, 2, 4, 8 and 16
@@ -88,7 +104,9 @@ it is **not** killed or blindly restarted. Startup, crash, port contention,
 health failure and mismatched authentication have distinct status reasons.
 
 The installed launch manifest pins a digest of the original state directory,
-provider configuration, scope, port and access token. If its configuration
+provider configuration, scope, port and access token. The trusted registry also
+pins a separate digest of the manifest bytes to detect changes in runtime,
+assembly or config paths before they can execute at login. If its configuration
 file is later changed, startup refuses to access the newly configured state.
 Remove the old registration and deliberately reinstall after validating
 the new state and copying/backing up evidence. A running supervisor also

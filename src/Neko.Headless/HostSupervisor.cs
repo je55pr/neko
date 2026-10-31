@@ -54,6 +54,7 @@ internal sealed class SupervisorStore
                 new JsonSerializerOptions(JsonSerializerDefaults.Web));
         }
         catch (FileNotFoundException) { return null; }
+        catch (DirectoryNotFoundException) { return null; }
     }
 
     public void Log(string eventName)
@@ -61,6 +62,22 @@ internal sealed class SupervisorStore
         Directory.CreateDirectory(_folder);
         File.AppendAllText(LogFile,
             DateTimeOffset.UtcNow.ToString("O") + " " + eventName + Environment.NewLine);
+    }
+
+    // Telemetry is diagnostic only. A locked or temporarily unwritable status
+    // file must never become a reason to abandon a running healthy host.
+    public void TryWrite(SupervisorStatus status)
+    {
+        try { Write(status); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { Console.Error.WriteLine("Supervisor status unavailable: " + error.GetType().Name); }
+    }
+
+    public void TryLog(string eventName)
+    {
+        try { Log(eventName); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        { Console.Error.WriteLine("Supervisor log unavailable: " + error.GetType().Name); }
     }
 
     public IReadOnlyList<string> Tail(int count = 60)
@@ -79,6 +96,7 @@ internal sealed class SupervisorStore
             return lines.ToArray();
         }
         catch (FileNotFoundException) { return []; }
+        catch (DirectoryNotFoundException) { return []; }
     }
 }
 
@@ -193,7 +211,7 @@ internal sealed class HostSupervisor
     private void Publish(string state, string reason, int? childPid = null,
         HostHealth? health = null, bool healthy = false)
     {
-        _store.Write(new SupervisorStatus(state, reason, _identity, _pid,
+        _store.TryWrite(new SupervisorStatus(state, reason, _identity, _pid,
             childPid, _budget.Count, DateTimeOffset.UtcNow, healthy,
             health?.UncertainConversations, health?.PendingCreation,
             health?.BlockedManagerInboxEntries));
@@ -211,7 +229,7 @@ internal sealed class HostSupervisor
             return 3;
         }
 
-        _store.Log("supervisor_started");
+        _store.TryLog("supervisor_started");
         Publish("starting", "supervisor_started");
         using var probe = new SupervisorHealthProbe(_config);
         try
@@ -222,13 +240,13 @@ internal sealed class HostSupervisor
                 try { fresh = HostConfiguration.Read(_configPath); }
                 catch (Exception)
                 {
-                    _store.Log("configuration_unreadable");
+                    _store.TryLog("configuration_unreadable");
                     Publish("blocked", "configuration_unreadable");
                     return 4;
                 }
                 if (SupervisorIdentity.For(fresh) != _identity)
                 {
-                    _store.Log("configuration_changed_restart_requires_operator");
+                    _store.TryLog("configuration_changed_restart_requires_operator");
                     Publish("blocked", "configuration_changed");
                     return 4;
                 }
@@ -241,7 +259,7 @@ internal sealed class HostSupervisor
                     if (running.Kind is HostProbeKind.DifferentInstance or
                         HostProbeKind.Unauthorized)
                     {
-                        _store.Log("external_owner_configuration_or_auth_mismatch");
+                        _store.TryLog("external_owner_configuration_or_auth_mismatch");
                         Publish("blocked", "external_owner_configuration_or_auth_mismatch");
                         return 5;
                     }
@@ -259,7 +277,7 @@ internal sealed class HostSupervisor
                 if (!SupervisorIdentity.LoopbackPortAvailable(_config.Port))
                 {
                     var conflict = await probe.CheckAsync(token);
-                    _store.Log("port_occupied_without_state_owner");
+                    _store.TryLog("port_occupied_without_state_owner");
                     Publish("blocked", conflict.Kind == HostProbeKind.DifferentInstance
                         ? "port_owned_by_other_configuration"
                         : "port_occupied_without_state_owner");
@@ -273,17 +291,16 @@ internal sealed class HostSupervisor
                 }
                 catch (Exception)
                 {
-                    _store.Log("host_process_launch_failed");
+                    _store.TryLog("host_process_launch_failed");
                     Publish("blocked", "host_process_launch_failed");
                     return 5;
                 }
                 using (child)
                 {
-                    _store.Log("host_process_launched");
+                    _store.TryLog("host_process_launched");
                     Publish("starting", "waiting_for_readiness", child.Id);
                     var started = DateTimeOffset.UtcNow;
                     var exited = child.WaitForExitAsync(token);
-                    bool fatalConflict = false;
                     string? lastReason = null;
                     while (!child.HasExited && !token.IsCancellationRequested)
                     {
@@ -299,10 +316,19 @@ internal sealed class HostSupervisor
                         };
                         if (check.Kind is HostProbeKind.DifferentInstance or
                             HostProbeKind.Unauthorized)
-                            fatalConflict = true;
+                        {
+                            // An authenticated identity conflict is not a
+                            // transient health failure. Never kill an uncertain
+                            // child or launch another one; leave its PID in a
+                            // durable blocked record for manual diagnosis.
+                            _store.TryLog("health_conflict_requires_operator");
+                            Publish("blocked", "health_conflict_child_left_running",
+                                child.Id);
+                            return 5;
+                        }
                         if (reason != lastReason)
                         {
-                            _store.Log("host_health_" + reason);
+                            _store.TryLog("host_health_" + reason);
                             lastReason = reason;
                         }
                         var healthy = check.Kind == HostProbeKind.Ready;
@@ -318,23 +344,17 @@ internal sealed class HostSupervisor
                     // HasExited gates restart. No remote activity, receipt replay,
                     // optimistic state clearing or premature child kill occurs.
                     var exitCode = child.ExitCode;
-                    _store.Log("host_process_exited_code_" + exitCode);
+                    _store.TryLog("host_process_exited_code_" + exitCode);
                     Publish("exited", "host_process_exited", child.Id);
-                    if (fatalConflict)
-                    {
-                        _store.Log("health_conflict_requires_operator");
-                        Publish("blocked", "health_conflict_requires_operator");
-                        return 5;
-                    }
                 }
 
                 if (!_budget.TrySchedule(DateTimeOffset.UtcNow, out var delay))
                 {
-                    _store.Log("restart_budget_exhausted");
+                    _store.TryLog("restart_budget_exhausted");
                     Publish("exhausted", "restart_budget_exhausted");
                     return 6;
                 }
-                _store.Log("restart_scheduled");
+                _store.TryLog("restart_scheduled");
                 Publish("backoff", "process_exited_restarting");
                 await Task.Delay(delay, token);
             }
@@ -342,7 +362,7 @@ internal sealed class HostSupervisor
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         // Stop does not kill the host. The host's exclusive lease remains its
         // own responsibility and a new supervisor will observe an external owner.
-        _store.Log("supervisor_stopped_host_not_killed");
+        _store.TryLog("supervisor_stopped_host_not_killed");
         Publish("stopped", "supervisor_stopped_host_not_killed");
         return 0;
     }

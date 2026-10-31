@@ -10,6 +10,32 @@ namespace Neko.Headless.Tests;
 public sealed class SupervisorTests
 {
     [Fact]
+    public void FreshStatusAndLogReadsDoNotRequireExistingSupervisionDirectory()
+    {
+        using var folder = new TestFolder();
+        var store = new SupervisorStore(Path.Combine(folder.Path, "fresh-state"));
+        Assert.Null(store.Read());
+        Assert.Empty(store.Tail());
+    }
+
+    [Fact]
+    public void UnavailableTelemetryFilesDoNotPreventSupervisorStatusAndLogging()
+    {
+        using var folder = new TestFolder();
+        var root = Path.Combine(folder.Path, "supervision");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(Path.Combine(root, "status.json"));
+        Directory.CreateDirectory(Path.Combine(root, "supervisor.log"));
+        var store = new SupervisorStore(folder.Path);
+        var status = new SupervisorStatus("running", "test", "instance", 1,
+            2, 0, DateTimeOffset.UtcNow);
+        store.TryWrite(status); // locked/unwritable destination must fail safely
+        store.TryLog("host_alive");
+        Assert.True(Directory.Exists(Path.Combine(root, "status.json")));
+        Assert.Empty(Directory.GetFiles(root, "*.tmp"));
+    }
+
+    [Fact]
     public void RestartBudgetIsBoundedAndRecoversOnlyOutsideSlidingWindow()
     {
         var budget = new SupervisorRestartBudget();
@@ -53,9 +79,31 @@ public sealed class SupervisorTests
         Assert.DoesNotContain(config.AccessToken, launch);
         Assert.DoesNotContain(folder.Path, launch);
         Assert.True(launch.Length <= 260);
-        Assert.EndsWith("supervisor-" + key + ".local.json",
-            SupervisorControls.ManifestPath(@"C:\some folder\launch.ps1", key));
+        var manifestPath = SupervisorControls.ManifestPath(key);
+        Assert.EndsWith("supervisor-" + key + ".local.json", manifestPath);
+        Assert.StartsWith(Environment.GetFolderPath(
+            Environment.SpecialFolder.LocalApplicationData), manifestPath,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(Path.Combine("Neko", "Supervision"), manifestPath,
+            StringComparison.OrdinalIgnoreCase);
+        var installedScript = SupervisorControls.InstalledLauncherPath(key);
+        Assert.StartsWith(Path.GetDirectoryName(manifestPath)!, installedScript,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.EndsWith("supervisor-launch-" + key + ".ps1", installedScript);
+        Assert.True(SupervisorControls.StartupCommand(installedScript, key).Length <= 260);
         Assert.Contains("-WindowStyle Hidden", launch);
+    }
+
+    [Fact]
+    public void StartupManifestDigestDetectsTampering()
+    {
+        using var folder = new TestFolder();
+        var source = Path.Combine(folder.Path, "startup.local.json");
+        File.WriteAllText(source, "{\"runtime\":\"trusted\"}");
+        var original = SupervisorControls.ManifestDigest(source);
+        Assert.Equal(64, original.Length);
+        File.WriteAllText(source, "{\"runtime\":\"replaced\"}");
+        Assert.NotEqual(original, SupervisorControls.ManifestDigest(source));
     }
 
     [Fact]
@@ -223,7 +271,7 @@ public sealed class SupervisorTests
         : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request, CancellationToken cancellationToken) =>
+            HttpRequestMessage request, CancellationToken _) =>
             Task.FromResult(reply(request));
     }
 
