@@ -656,6 +656,7 @@ public sealed partial class HeadlessRuntimeTests
         public int? RateLimitRetryAfterSeconds { get; set; }
         public int ReadCalls;
         public int SendCalls;
+        public int ManagerCreationCalls;
         public TaskCompletionSource<SendReceipt>? PendingCreate { get; set; }
         public TaskCompletionSource<SendReceipt>? PendingSend;
         public void Publish(PublicConversationUpdate update) =>

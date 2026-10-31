@@ -10,9 +10,8 @@ public sealed partial class HeadlessRuntimeTests
 {
     private sealed partial class FakeProvider
     {
-        public int ManagerCreationCalls;
-        public bool RejectNextManagerCreation;
-        public string? ManagerCreationConversationIdOverride;
+        public bool RejectNextManagerCreation { get; set; }
+        public string? ManagerCreationConversationIdOverride { get; set; }
     }
 
     [Fact]
