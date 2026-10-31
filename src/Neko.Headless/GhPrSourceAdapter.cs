@@ -11,6 +11,7 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
 {
     private readonly string? _trustedExecutable;
     private readonly PrReviewPolicy? _policy;
+    private readonly Func<CancellationToken, string[], Task<JsonDocument>>? _testSource;
 
     // This is an opt-in adapter: missing configuration disables external PR
     // operations without preventing legacy headless hosting.
@@ -24,6 +25,15 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
                 Path.GetFileName(trustedExecutable), OperatingSystem.IsWindows() ? "gh.exe" : "gh"))
             throw new ArgumentException("A trusted absolute PR CLI executable is required.");
         _trustedExecutable = Path.GetFullPath(trustedExecutable);
+    }
+
+    // Tests exercise ReadAsync's complete source classification with synthetic
+    // GitHub responses. Production still uses the validated local gh executable.
+    internal GhPrSourceAdapter(PrReviewPolicy policy,
+        Func<CancellationToken, string[], Task<JsonDocument>> testSource)
+    {
+        _policy = policy;
+        _testSource = testSource;
     }
 
     // Trust only the allowlisted canonical identifier from local host policy.
@@ -46,6 +56,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     private async Task<JsonDocument> ApiAsync(
         CancellationToken cancellation, params string[] args)
     {
+        if (_testSource is not null)
+            return await _testSource(cancellation, args);
         if (_trustedExecutable is null)
             throw new InvalidOperationException("External PR adapter is not configured.");
         // The executable is validated as an existing fully-qualified local
