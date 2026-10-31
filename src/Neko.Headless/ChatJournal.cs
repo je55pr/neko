@@ -129,23 +129,8 @@ internal sealed class ChatJournal
 
     private void WriteCreationPending(CreationPendingRecord updated)
     {
-            _beforeCreationPersist?.Invoke(updated);
-            var file=Path.Combine(_directory,"creation.pending");
-            var temp=file+"."+Guid.NewGuid().ToString("N")+".tmp";
-            try
-            {
-                using(var stream=new FileStream(temp,FileMode.CreateNew,FileAccess.Write))
-                {
-                    using(var writer=new StreamWriter(stream,new UTF8Encoding(false),leaveOpen:true))
-                    {
-                        writer.Write(JsonSerializer.Serialize(updated));
-                        writer.Flush();
-                    }
-                    stream.Flush(flushToDisk:true);
-                }
-                File.Move(temp,file,true);
-            }
-            finally { if(File.Exists(temp))File.Delete(temp); }
+        _beforeCreationPersist?.Invoke(updated);
+        WriteAtomic(Path.Combine(_directory, "creation.pending"), updated);
     }
 
     public void ClearCreation()
@@ -154,6 +139,21 @@ internal sealed class ChatJournal
         {
             var path = Path.Combine(_directory, "creation.pending");
             if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    // The identity check and removal are one critical section. Otherwise a
+    // concurrent creation could replace the guard between read and delete.
+    public bool ClearCorrelatedCreation(string ownerId, string conversationId)
+    {
+        lock (_gate)
+        {
+            var pending = GetPendingCreation();
+            if (pending?.OwnerId != ownerId ||
+                pending.CorrelatedConversationId != conversationId)
+                return false;
+            File.Delete(Path.Combine(_directory, "creation.pending"));
+            return true;
         }
     }
 
@@ -190,28 +190,32 @@ internal sealed class ChatJournal
         lock (_gate)
         {
             _beforePersist?.Invoke(record);
-            var file = FileName(record.Id);
-            var temp = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            try
-            {
-                // Persist the new checkpoint before replacing the previous
-                // one. A crash must not lose the last safe delivery state.
-                using (var stream=new FileStream(temp,FileMode.CreateNew,
-                           FileAccess.Write,FileShare.None))
-                {
-                    using (var writer=new StreamWriter(stream,new UTF8Encoding(false),
-                               leaveOpen:true))
-                    {
-                        writer.Write(JsonSerializer.Serialize(record with {
-                            UpdatedAt=DateTimeOffset.UtcNow }));
-                        writer.Flush();
-                    }
-                    stream.Flush(flushToDisk:true);
-                }
-                File.Move(temp, file, true);
-            }
-            finally { if (File.Exists(temp)) File.Delete(temp); }
+            WriteAtomic(FileName(record.Id),
+                record with { UpdatedAt = DateTimeOffset.UtcNow });
         }
+    }
+
+    // Shared durable checkpoint protocol for conversation journals and
+    // creation markers. Faults must leave the previous file intact.
+    private static void WriteAtomic<T>(string file, T value)
+    {
+        var temp = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew,
+                       FileAccess.Write, FileShare.None))
+            {
+                using (var writer = new StreamWriter(stream,
+                           new UTF8Encoding(false), leaveOpen: true))
+                {
+                    writer.Write(JsonSerializer.Serialize(value));
+                    writer.Flush();
+                }
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, file, overwrite: true);
+        }
+        finally { if (File.Exists(temp)) File.Delete(temp); }
     }
 
     private ChatRecord? Read(string file)
