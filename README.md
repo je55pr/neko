@@ -181,9 +181,11 @@ dotnet run --no-build -c Release --project src/Neko.Headless -- reconcile-creati
 
 Corresponding authenticated JSON API operations are `POST
 /conversations/{id}/reconcile`, `POST /managers/{name}/reconcile`, and
-`POST /conversations/creation/reconcile`. These return `outcome` and
-`reason` (`restored`, `blocked`, or `not_applicable`). A manager's
-result also includes its registry snapshot. Only an exact newly observed user
+`POST /conversations/creation/reconcile`. These return an `outcome`
+(`restored`, `blocked`, or `not_applicable`) and a `reason` explaining it.
+Manager reconciliation may also return `guard_cleared` when an already
+persisted, server-correlated manager binding safely releases a stranded global
+creation guard after a crash. Manager results include the registry snapshot. Only an exact newly observed user
 message, proven submission correlation, fresh authoritative history, and an
 independent remote terminal-success state can restore `idle`; the durable
 journal update must succeed first. The provider must implement the optional
