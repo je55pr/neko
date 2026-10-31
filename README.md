@@ -65,8 +65,8 @@ fields are unchanged. Additive fields:
 | `lastPublicUpdateAt` | UTC time the host most recently published a public update |
 | `publicEventCount` | Number of accepted public-feed events this process observed for this turn, including a host-generated terminal `Fail` when a stream ends unexpectedly |
 | `lastPublicUpdateType` | Public event kind and operation, e.g. `Final.Append` or `Activity.Start`; no text, title, message ID, or tool details |
-| `isTerminal` | Whether the public event feed ended with `Final.Complete` or `Final.Fail` |
-| `terminalOperation` | `Complete` or `Fail` when such a terminal update was published |
+| `isTerminal` | Whether the public event feed ended with `Final.Complete`, `Final.Fail`, or `Final.ObservationExpired` |
+| `terminalOperation` | `Complete`, `Fail`, or `ObservationExpired` when such a terminal update was published |
 
 For a live turn with **zero public events**, `publicEventCount` is `0`;
 the last-update fields are `null`, and elapsed time still increases.
@@ -147,9 +147,57 @@ restart, with no automatic replay. A crash after successful remote creation
 but before persisting its manager binding can leave an unresolved manager
 alongside a separately journaled conversation; reconciliation requires
 operator evidence, not an automatic guess. Existing conversation endpoints,
-CLI responses, and their at-most-once safeguards are unchanged. No inbox,
-background worker orchestration, rollover, or automatic uncertain recovery
-is implemented by this change.
+CLI responses, and their at-most-once safeguards are unchanged. Manager
+rollover and automatic uncertain recovery are not implemented.
+
+### Durable manager inbox
+
+Use the inbox to accept work when a manager is busy, offline, or still being
+created. An HTTP **202** enqueue response means *durably queued locally*,
+not submitted remotely. Each message has a stable ID and creation sequence.
+An optional `idempotencyKey` is unique within that manager; resubmitting
+identical text with the same key returns the same entry (HTTP 200), while
+a different payload with that key returns HTTP 409. Keys contain up to 128
+ASCII letters, digits, `-`, `_`, `.`, or `:`.
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/managers/main/inbox` | POST | `{"text":"Next task","idempotencyKey":"request-42"}`; persist before acknowledgement |
+| `/managers/main/inbox` | GET | List ordered delivery metadata without message text |
+| `/managers/main/inbox/{messageId}` | GET | Inspect one message's state, timestamps, correlation, and receipt evidence |
+| `/managers/main/inbox/{messageId}/cancel` | POST | Cancel only while still queued; otherwise 409 |
+| `/managers/main/inbox/{messageId}/retry` | POST | Explicitly requeue only a definitively rejected, retryable submission; otherwise 409 |
+
+The CLI equivalents are `manager-queue manager/main "text" --key request-42`,
+`manager-messages manager/main`, `manager-message manager/main <id>`,
+`manager-cancel manager/main <id>`, and `manager-retry manager/main <id>`.
+
+State progression is `queued` -> `dispatching` -> `accepted` ->
+`generating` -> `completed` for a verified successful turn. Other outcomes
+are `rejected` (definitive, no provider acceptance), `uncertain` (blocked
+until exact authoritative reconciliation), and `cancelled` (never sent).
+The single in-flight worker dispatches only entries still definitively queued;
+later queued messages wait for the preceding accepted turn to finish.
+A definitive rejection terminates that attempt without permanently stalling
+later messages. Manual retry rearms that same logical message and retains its
+previous receipt evidence. Known cooldowns prevent premature submission; an
+unreadable remote history requeues without claiming it was sent.
+
+A crash between dispatch reservation and verified receipt, or failure of
+receipt persistence, leaves an uncertainty guard, **not** a replayable queue
+entry. The existing `reconcile-manager manager/main` command and
+`POST /managers/main/reconcile` are the only remote reconciliation path.
+Only a durable verification of the exact operation ID can unblock the inbox.
+No background reconciliation or resubmission of accepted/uncertain work occurs.
+
+The journal resides under untracked `stateDirectory/manager-inbox/`,
+protected by the existing exclusive host lease. It retains message text,
+including completed entries, and metadata locally; authenticated API
+list/inspect responses exclude the text. Retention and bounded archive
+compaction are not yet implemented, so very large journals require monitoring.
+The older `/managers/main/messages` endpoint remains available for immediate
+guarded sends, but returns `manager_inbox_pending` while an inbox message
+is outstanding, protecting its unconsumed completion evidence.
 
 ## Architecture and reliability
 

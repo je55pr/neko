@@ -23,19 +23,29 @@ internal static class LocalClient
         HttpClient client, string command, string[] args, TextWriter output, TextWriter error)
     {
         var positional = new List<string>();
-        var skipConfigValue = false;
-        for (var i = 1; i < args.Length; i++)
+        string? idempotencyKey = null;
+        var i = 1;
+        while (i < args.Length)
         {
-            if (skipConfigValue) { skipConfigValue = false; continue; }
             if (args[i] == "--config")
             {
                 if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
                     throw new ArgumentException("--config requires a file path.");
-                skipConfigValue = true;
+                i += 2;
                 continue;
             }
-            if (args[i] == "--wait") continue;
+            if (args[i] == "--wait") { i++; continue; }
+            if (args[i] == "--key")
+            {
+                if (command != "manager-queue" || i + 1 >= args.Length ||
+                    args[i + 1].StartsWith("--"))
+                    throw new ArgumentException("--key requires a value for manager-queue.");
+                idempotencyKey ??= args[i + 1];
+                i += 2;
+                continue;
+            }
             positional.Add(args[i]);
+            i++;
         }
 
         var wait = args.Contains("--wait");
@@ -80,6 +90,25 @@ internal static class LocalClient
                 route = $"managers/{Uri.EscapeDataString(name)}/reconcile";
                 method = HttpMethod.Post;
                 break;
+            case "manager-queue" when positional.Count == 2:
+                route = $"managers/{ManagerName(positional[0])}/inbox";
+                method = HttpMethod.Post;
+                body = JsonSerializer.Serialize(new { text = positional[1], idempotencyKey });
+                break;
+            case "manager-messages" when positional.Count == 1:
+                route = $"managers/{ManagerName(positional[0])}/inbox";
+                break;
+            case "manager-message" when positional.Count == 2:
+                route = $"managers/{ManagerName(positional[0])}/inbox/{Uri.EscapeDataString(positional[1])}";
+                break;
+            case "manager-cancel" when positional.Count == 2:
+                route = $"managers/{ManagerName(positional[0])}/inbox/{Uri.EscapeDataString(positional[1])}/cancel";
+                method = HttpMethod.Post;
+                break;
+            case "manager-retry" when positional.Count == 2:
+                route = $"managers/{ManagerName(positional[0])}/inbox/{Uri.EscapeDataString(positional[1])}/retry";
+                method = HttpMethod.Post;
+                break;
             case "watch" when positional.Count == 1:
                 await WatchAsync(client, positional[0]);
                 return 0;
@@ -109,6 +138,10 @@ internal static class LocalClient
         if (id is not null) await WatchAsync(client, id);
         return 0;
     }
+
+    private static string ManagerName(string id) =>
+        Uri.EscapeDataString(id.StartsWith("manager/", StringComparison.Ordinal)
+            ? id["manager/".Length..] : id);
 
     // A pending transcript is an explicit, successful HTTP read state rather than
     // an unknown conversation or a fabricated empty history.

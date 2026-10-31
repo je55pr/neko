@@ -23,6 +23,57 @@ internal sealed class ManagerService
     private readonly ManagerRegistry _registry;
     private readonly ChatRuntime _runtime;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sendGates = new();
+    private readonly ConcurrentDictionary<string, string> _inboxBlocks = new();
+    private ManagerInboxJournal? _inboxJournal;
+
+    // The inbox remains the authoritative source for outstanding messages.
+    // Legacy direct sends may resume only after it consumes the exact turn.
+    public void AttachInboxJournal(ManagerInboxJournal journal) =>
+        _inboxJournal = journal;
+
+    // If the inbox reserved a remote dispatch but the process died before the
+    // manager journal took over, fail closed even if the conversation is idle.
+    // Keep an in-process latch if registry storage itself is unavailable.
+    public void BlockForInboxUncertainty(string id, string operationId)
+    {
+        if (_registry.Get(id) is null) return;
+        _inboxBlocks[id] = operationId;
+        try
+        {
+            _registry.Update(id, record =>
+                record.LifecycleState is "idle" or "generating" or "sending"
+                    ? record with { LifecycleState = "uncertain",
+                        PendingOperationId = operationId } : record);
+        }
+        catch (IOException)
+        {
+            // The inbox journal is already uncertain on disk, and the
+            // process-local block was established before this failed write.
+            // Do not make the service unusable or permit another send.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Keep the in-process block; the durable inbox guard is retained.
+        }
+    }
+
+    private void ReleaseVerifiedInboxBlock(string id, string conversationId)
+    {
+        if (!_inboxBlocks.TryGetValue(id, out var operationId)) return;
+        var record = _runtime.Get(conversationId);
+        if (record?.Status == "idle" &&
+            record.LastReconciliation is { Outcome: "restored" } proof &&
+            proof.OperationId == operationId)
+            _inboxBlocks.TryRemove(id, out _);
+    }
+
+    // Called only after the inbox has durably consumed the exact restored turn.
+    public void ConfirmVerifiedInboxCompletion(
+        string id, string conversationId, string operationId)
+    {
+        if (_inboxBlocks.TryGetValue(id, out var blocked) && blocked == operationId)
+            ReleaseVerifiedInboxBlock(id, conversationId);
+    }
 
     public ManagerService(ManagerRegistry registry, ChatRuntime runtime)
     {
@@ -122,7 +173,8 @@ internal sealed class ManagerService
     }
 
     public async Task<ManagerSendResult?> SendAsync(
-        string id, string text, CancellationToken cancellation)
+        string id, string text, CancellationToken cancellation,
+        string? operationId = null)
     {
         // Unknown names must not allocate permanent per-manager gates.
         if (_registry.Get(id) is null) return null;
@@ -132,6 +184,12 @@ internal sealed class ManagerService
         {
             var current = Get(id);
             if (current is null) return null;
+            if (_inboxBlocks.ContainsKey(id))
+                return new ManagerSendResult(current,
+                    new SendReceipt(SendDisposition.Rejected, "inbox_uncertainty_blocked"));
+            if (operationId is null && _inboxJournal?.HasOutstanding(id) == true)
+                return new ManagerSendResult(current,
+                    new SendReceipt(SendDisposition.Rejected, "manager_inbox_pending"));
             if (current.ConversationId is null || current.LifecycleState != "idle")
                 return new ManagerSendResult(current,
                     new SendReceipt(SendDisposition.Rejected, "manager_not_idle"));
@@ -141,7 +199,7 @@ internal sealed class ManagerService
 
             // Persist the guard before the remote operation, including before
             // potentially slow history preflight. A crash requires review.
-            var operationId = Guid.NewGuid().ToString("N");
+            operationId ??= Guid.NewGuid().ToString("N");
             _registry.Update(id, record => record with {
                 LifecycleState = "sending", PendingOperationId = operationId
             });
@@ -187,8 +245,12 @@ internal sealed class ManagerService
                 return new(Get(id)!, new("guard_cleared",
                     "durable_creation_binding", current.ConversationId));
             if (current.LifecycleState != "uncertain")
+            {
+                if (current.ConversationId is not null)
+                    ReleaseVerifiedInboxBlock(id, current.ConversationId);
                 return new(current, new("not_applicable", "manager_not_uncertain",
                     current.ConversationId));
+            }
             if (current.ConversationId is null)
             {
                 var creation = await _runtime.ReconcileCreationAsync(id, cancellation);
@@ -214,6 +276,7 @@ internal sealed class ManagerService
                     record.LifecycleState == "uncertain" &&
                     record.ConversationId == resolved.ConversationId
                         ? record with { LifecycleState = "idle" } : record);
+                ReleaseVerifiedInboxBlock(id, resolved.ConversationId);
                 return new(Snapshot(updated), resolved);
             }
             return new(Get(id)!, resolved);
@@ -259,6 +322,11 @@ internal sealed class ManagerService
                 record = _registry.RefreshLifecycle(
                     record.Id, record.LifecycleState, journalState);
         }
+
+        // A failed registry checkpoint must not make a locally blocked
+        // manager appear idle to status clients.
+        if (_inboxBlocks.ContainsKey(record.Id))
+            record = record with { LifecycleState = "uncertain" };
 
         return new ManagerSnapshot(record.Id, record.ConversationId,
             record.LifecycleState,

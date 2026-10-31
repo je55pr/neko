@@ -1,0 +1,453 @@
+using System.Net;
+using System.Text.Json;
+using Neko;
+using Neko.Headless;
+
+namespace Neko.Headless.Tests;
+
+public sealed partial class HeadlessRuntimeTests
+{
+    private static ChatRuntime InboxRuntime(string folder, FakeProvider provider) =>
+        new(new ScopedConversationProvider(provider, "scope-a"), new ChatJournal(folder));
+
+    private static async Task<ManagerService> CreateIdleManager(
+        ChatRuntime runtime, string folder)
+    {
+        var managers = new ManagerService(new ManagerRegistry(folder), runtime);
+        Assert.Equal(SendDisposition.Accepted,
+            (await managers.CreateAsync("manager/main", "initial", CancellationToken.None))
+                .Receipt.Disposition);
+        await WaitForTerminal(runtime, "chat-1");
+        Assert.Equal("idle", managers.Get("manager/main")?.LifecycleState);
+        return managers;
+    }
+
+    [Fact]
+    public async Task ConcurrentIdempotencyReservationsHaveOneStableIdAcrossRestart()
+    {
+        using var folder = new TemporaryDirectory();
+        var journal = new ManagerInboxJournal(folder.Path);
+        var results = await Task.WhenAll(Enumerable.Range(0, 25).Select(_ =>
+            Task.Run(() => journal.Enqueue("manager/main", "hello", "key-1"))));
+        Assert.Single(results.Select(r => r.Message.Id).Distinct());
+        Assert.Single(journal.List("manager/main"));
+        Assert.Equal(InboxEnqueueStatus.Duplicate,
+            new ManagerInboxJournal(folder.Path).Enqueue("manager/main", "hello", "key-1").Status);
+        Assert.Equal(InboxEnqueueStatus.Conflict,
+            journal.Enqueue("manager/main", "different", "key-1").Status);
+        Assert.Single(journal.List("manager/main"));
+        var another = journal.Enqueue("manager/second", "another", "key-1");
+        Assert.Equal(InboxEnqueueStatus.Enqueued, another.Status);
+        Assert.Equal(1, another.Message.Sequence);
+    }
+
+    [Fact]
+    public async Task BusyManagerKeepsOrderedBacklogUntilEachTurnCompletes()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider { DeferCompletion = true };
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = new ManagerService(new ManagerRegistry(folder.Path), runtime);
+        await managers.CreateAsync("manager/main", "initial", CancellationToken.None);
+        using var inbox = new ManagerInboxService(new ManagerInboxJournal(folder.Path),
+            managers, runtime);
+        var first = inbox.Enqueue("manager/main", "one", "a").Result!.Message;
+        var second = inbox.Enqueue("manager/main", "two", "b").Result!.Message;
+        Assert.Equal("queued", first.State);
+        Assert.Equal(2, second.Sequence);
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(0, provider.SendCalls);
+
+        provider.CompletePending();
+        await WaitForTerminal(runtime, "chat-1");
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(1, provider.SendCalls);
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("queued", inbox.Get("manager/main", second.Id)!.State);
+
+        provider.CompletePending();
+        await WaitForTerminal(runtime, "chat-1");
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("completed", inbox.Get("manager/main", first.Id)!.State);
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(2, provider.SendCalls);
+        provider.CompletePending();
+        await WaitForTerminal(runtime, "chat-1");
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("completed", inbox.Get("manager/main", second.Id)!.State);
+        Assert.Equal(2, provider.SendCalls);
+    }
+
+    [Fact]
+    public async Task OfflineHistoryRemainsQueuedWithCooldownAndNoProviderSend()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        var clock = new InboxClock();
+        using var inbox = new ManagerInboxService(
+            new ManagerInboxJournal(folder.Path, clock), managers, runtime, clock);
+        var message = inbox.Enqueue("manager/main", "later").Result!.Message;
+        provider.ReturnNullHistory = true;
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(0, provider.SendCalls);
+        Assert.Equal("queued", inbox.Get("manager/main", message.Id)!.State);
+        Assert.NotNull(inbox.Get("manager/main", message.Id)!.NotBefore);
+        provider.ReturnNullHistory = false;
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        clock.AdvanceSeconds(16);
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(1, provider.SendCalls);
+        await WaitForTerminal(runtime, "chat-1");
+    }
+
+    [Fact]
+    public async Task ExplicitRetryAfterDefinitiveRejectionHonorsCooldown()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        var clock = new InboxClock();
+        using var inbox = new ManagerInboxService(
+            new ManagerInboxJournal(folder.Path, clock), managers, runtime, clock);
+        var message = inbox.Enqueue("manager/main", "rate limited").Result!.Message;
+        provider.PendingSend = new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        provider.PendingSend.SetResult(new SendReceipt(SendDisposition.Rejected, "rate_limited")
+            { Retryable = true, RetryAfterSeconds = 120 });
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("rejected", inbox.Get("manager/main", message.Id)!.State);
+        Assert.Equal(1, provider.SendCalls);
+        Assert.Single(inbox.Get("manager/main", message.Id)!.Attempts!);
+        Assert.Equal("rejected", inbox.Get("manager/main", message.Id)!.Attempts![0].Disposition);
+        provider.PendingSend = null;
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("queued", inbox.Retry("manager/main", message.Id)!.State);
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(1, provider.SendCalls);
+        clock.AdvanceSeconds(121);
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(2, provider.SendCalls);
+        await WaitForTerminal(runtime, "chat-1");
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("completed", inbox.Get("manager/main", message.Id)!.State);
+        Assert.Equal(2, inbox.Get("manager/main", message.Id)!.Attempts!.Count);
+    }
+
+    [Fact]
+    public async Task UncertainReceiptNeverAutoReplaysOrAllowsExplicitRetry()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider { UncertainNextSend = true };
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        using var inbox = new ManagerInboxService(new ManagerInboxJournal(folder.Path),
+            managers, runtime);
+        var message = inbox.Enqueue("manager/main", "uncertain").Result!.Message;
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("uncertain", inbox.Get("manager/main", message.Id)!.State);
+        Assert.Null(inbox.Retry("manager/main", message.Id));
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(1, provider.SendCalls);
+    }
+
+    [Fact]
+    public async Task InterruptedDispatchBlocksManagerEvenWhenRuntimeIsIdle()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        var journal = new ManagerInboxJournal(folder.Path);
+        var message = journal.Enqueue("manager/main", "never replay", null).Message;
+        journal.Transition("manager/main", message.Id, InboxStates.Queued,
+            m => m with { State = InboxStates.Dispatching });
+        using var recoveredInbox = new ManagerInboxService(
+            new ManagerInboxJournal(folder.Path), managers, runtime);
+        Assert.Equal("uncertain", recoveredInbox.Get("manager/main", message.Id)!.State);
+        Assert.Equal("uncertain", managers.Get("manager/main")!.LifecycleState);
+        Assert.Equal("inbox_uncertainty_blocked",
+            (await managers.SendAsync("manager/main", "legacy must block",
+                CancellationToken.None))!.Receipt.Reason);
+        Assert.False(await recoveredInbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(0, provider.SendCalls);
+        Assert.Equal("uncertain",
+            new ManagerInboxJournal(folder.Path).Get("manager/main", message.Id)!.State);
+    }
+
+    [Fact]
+    public async Task PersistenceFailureBeforeDispatchCannotReachProvider()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        var journal = new ManagerInboxJournal(folder.Path,
+            beforePersist: message => {
+                if (message.State == InboxStates.Dispatching)
+                    throw new IOException("Simulated disk fault");
+            });
+        using var inbox = new ManagerInboxService(journal, managers, runtime);
+        var message = inbox.Enqueue("manager/main", "saved first").Result!.Message;
+        await Assert.ThrowsAsync<IOException>(() =>
+            inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("queued", journal.Get("manager/main", message.Id)!.State);
+        Assert.Equal(0, provider.SendCalls);
+    }
+
+    [Fact]
+    public async Task PersistenceFailureAfterRemoteAcceptanceNeverReplaysOnRestart()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        var journal = new ManagerInboxJournal(folder.Path,
+            beforePersist: message => {
+                if (message.State == InboxStates.Accepted)
+                    throw new IOException("Simulated acknowledgement loss");
+            });
+        var messageId = "";
+        using (var inbox = new ManagerInboxService(journal, managers, runtime))
+        {
+            messageId = inbox.Enqueue("manager/main", "accepted once").Result!.Message.Id;
+            await Assert.ThrowsAsync<IOException>(() =>
+                inbox.ProcessAsync("manager/main", CancellationToken.None));
+            Assert.Equal(InboxStates.Uncertain, journal.Get("manager/main", messageId)!.State);
+            Assert.Equal(1, provider.SendCalls);
+            await WaitForTerminal(runtime, "chat-1");
+        }
+        using var recovered = new ManagerInboxService(
+            new ManagerInboxJournal(folder.Path), managers, runtime);
+        Assert.Equal("uncertain", recovered.Get("manager/main", messageId)!.State);
+        Assert.False(await recovered.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(1, provider.SendCalls);
+    }
+
+    [Fact]
+    public async Task ConcurrentWorkersAndCancellationRespectSingleDispatch()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        using var inbox = new ManagerInboxService(new ManagerInboxJournal(folder.Path),
+            managers, runtime);
+        var canceled = inbox.Enqueue("manager/main", "cancel").Result!.Message;
+        Assert.Equal("cancelled", inbox.Cancel("manager/main", canceled.Id)!.State);
+        Assert.Null(inbox.Cancel("manager/main", canceled.Id));
+
+        var one = inbox.Enqueue("manager/main", "first").Result!.Message;
+        var two = inbox.Enqueue("manager/main", "second").Result!.Message;
+        provider.PendingSend = new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var processing = inbox.ProcessAsync("manager/main", CancellationToken.None);
+        for (var i = 0; i < 100 && provider.SendCalls == 0; i++)
+            await Task.Delay(5);
+        Assert.Equal(1, provider.SendCalls);
+        var simultaneous = inbox.ProcessAsync("manager/main", CancellationToken.None);
+        Assert.False(simultaneous.IsCompleted);
+        Assert.Null(inbox.Cancel("manager/main", one.Id));
+        provider.PendingSend.SetResult(new SendReceipt(SendDisposition.Rejected, "rejected"));
+        await processing;
+        await simultaneous;
+        Assert.Equal(2, provider.SendCalls);
+        Assert.Equal("rejected", inbox.Get("manager/main", two.Id)!.State);
+    }
+
+    [Fact]
+    public async Task InboxEndpointDistinguishesLocalAckDuplicateConflictAndCancellation()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        using var inbox = new ManagerInboxService(new ManagerInboxJournal(folder.Path),
+            managers, runtime);
+        var (status, body) = await ExecuteManagerResult(ManagerEndpoints.EnqueueInbox(
+            inbox, "main", new InboxEnqueueRequest("confidential message", "request:1")));
+        Assert.Equal(202, status);
+        using var parsed = JsonDocument.Parse(body);
+        Assert.Equal("queued",
+            parsed.RootElement.GetProperty("message").GetProperty("state").GetString());
+        Assert.DoesNotContain("confidential message", body);
+        var id = parsed.RootElement.GetProperty("message").GetProperty("id").GetString()!;
+        Assert.Equal(200, (await ExecuteManagerResult(ManagerEndpoints.EnqueueInbox(
+            inbox, "main", new InboxEnqueueRequest("confidential message", "request:1")))).Status);
+        Assert.Equal(409, (await ExecuteManagerResult(ManagerEndpoints.EnqueueInbox(
+            inbox, "main", new InboxEnqueueRequest("other", "request:1")))).Status);
+        Assert.Equal(200, (await ExecuteManagerResult(ManagerEndpoints.CancelInbox(
+            inbox, "main", id))).Status);
+        Assert.Equal(409, (await ExecuteManagerResult(ManagerEndpoints.CancelInbox(
+            inbox, "main", id))).Status);
+        Assert.Equal(0, provider.SendCalls);
+    }
+
+    [Fact]
+    public async Task DefinitiveRejectionDoesNotPermanentlyStallLaterQueuedWork()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        using var inbox = new ManagerInboxService(new ManagerInboxJournal(folder.Path),
+            managers, runtime);
+        var first = inbox.Enqueue("manager/main", "permanent failure").Result!.Message;
+        var second = inbox.Enqueue("manager/main", "valid follow-up").Result!.Message;
+        provider.PendingSend = new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        provider.PendingSend.SetResult(new SendReceipt(SendDisposition.Rejected, "invalid_remote"));
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("rejected", inbox.Get("manager/main", first.Id)!.State);
+        provider.PendingSend = null;
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.True(provider.SendCalls == 2, $"Second state {inbox.Get("manager/main", second.Id)!.State}, reason {inbox.Get("manager/main", second.Id)!.Reason}, manager {managers.Get("manager/main")!.LifecycleState}, runtime {runtime.Get("chat-1")!.Status}");
+        await WaitForTerminal(runtime, "chat-1");
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("completed", inbox.Get("manager/main", second.Id)!.State);
+    }
+
+    [Fact]
+    public async Task OnlyAuthoritativeExactTurnReconciliationUnlocksUncertainInbox()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        using var inbox = new ManagerInboxService(new ManagerInboxJournal(folder.Path),
+            managers, runtime);
+        var first = inbox.Enqueue("manager/main", "maybe received").Result!.Message;
+        var second = inbox.Enqueue("manager/main", "follow-up").Result!.Message;
+        provider.PendingSend = new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var attempt = inbox.ProcessAsync("manager/main", CancellationToken.None);
+        for (var i = 0; i < 100 && provider.SendCalls == 0; i++)
+            await Task.Delay(5);
+        Assert.Equal(1, provider.SendCalls);
+        provider.RemoteExchange("maybe received");
+        var visible = await provider.ReadAsync("chat-1", CancellationToken.None);
+        var remoteId = visible!.Messages[^2].Id;
+        provider.PendingSend.SetResult(new SendReceipt(SendDisposition.Uncertain,
+            "outcome_unknown", MessageId: remoteId));
+        Assert.False(await attempt);
+        Assert.Equal("uncertain", inbox.Get("manager/main", first.Id)!.State);
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(1, provider.SendCalls);
+        provider.AuthoritativeComplete = true;
+        var reconciled = (await managers.ReconcileAsync("manager/main", CancellationToken.None))!;
+        Assert.Equal("restored", reconciled.Reconciliation.Outcome);
+        Assert.Equal("idle", managers.Get("manager/main")!.LifecycleState);
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("completed", inbox.Get("manager/main", first.Id)!.State);
+        provider.PendingSend = null;
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.True(provider.SendCalls == 2, $"Second state {inbox.Get("manager/main", second.Id)!.State}, reason {inbox.Get("manager/main", second.Id)!.Reason}, manager {managers.Get("manager/main")!.LifecycleState}, runtime {runtime.Get("chat-1")!.Status}");
+        await WaitForTerminal(runtime, "chat-1");
+        Assert.True(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("completed", inbox.Get("manager/main", second.Id)!.State);
+    }
+
+    [Fact]
+    public async Task ManagerQueueCliPreservesIdempotencyKeyAndText()
+    {
+        using var handler = new InboxCliHandler();
+        using var client = new HttpClient(handler) {
+            BaseAddress = new Uri("http://127.0.0.1:8765/")
+        };
+        using var output = new StringWriter();
+        using var error = new StringWriter();
+        Assert.Equal(0, await LocalClient.RunCommandAsync(client, "manager-queue",
+            ["manager-queue", "manager/main", "identical", "--key", "identical"],
+            output, error));
+        Assert.Equal("/managers/main/inbox", handler.LastPath);
+        Assert.Equal(HttpMethod.Post, handler.LastMethod);
+        using var json = JsonDocument.Parse(handler.LastBody!);
+        Assert.Equal("identical", json.RootElement.GetProperty("text").GetString());
+        Assert.Equal("identical", json.RootElement.GetProperty("idempotencyKey").GetString());
+    }
+
+    [Fact]
+    public async Task PersistedQueuedWorkDispatchesAfterActualRuntimeRestart()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        string messageId;
+        using (var initial = InboxRuntime(folder.Path, provider))
+        {
+            var managers = await CreateIdleManager(initial, folder.Path);
+            using var inbox = new ManagerInboxService(
+                new ManagerInboxJournal(folder.Path), managers, initial);
+            messageId = inbox.Enqueue("manager/main", "survives restart").Result!.Message.Id;
+            Assert.Equal("queued", inbox.Get("manager/main", messageId)!.State);
+        }
+
+        using var restarted = InboxRuntime(folder.Path, provider);
+        var reloaded = new ManagerService(new ManagerRegistry(folder.Path), restarted);
+        using var inboxAgain = new ManagerInboxService(
+            new ManagerInboxJournal(folder.Path), reloaded, restarted);
+        Assert.Equal("queued", inboxAgain.Get("manager/main", messageId)!.State);
+        Assert.Equal(0, provider.SendCalls);
+        Assert.True(await inboxAgain.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(1, provider.SendCalls);
+        await WaitForTerminal(restarted, "chat-1");
+        Assert.True(await inboxAgain.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal("completed", inboxAgain.Get("manager/main", messageId)!.State);
+    }
+
+    [Fact]
+    public async Task ActualRestartAfterDispatchReservationNeverReplays()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        string messageId;
+        using (var initial = InboxRuntime(folder.Path, provider))
+        {
+            await CreateIdleManager(initial, folder.Path);
+            var journal = new ManagerInboxJournal(folder.Path);
+            messageId = journal.Enqueue("manager/main", "unknown dispatch", null).Message.Id;
+            journal.Transition("manager/main", messageId, InboxStates.Queued,
+                message => message with { State = InboxStates.Dispatching });
+        }
+
+        using var restarted = InboxRuntime(folder.Path, provider);
+        var reloaded = new ManagerService(new ManagerRegistry(folder.Path), restarted);
+        using var inbox = new ManagerInboxService(
+            new ManagerInboxJournal(folder.Path), reloaded, restarted);
+        Assert.Equal("uncertain", inbox.Get("manager/main", messageId)!.State);
+        Assert.Equal("uncertain", reloaded.Get("manager/main")!.LifecycleState);
+        Assert.False(await inbox.ProcessAsync("manager/main", CancellationToken.None));
+        Assert.Equal(0, provider.SendCalls);
+        Assert.NotEqual("restored",
+            (await reloaded.ReconcileAsync("manager/main", CancellationToken.None))!
+                .Reconciliation.Outcome);
+        Assert.Equal("uncertain", reloaded.Get("manager/main")!.LifecycleState);
+        Assert.Equal(0, provider.SendCalls);
+    }
+
+    private sealed class InboxCliHandler : HttpMessageHandler
+    {
+        public string? LastPath;
+        public string? LastBody;
+        public HttpMethod? LastMethod;
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            LastPath = request.RequestUri?.AbsolutePath;
+            LastMethod = request.Method;
+            LastBody = request.Content is null ? null
+                : await request.Content.ReadAsStringAsync(cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.Accepted) {
+                Content = new StringContent("{\"message\":{\"state\":\"queued\"}}")
+            };
+        }
+    }
+
+    private sealed class InboxClock : TimeProvider
+    {
+        private DateTimeOffset _now = new(2026, 10, 31, 0, 0, 0, TimeSpan.Zero);
+        public override DateTimeOffset GetUtcNow() => _now;
+        public void AdvanceSeconds(int seconds) => _now = _now.AddSeconds(seconds);
+    }
+}

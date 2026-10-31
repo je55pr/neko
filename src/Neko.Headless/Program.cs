@@ -24,8 +24,9 @@ var configPath = configIndex >= 0 && configIndex + 1 < args.Length
 
 if (command == "help")
 {
-    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager [args] [--wait] [--config path]");
+    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry [args] [--wait] [--config path]");
     Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch|reconcile <id>; reconcile-creation; reconcile-manager <manager/name>");
+    Console.WriteLine("manager-queue <manager/name> <text> [--key key]; manager-messages <manager/name>; manager-message|manager-cancel|manager-retry <manager/name> <message-id>");
     Console.WriteLine("Stop requires provider support; otherwise it returns Unsupported/stop_not_supported without cancelling.");
     return;
 }
@@ -44,6 +45,9 @@ try
     using var hostLease = journal.AcquireHostLease();
     using var runtime = new ChatRuntime(provider, journal);
     var managers = new ManagerService(new ManagerRegistry(config.StateDirectory), runtime);
+    using var inbox = new ManagerInboxService(
+        new ManagerInboxJournal(config.StateDirectory), managers, runtime);
+    inbox.Start();
 
     var builder = WebApplication.CreateSlimBuilder();
     builder.WebHost.UseUrls($"http://127.0.0.1:{config.Port}");
@@ -78,6 +82,16 @@ try
     app.MapPost("/managers/{name}/messages", (string name, TextRequest body,
         CancellationToken cancellation) =>
         ManagerEndpoints.SendAsync(managers, name, body.Text ?? "", cancellation));
+    app.MapGet("/managers/{name}/inbox", (string name) =>
+        ManagerEndpoints.ListInbox(inbox, name));
+    app.MapPost("/managers/{name}/inbox", (string name, InboxEnqueueRequest body) =>
+        ManagerEndpoints.EnqueueInbox(inbox, name, body));
+    app.MapGet("/managers/{name}/inbox/{messageId}", (string name, string messageId) =>
+        ManagerEndpoints.GetInbox(inbox, name, messageId));
+    app.MapPost("/managers/{name}/inbox/{messageId}/cancel", (string name, string messageId) =>
+        ManagerEndpoints.CancelInbox(inbox, name, messageId));
+    app.MapPost("/managers/{name}/inbox/{messageId}/retry", (string name, string messageId) =>
+        ManagerEndpoints.RetryInbox(inbox, name, messageId));
     // Listing is metadata only; full transcripts belong in GET by ID.
     app.MapGet("/conversations", () => Results.Json(runtime.List()
         .Select(record => new {
