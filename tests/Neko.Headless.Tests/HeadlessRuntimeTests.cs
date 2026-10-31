@@ -311,6 +311,36 @@ public sealed partial class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task FirstTurnElapsedTimeIncludesProviderCreationDelay()
+    {
+        using var folder = new TemporaryDirectory();
+        var clock = new ManualTimeProvider();
+        var pending = new TaskCompletionSource<SendReceipt>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var provider = new FakeProvider
+        {
+            DeferCompletion = true,
+            PendingCreate = pending
+        };
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path), clock);
+
+        var start = clock.GetUtcNow();
+        var creation = runtime.CreateAsync("first", CancellationToken.None);
+        Assert.False(creation.IsCompleted);
+        clock.AdvanceMilliseconds(6000);
+        pending.SetResult(new SendReceipt(
+            SendDisposition.Accepted, ConversationId: "chat-1"));
+        Assert.Equal(SendDisposition.Accepted, (await creation).Disposition);
+        var status = runtime.GetStatus("chat-1")!;
+        Assert.Equal(start, status.StartedAt);
+        Assert.Equal(6000, status.ElapsedMilliseconds);
+        provider.CompletePending();
+        await WaitForTerminal(runtime, "chat-1");
+    }
+
+    [Fact]
     public async Task ZeroPublicOutputStillReportsElapsedTimeWithoutClaimingActivity()
     {
         using var folder = new TemporaryDirectory();
@@ -626,6 +656,7 @@ public sealed partial class HeadlessRuntimeTests
         public int? RateLimitRetryAfterSeconds { get; set; }
         public int ReadCalls;
         public int SendCalls;
+        public TaskCompletionSource<SendReceipt>? PendingCreate { get; set; }
         public TaskCompletionSource<SendReceipt>? PendingSend;
         public void Publish(PublicConversationUpdate update) =>
             _events.Writer.TryWrite(update);
@@ -647,6 +678,11 @@ public sealed partial class HeadlessRuntimeTests
             Scope = scope;
             if (UncertainNextCreation)
                 return Task.FromResult(new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"));
+            if (PendingCreate is not null)
+            {
+                AddExchange(message.Text);
+                return PendingCreate.Task;
+            }
             AddExchange(message.Text);
             return Task.FromResult(new SendReceipt(SendDisposition.Accepted, ConversationId: "chat-1"));
         }

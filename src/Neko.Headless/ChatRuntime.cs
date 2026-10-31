@@ -75,6 +75,7 @@ internal sealed class ChatRuntime : IDisposable
             if (!_journal.TryStartCreation())
                 return new SendReceipt(SendDisposition.Rejected, "previous_creation_unresolved");
 
+            var feed = new ConversationUpdateFeed(_timeProvider);
             SendReceipt receipt;
             try { receipt = await _commands.CreateAsync(prepared.Message, cancellation); }
             catch (Exception) { receipt = new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"); }
@@ -84,7 +85,6 @@ internal sealed class ChatRuntime : IDisposable
             else if (receipt.Disposition == SendDisposition.Accepted &&
                      !string.IsNullOrWhiteSpace(receipt.ConversationId))
             {
-                var feed = new ConversationUpdateFeed(_timeProvider);
                 _journal.Set(new ChatRecord(receipt.ConversationId, "generating",
                     ProgressTurnId: feed.TurnId));
                 _journal.ClearCreation();
