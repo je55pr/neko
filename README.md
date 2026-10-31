@@ -108,6 +108,21 @@ starting with a letter or digit, up to 64 characters.
 | `/managers/main/messages` | POST | `{"text":"Next action"}`; submit through the existing guarded conversation runtime |
 | `/managers/main/history` | GET | Read the mapped transcript; 202 means no readable history yet, 404 means unknown |
 
+The local CLI can bootstrap and inspect managers without manually handling
+HTTP authentication:
+
+```text
+manager-create main "Initial instructions"  # creates logical ID manager/main once
+manager-list
+manager-status main
+manager-history main
+manager-send main "Next action"        # immediate guarded send; use inbox for queued work
+```
+
+`manager-create` accepts `main` or `manager/main`, and never automatically
+retries an uncertain creation. Existing manager identities return a conflict.
+Use `manager-queue` below for durable ordered work while the manager is busy.
+
 Creation returns `manager` metadata and the original `receipt`. Repeating
 creation for an existing or uncertain manager returns 409
 (`manager_already_exists`) without another provider call. A **definitively

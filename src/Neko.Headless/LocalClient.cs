@@ -106,6 +106,29 @@ internal static class LocalClient
                 route = "conversations/creation/reconcile";
                 method = HttpMethod.Post;
                 break;
+            case "manager-create" when positional.Count == 2:
+                var managerId = positional[0].StartsWith("manager/", StringComparison.Ordinal)
+                    ? positional[0] : "manager/" + positional[0];
+                if (!ManagerRegistry.IsValidId(managerId))
+                    throw new ArgumentException("Invalid manager identity.");
+                route = "managers";
+                method = HttpMethod.Post;
+                body = JsonSerializer.Serialize(new { id = managerId, text = positional[1] });
+                break;
+            case "manager-list" when positional.Count == 0:
+                route = "managers";
+                break;
+            case "manager-status" when positional.Count == 1:
+                route = $"managers/{ManagerName(positional[0])}";
+                break;
+            case "manager-history" when positional.Count == 1:
+                route = $"managers/{ManagerName(positional[0])}/history";
+                break;
+            case "manager-send" when positional.Count == 2:
+                route = $"managers/{ManagerName(positional[0])}/messages";
+                method = HttpMethod.Post;
+                body = JsonSerializer.Serialize(new { text = positional[1] });
+                break;
             case "reconcile-manager" when positional.Count == 1:
                 var name = positional[0].StartsWith("manager/", StringComparison.Ordinal)
                     ? positional[0]["manager/".Length..] : positional[0];
