@@ -31,8 +31,12 @@ is separately pinned under `HKCU\Software\Neko\SupervisorManifests`. The
 launcher verifies this registry-backed digest *before* executing any path from
 the manifest, so modifying a writable checkout or manifest alone cannot redirect
 logon execution. A digest of the installed private launcher copy is also pinned
-and shown in `supervisor-status` integrity verification. This does not claim security against malware already running
-as the same user, which can also modify that user's registry. Windows limits Run-key commands to 260 characters;
+and shown in `supervisor-status` integrity verification. Additionally the
+manifest pins the hashes of the host executable, its runtime dependencies and
+the configured provider files; the launcher verifies those bytes before it
+starts the host. Changing any such file requires explicit reinstallation.
+This does not claim security against malware already running as the same
+user, which can also modify that user's registry or race validation. Windows limits Run-key commands to 260 characters;
 installation fails safely if the private launcher path makes even this short
 entry too long. Installation does **not** start, stop, restart or inspect a live host.
 The launcher runs at the next supported interactive user logon.
@@ -60,7 +64,8 @@ dotnet run --no-build -c Release --project src/Neko.Headless -- supervisor-remov
 `supervisor-status` reports whether the exclusive supervisor lock is actively
 held, whether a Run entry exists, whether the private startup manifest still
 matches its registered digest, the last recorded status, and the result of
-an **authenticated, read-only** localhost health probe. The last status is
+a **nonce-bound, signed, read-only** localhost health probe. The probe sends
+no bearer token to an unknown process occupying that port. The last status is
 historical if the supervisor lock is not held. `supervisor-logs` prints the
 last 60 supervisor events; it never reads transcripts or talks to a provider.
 Local operator-only files live under `stateDirectory/supervision/status.json`
@@ -103,8 +108,11 @@ ready after 30 seconds, it is reported as `host_alive_but_not_ready`, but
 it is **not** killed or blindly restarted. Startup, crash, port contention,
 health failure and mismatched authentication have distinct status reasons.
 
-The installed launch manifest pins a digest of the original state directory,
-provider configuration, scope, port and access token. The trusted registry also
+The installed launch manifest pins a digest of the state directory,
+provider assembly and settings bytes, provider factory, creation scope, port,
+access token, PR CLI executable and review policy. If a PR CLI is configured,
+its executable path must be absolute so the image can be pinned; a bare name
+resolved from the user's mutable `PATH` is refused for supervised startup. The trusted registry also
 pins a separate digest of the manifest bytes to detect changes in runtime,
 assembly or config paths before they can execute at login. If its configuration
 file is later changed, startup refuses to access the newly configured state.
@@ -114,6 +122,11 @@ refuses changed configuration on the next launch. Different Windows path
 capitalization does not change identity.
 
 Authenticated `GET /health` returns `status: "ready"`, `instanceId`,
+while credential-free `GET /health/attest?nonce=<64 uppercase hex characters>`
+returns the same health snapshot accompanied by an HMAC-SHA256 signature over
+the nonce and each health field. The supervisor validates the signature with
+its own locally configured secret but never transmits that secret in its probe.
+Both endpoints report
 `uncertainConversations`, `pendingCreation`, and
 `blockedManagerInboxEntries`. **Ready only means the API is listening.**
 It does not mean every conversation is complete or every queued message has

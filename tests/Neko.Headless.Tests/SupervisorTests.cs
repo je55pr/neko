@@ -142,6 +142,9 @@ public sealed class SupervisorTests
             runtime, assembly, config);
         Assert.NotEqual(original[Path.GetFullPath(provider)],
             changedProvider[Path.GetFullPath(provider)]);
+        Assert.Throws<InvalidOperationException>(() =>
+            SupervisorControls.PinnedRuntimeFiles(runtime, assembly,
+                config with { ExternalPrCliExecutable = "gh" }));
     }
 
     [Fact]

@@ -72,9 +72,11 @@ internal static class SupervisorControls
         foreach (var path in new[] { runtime, assembly, config.ProviderAssembly,
                      config.ProviderSettings })
             files[Path.GetFullPath(path)] = ManifestDigest(path);
-        if (!string.IsNullOrWhiteSpace(config.ExternalPrCliExecutable) &&
-            Path.IsPathFullyQualified(config.ExternalPrCliExecutable))
+        if (!string.IsNullOrWhiteSpace(config.ExternalPrCliExecutable))
         {
+            if (!Path.IsPathFullyQualified(config.ExternalPrCliExecutable))
+                throw new InvalidOperationException(
+                    "Supervised PR CLI must be an explicit absolute executable path.");
             var cli = Path.GetFullPath(config.ExternalPrCliExecutable);
             files[cli] = ManifestDigest(cli);
         }
