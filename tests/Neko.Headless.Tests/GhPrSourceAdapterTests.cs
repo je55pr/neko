@@ -147,37 +147,39 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
-    public void CombinedCommitStatusesMustReturnTheEntireVerifiedPage()
+    public void IndividualCommitStatusesKeepAllPublishersAndFailClosedOnPagination()
     {
         const string sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         Assert.Equal("repos/sample/project/commits/" + sha +
-            "/status?per_page=100",
-            GhPrSourceAdapter.CompleteCommitStatusesRoute("sample/project", sha));
+            "/statuses?per_page=100",
+            GhPrSourceAdapter.IndividualCommitStatusesRoute("sample/project", sha));
 
+        // The combined endpoint hides the earlier trusted status when an
+        // untrusted actor publishes a newer status in the same context.
         using var complete = JsonDocument.Parse("""
-            {"total_count":2,"statuses":[{"id":1},{"id":2}]}
+            [[{"id":22,"context":"build","creator":{"id":999}},
+              {"id":21,"context":"build","creator":{"id":100}}]]
             """);
-        Assert.Equal(2, GhPrSourceAdapter.VerifiedCompletePage(
-            complete.RootElement, "statuses").GetArrayLength());
+        var statuses = GhPrSourceAdapter.VerifiedIndividualStatusPages(
+            complete.RootElement);
+        Assert.Equal(2, statuses.Count);
+        Assert.Equal(100, statuses[1].GetProperty("creator").GetProperty("id").GetInt32());
 
-        // GitHub's default 30-entry page may hide a 31st required status.
-        using var truncated = JsonDocument.Parse("""
-            {"total_count":31,"statuses":[{"id":1}]}
-            """);
+        using var empty = JsonDocument.Parse("[[]]");
+        Assert.Empty(GhPrSourceAdapter.VerifiedIndividualStatusPages(empty.RootElement));
+        using var invalid = JsonDocument.Parse("[]");
         Assert.Throws<InvalidOperationException>(() =>
-            GhPrSourceAdapter.VerifiedCompletePage(truncated.RootElement, "statuses"));
-
-        using var overLimit = JsonDocument.Parse("""
-            {"total_count":101,"statuses":[]}
-            """);
+            GhPrSourceAdapter.VerifiedIndividualStatusPages(invalid.RootElement));
+        using var malformed = JsonDocument.Parse("[{}]");
         Assert.Throws<InvalidOperationException>(() =>
-            GhPrSourceAdapter.VerifiedCompletePage(overLimit.RootElement, "statuses"));
-
-        using var missingCount = JsonDocument.Parse("""
-            {"statuses":[]}
-            """);
+            GhPrSourceAdapter.VerifiedIndividualStatusPages(malformed.RootElement));
+        using var malformedPages = JsonDocument.Parse("[[{\"id\":1}],[{\"id\":2}]]");
         Assert.Throws<InvalidOperationException>(() =>
-            GhPrSourceAdapter.VerifiedCompletePage(missingCount.RootElement, "statuses"));
+            GhPrSourceAdapter.VerifiedIndividualStatusPages(malformedPages.RootElement));
+        using var overLimit = JsonDocument.Parse(JsonSerializer.Serialize(
+            new[] { Enumerable.Range(0, 100).Select(id => new { id }).ToArray() }));
+        Assert.Throws<InvalidOperationException>(() =>
+            GhPrSourceAdapter.VerifiedIndividualStatusPages(overLimit.RootElement));
     }
 
     [Fact]

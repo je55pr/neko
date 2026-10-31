@@ -228,11 +228,11 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         "repos/" + repository + "/commits/" + head +
         "/check-runs?per_page=100&filter=all";
 
-    internal static string CompleteCommitStatusesRoute(string repository, string head) =>
-        "repos/" + repository + "/commits/" + head + "/status?per_page=100";
+    internal static string IndividualCommitStatusesRoute(string repository, string head) =>
+        "repos/" + repository + "/commits/" + head + "/statuses?per_page=100";
 
-    // Both endpoints report total_count independently of the returned page.
-    // Missing/truncated results must fail closed, not silently hide checks.
+    // Check runs report total_count. Missing/truncated results must fail
+    // closed, not silently hide earlier trusted runs.
     internal static JsonElement VerifiedCompletePage(JsonElement root, string itemsName)
     {
         var entries = Member(root, itemsName);
@@ -242,6 +242,30 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             !total.TryGetInt32(out var count) || count < 0 || count > 100 ||
             count != entries.GetArrayLength())
             throw new InvalidOperationException("Source list exceeds verified page.");
+        return entries;
+    }
+
+    // gh api --paginate --slurp produces one array per fetched page.
+    // Unlike the combined-status endpoint, this lists every publisher's
+    // status for a context. Refuse >=100 statuses until bounded pagination
+    // beyond the first page is explicitly supported by policy.
+    internal static IReadOnlyList<JsonElement> VerifiedIndividualStatusPages(JsonElement pages)
+    {
+        if (pages.ValueKind != JsonValueKind.Array || pages.GetArrayLength() == 0)
+            throw new InvalidOperationException("Commit status pages unavailable.");
+        var entries = new List<JsonElement>();
+        var pageIndex = 0;
+        foreach (var page in pages.EnumerateArray())
+        {
+            if (page.ValueKind != JsonValueKind.Array ||
+                page.GetArrayLength() > 100 ||
+                (pageIndex < pages.GetArrayLength() - 1 &&
+                 page.GetArrayLength() != 100) ||
+                entries.Count + page.GetArrayLength() >= 100)
+                throw new InvalidOperationException("Commit status list exceeds verified limit.");
+            entries.AddRange(page.EnumerateArray());
+            pageIndex++;
+        }
         return entries;
     }
 
@@ -310,10 +334,13 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
                 DateTimeOffset.TryParse(GetString(run, "started_at"), out var started)
                     ? started : null));
         }
+        // The combined endpoint collapses same-context statuses across
+        // publishers, losing trusted evidence behind newer untrusted posts.
+        // Read every individual status (with exhaustive page retrieval).
         using var statuses = await ApiAsync(cancellation,
-            CompleteCommitStatusesRoute(repository, head));
-        var statusEntries = VerifiedCompletePage(statuses.RootElement, "statuses");
-        foreach (var item in statusEntries.EnumerateArray())
+            "--paginate", "--slurp", IndividualCommitStatusesRoute(repository, head));
+        var statusEntries = VerifiedIndividualStatusPages(statuses.RootElement);
+        foreach (var item in statusEntries)
         {
             var name = GetString(item, "context") ?? "";
             gathered.Add(new PrCheck(name, head, "completed",
