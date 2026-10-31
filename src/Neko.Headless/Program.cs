@@ -25,6 +25,7 @@ var configPath = configIndex >= 0 && configIndex + 1 < args.Length
 if (command == "help")
 {
     Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry|manager-track|manager-jobs|manager-job|manager-interrupt|pr-register|pr-status|pr-refresh|pr-reviewer|pr-publish-review|pr-merge [args] [--config path] [--wait]");
+    Console.WriteLine("supervise|supervisor-install|supervisor-remove|supervisor-status|supervisor-logs [--config path]");
     Console.WriteLine("pr-register <repo> <number> <creator> <developer> <manager>; pr-status|pr-merge <repo> <number>");
     Console.WriteLine("pr-reviewer <repo> <number> <reviewer-account> <task>; pr-publish-review <repo> <number>");
     Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch|reconcile <id>; reconcile-creation; reconcile-manager <manager/name>");
@@ -38,15 +39,23 @@ if (command == "help")
 try
 {
     var config = HostConfiguration.Read(configPath);
+    if (command is "supervise" or "supervisor-install" or "supervisor-remove" or
+        "supervisor-status" or "supervisor-logs")
+    {
+        Environment.ExitCode = await SupervisorControls.ExecuteAsync(command, configPath, config, args);
+        return;
+    }
     if (command != "serve")
     {
         await LocalClient.RunAsync(config, command, args);
         return;
     }
 
-    var provider = config.CreateProvider(); // Fails closed if scoped creation is unsupported.
     var journal = new ChatJournal(config.StateDirectory);
+    // Acquire ownership BEFORE initializing the browser/provider. A duplicate
+    // process must never touch a live authenticated profile while losing the lease.
     using var hostLease = journal.AcquireHostLease();
+    var provider = config.CreateProvider(); // Fails closed if scoped creation is unsupported.
     using var runtime = new ChatRuntime(provider, journal);
     var managerRegistry = new ManagerRegistry(config.StateDirectory);
     var managers = new ManagerService(managerRegistry, runtime);
@@ -83,7 +92,8 @@ try
         await next();
     });
 
-    app.MapGet("/health", () => Results.Json(new { status = "ready" }));
+    app.MapGet("/health", () => Results.Json(HostHealthSnapshot.Create(
+        config, journal, runtime, managers, inbox)));
     app.MapGet("/pr-workflows", () => Results.Json(prWorkflows.List()));
     app.MapPost("/pr-workflows", (PrWorkflowCreateRequest body, CancellationToken ct) =>
         PrWorkflowEndpoints.CreateAsync(prWorkflows, body, ct));
