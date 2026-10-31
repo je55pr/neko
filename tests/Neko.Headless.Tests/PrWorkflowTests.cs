@@ -36,13 +36,15 @@ public sealed partial class HeadlessRuntimeTests
         ["build"], "review-job", "auto-account",
         TrustedCheckProducers: new Dictionary<string, string> { ["build"] = "app:100" },
         AutomatedCheckProducer: "app:200",
-        AutomatedNoFindingsMarker: "No actionable findings");
+        AutomatedNoFindingsMarker: "No actionable findings",
+        AllowedRepositories: ["sample/project"]);
 
     private static PrSourceStatus GoodSource(DateTimeOffset now) =>
         new("sample/project", 7, PrHead, PrBase, "open", "creator-account", false, true,
         [
             new("build", PrHead, "completed", "success", "app:100"),
-            new("review-job", PrHead, "completed", "success", "app:200")
+            new("review-job", PrHead, "completed", "success", "app:200",
+                StartedAt: now.AddMinutes(-5))
         ],
         [
             new(PrReviewUrl, "independent-account", PrHead, "approved",

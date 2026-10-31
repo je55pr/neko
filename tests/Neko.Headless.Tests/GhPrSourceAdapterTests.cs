@@ -71,6 +71,28 @@ public sealed class GhPrSourceAdapterTests
         Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
             "```\nActionable comments posted: 0\n```\n", marker));
         Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "~~~\nActionable comments posted: 0\n~~~\n", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "    Actionable comments posted: 0\n", marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable comments posted: 2**\n<!--\nActionable comments posted: 0\n-->",
+            marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable comments posted: 3**\n**Actionable comments posted: 0**",
+            marker));
+        Assert.True(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "<!-- automated-review-metadata -->\n**Actionable comments posted: 0**\n",
+            marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable comments posted: 0**\n**Actionable comments posted: 3**",
+            marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable comments posted: 0**\n<!-- Actionable comments posted: 2 -->",
+            marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "<!--\nActionable comments posted: 0\n-->\n**Actionable comments posted: 2**",
+            marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
             "**Actionable comments posted: 0**", null));
     }
 
@@ -102,6 +124,30 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
+    public async Task ExternalPrOperationsNeverAcceptUnlistedRepositories()
+    {
+        var policy = new Neko.PrReviewPolicy(["build"], "automated-check",
+            "automated-reviewer", AllowedRepositories: ["Sample/Project"]);
+        var adapter = new GhPrSourceAdapter(null, policy);
+        Assert.Equal("Sample/Project", adapter.AuthorizedRepository("sample/project"));
+        Assert.Equal("Sample/Project", adapter.AuthorizedRepository("SAMPLE/PROJECT"));
+        Assert.Throws<ArgumentException>(() => adapter.AuthorizedRepository("other/project"));
+        Assert.Throws<ArgumentException>(() => adapter.AuthorizedRepository("../project"));
+        Assert.Throws<ArgumentException>(() => adapter.AuthorizedRepository("sample/project/other"));
+        Assert.Throws<ArgumentException>(() =>
+            new GhPrSourceAdapter(null).AuthorizedRepository("sample/project"));
+
+        const string head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            adapter.ReadAsync("untrusted/project", 7, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            adapter.PostReviewAsync("untrusted/project", 7, head,
+                "Substantive test review content.", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            adapter.MergeAsync("untrusted/project", 7, head, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task RelativeOrMissingExecutableCannotRunExternalCommands()
     {
         Assert.Throws<ArgumentException>(() => new GhPrSourceAdapter("gh"));
@@ -109,7 +155,9 @@ public sealed class GhPrSourceAdapterTests
             new GhPrSourceAdapter(Path.Combine(Path.GetTempPath(),
                 "missing-executable-" + Guid.NewGuid().ToString("N"))));
 
-        var disabled = new GhPrSourceAdapter(null);
+        var policy = new Neko.PrReviewPolicy(["build"], "automated-check",
+            "automated-reviewer", AllowedRepositories: ["sample/project"]);
+        var disabled = new GhPrSourceAdapter(null, policy);
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             disabled.ReadAsync("sample/project", 1, CancellationToken.None));
     }

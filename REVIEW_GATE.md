@@ -20,6 +20,7 @@ Set optional `reviewGate` in the local ignored host configuration. There is
     "automatedCheckProducer": "app:12345",
     "automatedCheckWorkflow": "workflow:400010385",
     "automatedNoFindingsMarker": "No actionable findings",
+    "allowedRepositories": ["owner/repository"],
     "trustedCheckProducers": {
       "build-and-test": "app:23456",
       "static-analysis": "app:34567"
@@ -34,17 +35,27 @@ Set optional `reviewGate` in the local ignored host configuration. There is
 
 These names are examples, not hardcoded rules. The deployment owner must set
 the actual required CI names and automated review account/check name for the
-repository. All configured CI must have a conclusive successful run at the
+repository. The `allowedRepositories` list is mandatory and fail-closed:
+the adapter takes the repository identifier from this trusted local list,
+not from caller-controlled path text. The host cannot inspect, review, or
+merge unlisted repositories even if its external credential can access them.
+Use the canonical repository spelling reported by the source. All configured
+CI must have a conclusive successful run at the
 exact PR head. The automated reviewer must additionally have a substantive
 posted review against that head. An automated review also needs a trusted,
-configured no-findings line in the **latest bot review body**. A successful
-check run does not mean the bot found no problems. Unknown body formats and
-reviews with actionable findings block merge until fixes and a new clear
-review have been obtained on the current head. The configured marker is a
-literal line (optionally Markdown-bold), not an arbitrary substring; use a
-positive phrase emitted by the repository's actual reviewer. No marker is
-assumed by default. Skipped, neutral, pending, rejected, cancelled, and
-check-only automated responses cannot pass.
+configured no-findings line as the **first substantive visible status line**
+of the latest bot review body, allowing only initial HTML metadata comments.
+A successful check run does not mean the bot found no problems. Unknown
+body formats, quoted or sample markers, and reviews with actionable findings
+block merge until fixes and a new clear review have been obtained. A bot
+review must be submitted **at or after the latest trusted check run started**,
+including same-head reruns; missing source run-start timestamps block.
+This is a conservative temporal association, not a provider-signed pairing
+of a particular check and review. A deployment needing stronger guarantees
+must use a reviewer with explicit per-run evidence and branch protection.
+The configured marker is a literal line (optionally Markdown-bold), not an
+arbitrary substring. No marker is assumed by default. Skipped, neutral,
+pending, rejected, cancelled, and check-only responses cannot pass.
 
 ## Explicit operations
 

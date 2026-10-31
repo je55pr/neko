@@ -3,7 +3,8 @@ namespace Neko;
 /// <summary>Provider-neutral facts. Source-side reviews and checks must be re-read before merge.</summary>
 public sealed record PrCheck(string Name, string HeadSha, string Status, string? Conclusion,
     string? ProducerId = null, string? WorkflowId = null,
-    bool RequiresWorkflowIdentity = false, long RunId = 0);
+    bool RequiresWorkflowIdentity = false, long RunId = 0,
+    DateTimeOffset? StartedAt = null);
 public sealed record PrReview(string Url, string Author, string HeadSha, string Verdict,
     bool Substantive, DateTimeOffset SubmittedAt, string? BodySha256 = null,
     long? SourceReviewId = null, bool AutomatedNoFindings = false);
@@ -18,7 +19,8 @@ public sealed record PrReviewPolicy(
     string? AutomatedCheckProducer = null,
     IReadOnlyDictionary<string, string>? TrustedCheckWorkflows = null,
     string? AutomatedCheckWorkflow = null,
-    string? AutomatedNoFindingsMarker = null);
+    string? AutomatedNoFindingsMarker = null,
+    IReadOnlyList<string>? AllowedRepositories = null);
 public sealed record PrWorkerEvidence(string ConversationId, string CreatedForHead,
     DateTimeOffset CreatedAt, bool Completed, DateTimeOffset? CompletedAt,
     string? ReviewUrl, string? Verdict, string? ReviewerAccount,
@@ -63,6 +65,9 @@ public static class PrReviewGate
         PrSourceStatus source, DateTimeOffset now)
     {
         var blockers = new List<string>();
+        if (policy.AllowedRepositories?.Any(allowed =>
+                StringComparer.OrdinalIgnoreCase.Equals(allowed, workflow.Repository)) != true)
+            blockers.Add("repository_not_authorized");
         if (source.Repository != workflow.Repository || source.Number != workflow.Number)
             blockers.Add("source_identity_mismatch");
         if (source.State != "open" || source.Merged) blockers.Add("pr_not_open");
@@ -148,6 +153,14 @@ public static class PrReviewGate
                  (botReviews[0].SourceReviewId is null ||
                   botReviews[1].SourceReviewId is null)))
                 blockers.Add("automated_findings_untriaged");
+            // Same-commit re-runs are distinct reviews. An older positive
+            // result cannot satisfy a later successful check run. The source
+            // must prove both the check start and a review submitted since
+            // that start; missing timestamps always block.
+            if (automated?.StartedAt is not { } runStarted ||
+                botReviews.Length == 0 ||
+                botReviews[0].SubmittedAt < runStarted)
+                blockers.Add("automated_review_run_not_bound_to_review");
         }
         if (policy.RequiredChecks is null || policy.RequiredChecks.Count == 0)
             blockers.Add("required_checks_policy_missing");

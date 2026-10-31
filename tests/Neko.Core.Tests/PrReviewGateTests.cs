@@ -12,7 +12,8 @@ public sealed class PrReviewGateTests
         ["build"], "review-bot-run", "review-bot",
         TrustedCheckProducers: new Dictionary<string, string> { ["build"] = "app:100" },
         AutomatedCheckProducer: "app:200",
-        AutomatedNoFindingsMarker: "No actionable findings");
+        AutomatedNoFindingsMarker: "No actionable findings",
+        AllowedRepositories: ["sample/project"]);
 
     private static PrWorkerEvidence Worker() => new("fresh-review-worker", Head,
         Now.AddMinutes(-30), true, Now.AddMinutes(-10), "https://example.org/review/12",
@@ -29,7 +30,8 @@ public sealed class PrReviewGateTests
         "open", "author-account", false, true,
         [
             new("build", Head, "completed", "success", "app:100"),
-            new("review-bot-run", Head, "completed", "success", "app:200")
+            new("review-bot-run", Head, "completed", "success", "app:200",
+                StartedAt: Now.AddMinutes(-15))
         ],
         [
             new("https://example.org/review/12", "review-account", Head, "approved",
@@ -43,6 +45,17 @@ public sealed class PrReviewGateTests
         PrSourceStatus? source = null, PrReviewPolicy? policy = null) =>
         PrReviewGate.Evaluate(workflow ?? Workflow(), policy ?? Policy,
             source ?? Source(), Now);
+
+    [Fact]
+    public void RepositoryNotInTrustedHostPolicyCannotPassTheGate()
+    {
+        var restricted = Policy with { AllowedRepositories = ["different/repository"] };
+        var result = Evaluate(policy: restricted);
+        Assert.False(result.Ready);
+        Assert.Contains("repository_not_authorized", result.Blockers);
+        Assert.Contains("repository_not_authorized",
+            Evaluate(policy: Policy with { AllowedRepositories = null }).Blockers);
+    }
 
     [Fact]
     public void CompleteIndependentAndAutomatedReviewsPermitMerge()
@@ -120,7 +133,8 @@ public sealed class PrReviewGateTests
     {
         var source = Source() with {
             Checks = [new("build", Head, "completed", "success", "app:100"),
-                new("review-bot-run", Head, status, conclusion, "app:200")]
+                new("review-bot-run", Head, status, conclusion, "app:200",
+                StartedAt: Now.AddMinutes(-15))]
         };
         Assert.Contains("automated_review_run_not_successful", Evaluate(source: source).Blockers);
     }
@@ -232,9 +246,11 @@ public sealed class PrReviewGateTests
             AutomatedCheckWorkflow = "workflow:777"
         };
         var correct = new PrCheck("review-bot-run", Head, "completed", "success",
-            "app:15368", "workflow:777", true, 200);
+            "app:15368", "workflow:777", true, 200,
+            StartedAt: Now.AddMinutes(-15));
         var differentWorkflow = new PrCheck("review-bot-run", Head, "completed",
-            "success", "app:15368", "workflow:999", true, 300);
+            "success", "app:15368", "workflow:999", true, 300,
+            StartedAt: Now.AddMinutes(-15));
         var source = Source() with {
             Checks = [Source().Checks[0], correct, differentWorkflow]
         };
@@ -277,6 +293,41 @@ public sealed class PrReviewGateTests
         }).Ready);
         Assert.Contains("automated_finding_policy_missing",
             Evaluate(policy: Policy with { AutomatedNoFindingsMarker = null }).Blockers);
+    }
+
+    [Fact]
+    public void SameHeadRerunNeedsNewAutomatedReviewAfterCheckStart()
+    {
+        var source = Source();
+        var original = Evaluate(source: source);
+        Assert.True(original.Ready);
+
+        var newRun = source.Checks[1] with {
+            RunId = 9002,
+            StartedAt = Now.AddMinutes(-5)
+        };
+        var beforeNewReview = source with {
+            Checks = [source.Checks[0], newRun]
+        };
+        Assert.Contains("automated_review_run_not_bound_to_review",
+            Evaluate(source: beforeNewReview).Blockers);
+        Assert.False(Evaluate(source: beforeNewReview).Ready);
+
+        var matchingNewReview = source.Reviews[1] with {
+            Url = "https://example.org/review/next",
+            SourceReviewId = 999,
+            SubmittedAt = Now.AddMinutes(-4)
+        };
+        var complete = beforeNewReview with {
+            Reviews = [..source.Reviews, matchingNewReview]
+        };
+        Assert.True(Evaluate(source: complete).Ready);
+
+        var missingStart = complete with {
+            Checks = [source.Checks[0], newRun with { StartedAt = null }]
+        };
+        Assert.Contains("automated_review_run_not_bound_to_review",
+            Evaluate(source: missingStart).Blockers);
     }
 
     [Fact]

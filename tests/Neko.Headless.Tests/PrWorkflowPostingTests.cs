@@ -304,6 +304,30 @@ public sealed partial class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task UnlistedRepositoryIsNotVisibleOrExternallyActionable()
+    {
+        using var folder = new TemporaryDirectory();
+        using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
+        var store = new PrWorkflowStore(folder.Path);
+        ReadyRecord(store);
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
+        var policy = GatePolicy() with { AllowedRepositories = ["other/project"] };
+        var service = new PrWorkflowService(store, source, runtime, policy);
+
+        Assert.Null(service.Get("sample/project", 7));
+        Assert.Empty(service.List());
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            service.CreateAsync("sample/project", 8, "creator", "developer",
+                "manager", CancellationToken.None));
+        await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+            service.InspectAsync("sample/project", 7, CancellationToken.None));
+        await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+            service.MergeAsync("sample/project", 7, CancellationToken.None));
+        Assert.Equal(0, source.Reads);
+        Assert.Equal(0, source.MergeCalls);
+    }
+
+    [Fact]
     public async Task CasingAliasesCannotCreateParallelMergeAttemptLedgers()
     {
         using var folder = new TemporaryDirectory();

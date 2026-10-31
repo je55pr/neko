@@ -26,6 +26,23 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         _trustedExecutable = Path.GetFullPath(trustedExecutable);
     }
 
+    // Trust only the allowlisted canonical identifier from local host policy.
+    // The caller's repository string selects a configured entry; it is never
+    // interpolated into an authenticated external request.
+    internal string AuthorizedRepository(string requested)
+    {
+        if (!PrWorkflowStore.ValidRepository(requested) ||
+            _policy?.AllowedRepositories is not { Count: > 0 })
+            throw new ArgumentException("Repository not authorized.");
+        var selected = _policy.AllowedRepositories
+            .Where(PrWorkflowStore.ValidRepository)
+            .Where(value => StringComparer.OrdinalIgnoreCase.Equals(value, requested))
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (selected.Length != 1)
+            throw new ArgumentException("Repository not authorized.");
+        return selected[0];
+    }
+
     private async Task<JsonDocument> ApiAsync(
         CancellationToken cancellation, params string[] args)
     {
@@ -100,27 +117,55 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         return "deleted-pr-author:" + id;
     }
 
-    // Only a positively identified line from an authenticated automated
-    // reviewer can clear findings. Unknown formats and unconfigured markers
-    // remain untriaged, regardless of whether the check itself succeeded.
+    // A provider-authored positive status must be the FIRST substantive line.
+    // Markers buried in prose, quotes, samples or hidden HTML never clear
+    // findings. A configuration-specific marker avoids provider assumptions.
     internal static bool VerifiedNoFindingsLine(string body, string? marker)
     {
         if (string.IsNullOrWhiteSpace(marker) || marker.Length > 200 ||
             marker.Any(char.IsControl))
             return false;
-        var fenced = false;
+        bool inComment = false;
         foreach (var raw in body.Split('\n'))
         {
             var line = raw.Trim();
-            if (line.StartsWith("```", StringComparison.Ordinal))
+            if (line.Length == 0) continue;
+            if (inComment)
             {
-                fenced = !fenced;
+                if (line.Contains("-->", StringComparison.Ordinal))
+                    inComment = false;
                 continue;
             }
-            if (!fenced && !line.StartsWith('>') &&
-                string.Equals(line.Trim('*', '_', ' ', '\t', '\r'),
+            if (line.StartsWith("<!--", StringComparison.Ordinal))
+            {
+                // The entire line is an HTML comment or opens a comment.
+                // Anything after a closing comment is ambiguous and rejected.
+                if (!line.Contains("-->", StringComparison.Ordinal))
+                    inComment = true;
+                else if (!line.EndsWith("-->", StringComparison.Ordinal))
+                    return false;
+                continue;
+            }
+            if (line.StartsWith('>') ||
+                line.StartsWith("```", StringComparison.Ordinal) ||
+                line.StartsWith("~~~", StringComparison.Ordinal) ||
+                raw.Length - raw.TrimStart().Length >= 4)
+                return false;
+            if (!string.Equals(line.Trim('*', '_', ' ', '\t', '\r'),
                     marker, StringComparison.OrdinalIgnoreCase))
-                return true;
+                return false;
+            // When the configured positive marker ends in zero, any second
+            // occurrence of the same status key is ambiguous, even inside a
+            // comment or example. Do not accept a contradictory count buried
+            // after a positive opening summary.
+            if (marker.EndsWith('0') && marker.Length > 1)
+            {
+                var stem = marker[..^1];
+                var matchingLines = body.Split('\n').Count(other =>
+                    other.Contains(stem, StringComparison.OrdinalIgnoreCase));
+                if (matchingLines != 1) return false;
+            }
+            return true;
         }
         return false;
     }
@@ -169,8 +214,9 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     public async Task<PrSourceStatus> ReadAsync(
         string repository, int number, CancellationToken cancellation)
     {
-        if (!PrWorkflowStore.ValidRepository(repository) || number < 1)
+        if (number < 1)
             throw new ArgumentException("Invalid external PR identity.");
+        repository = AuthorizedRepository(repository);
         var route = "repos/" + repository + "/pulls/" + number;
         using var pull = await ApiAsync(cancellation, route);
         var pr = pull.RootElement;
@@ -228,7 +274,9 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             gathered.Add(new PrCheck(name, head,
                 GetString(run, "status") ?? "", GetString(run, "conclusion"),
                 ProducerId(run, "app", "app"), workflowId, isActions,
-                run.GetProperty("id").GetInt64()));
+                run.GetProperty("id").GetInt64(),
+                DateTimeOffset.TryParse(GetString(run, "started_at"), out var started)
+                    ? started : null));
         }
         using var statuses = await ApiAsync(cancellation,
             "repos/" + repository + "/commits/" + head + "/status");
@@ -304,10 +352,10 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     public async Task<PrReview> PostReviewAsync(string repository, int number,
         string expectedHead, string body, CancellationToken cancellation)
     {
-        if (!PrWorkflowStore.ValidRepository(repository) || number < 1 ||
-            !PrReviewGate.ValidSha(expectedHead) ||
+        if (number < 1 || !PrReviewGate.ValidSha(expectedHead) ||
             string.IsNullOrWhiteSpace(body) || body.Length > 12000)
             throw new ArgumentException("Invalid external review post request.");
+        repository = AuthorizedRepository(repository);
         using var result = await ApiAsync(cancellation, "-X", "POST",
             "repos/" + repository + "/pulls/" + number + "/reviews",
             "-f", "commit_id=" + expectedHead, "-f", "event=COMMENT",
@@ -327,9 +375,9 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     public async Task<string> MergeAsync(string repository, int number,
         string expectedHead, CancellationToken cancellation)
     {
-        if (!PrWorkflowStore.ValidRepository(repository) || number < 1 ||
-            !PrReviewGate.ValidSha(expectedHead))
+        if (number < 1 || !PrReviewGate.ValidSha(expectedHead))
             throw new ArgumentException("Invalid merge precondition.");
+        repository = AuthorizedRepository(repository);
         // Server-side sha predicate is atomic with merge. No speculative retries.
         using var result = await ApiAsync(cancellation, "-X", "PUT",
             "repos/" + repository + "/pulls/" + number + "/merge",

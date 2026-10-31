@@ -41,8 +41,15 @@ internal sealed class PrWorkflowService
         _clock = clock ?? TimeProvider.System;
     }
 
-    public PrWorkflow? Get(string repository, int number) => _store.Get(repository, number);
-    public IReadOnlyList<PrWorkflow> List() => _store.List();
+    private bool IsAuthorizedRepository(string repository) =>
+        PrWorkflowStore.ValidRepository(repository) &&
+        _policy.AllowedRepositories?.Any(allowed =>
+            StringComparer.OrdinalIgnoreCase.Equals(allowed, repository)) == true;
+
+    public PrWorkflow? Get(string repository, int number) =>
+        IsAuthorizedRepository(repository) ? _store.Get(repository, number) : null;
+    public IReadOnlyList<PrWorkflow> List() =>
+        _store.List().Where(w => IsAuthorizedRepository(w.Repository)).ToArray();
 
     private static bool ReviewPostingUnresolved(PrWorkflow workflow) =>
         workflow.Reviewer is {
@@ -53,8 +60,8 @@ internal sealed class PrWorkflowService
     public async Task<PrWorkflow> CreateAsync(string repository, int number,
         string creator, string developer, string manager, CancellationToken cancellation)
     {
-        if (!PrWorkflowStore.ValidRepository(repository) || number < 1)
-            throw new ArgumentException("Invalid repository or number.");
+        if (!IsAuthorizedRepository(repository) || number < 1)
+            throw new ArgumentException("Repository not authorized.");
         var source = await _source.ReadAsync(repository, number, cancellation);
         if (source.Repository != repository || source.Number != number ||
             source.State != "open" || !PrReviewGate.ValidSha(source.HeadSha) ||
@@ -67,7 +74,7 @@ internal sealed class PrWorkflowService
     public async Task<PrWorkflowReport> InspectAsync(string repository, int number,
         CancellationToken cancellation)
     {
-        var record = _store.Get(repository, number)
+        var record = Get(repository, number)
             ?? throw new KeyNotFoundException("Workflow unavailable.");
         var status = await _source.ReadAsync(repository, number, cancellation);
         var decision = PrReviewGate.Evaluate(record, _policy, status, _clock.GetUtcNow());
@@ -103,7 +110,7 @@ internal sealed class PrWorkflowService
     public async Task<PrWorkflow> RefreshRevisionAsync(string repository, int number,
         CancellationToken cancellation)
     {
-        var current = _store.Get(repository, number)
+        var current = Get(repository, number)
             ?? throw new KeyNotFoundException("Workflow unavailable.");
         if ((current.MergeAttemptId is not null &&
             current.MergeOutcome != "rejected_before_dispatch") ||
@@ -158,7 +165,7 @@ internal sealed class PrWorkflowService
             StringComparer.OrdinalIgnoreCase.Equals(reviewerAccount,
                 _policy.AutomatedReviewer))
             throw new ArgumentException("Independent reviewer must be distinct.");
-        var current = _store.Get(repository, number)
+        var current = Get(repository, number)
             ?? throw new KeyNotFoundException("Workflow unavailable.");
         if (current.ReviewLaunchState != "unstarted" || current.MergeAttemptId is not null)
             throw new InvalidOperationException("Review creation already reserved.");
@@ -242,7 +249,7 @@ internal sealed class PrWorkflowService
     public async Task<PrWorkflow> PublishReviewAsync(string repository, int number,
         CancellationToken cancellation)
     {
-        var record = _store.Get(repository, number)
+        var record = Get(repository, number)
             ?? throw new KeyNotFoundException("Workflow unavailable.");
         var worker = record.Reviewer ??
             throw new InvalidOperationException("No bound reviewer.");
