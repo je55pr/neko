@@ -6,6 +6,10 @@ using Neko;
 
 namespace Neko.Headless;
 
+internal sealed class UnsupportedManagerWaitException() :
+    ArgumentException("--wait is not supported for manager-create or manager-send; " +
+        "use manager-status/history or durable manager-queue.");
+
 internal static class LocalClient
 {
     public static async Task RunAsync(HostConfiguration config, string command, string[] args)
@@ -71,6 +75,11 @@ internal static class LocalClient
         }
 
         var wait = args.Contains("--wait");
+        // An accepted manager receipt is not a completed turn. Until manager
+        // terminal watching is implemented, reject the misleading option
+        // BEFORE sending either operation; never silently ignore it.
+        if (wait && command is ("manager-create" or "manager-send"))
+            throw new UnsupportedManagerWaitException();
         string route;
         HttpMethod method = HttpMethod.Get;
         string? body = null;
@@ -106,10 +115,28 @@ internal static class LocalClient
                 route = "conversations/creation/reconcile";
                 method = HttpMethod.Post;
                 break;
+            case "manager-create" when positional.Count == 2:
+                var managerId = ValidManagerId(positional[0]);
+                route = "managers";
+                method = HttpMethod.Post;
+                body = JsonSerializer.Serialize(new { id = managerId, text = positional[1] });
+                break;
+            case "manager-list" when positional.Count == 0:
+                route = "managers";
+                break;
+            case "manager-status" when positional.Count == 1:
+                route = $"managers/{ManagerName(positional[0])}";
+                break;
+            case "manager-history" when positional.Count == 1:
+                route = $"managers/{ManagerName(positional[0])}/history";
+                break;
+            case "manager-send" when positional.Count == 2:
+                route = $"managers/{ManagerName(positional[0])}/messages";
+                method = HttpMethod.Post;
+                body = JsonSerializer.Serialize(new { text = positional[1] });
+                break;
             case "reconcile-manager" when positional.Count == 1:
-                var name = positional[0].StartsWith("manager/", StringComparison.Ordinal)
-                    ? positional[0]["manager/".Length..] : positional[0];
-                route = $"managers/{Uri.EscapeDataString(name)}/reconcile";
+                route = $"managers/{ManagerName(positional[0])}/reconcile";
                 method = HttpMethod.Post;
                 break;
             case "manager-jobs" when positional.Count == 1:
@@ -230,9 +257,17 @@ internal static class LocalClient
             Uri.EscapeDataString(parts[1]) + "/" + number;
     }
 
+    private static string ValidManagerId(string id)
+    {
+        var canonical = id.StartsWith("manager/", StringComparison.Ordinal)
+            ? id : "manager/" + id;
+        if (!ManagerRegistry.IsValidId(canonical))
+            throw new ArgumentException("Invalid manager identity.");
+        return canonical;
+    }
+
     private static string ManagerName(string id) =>
-        Uri.EscapeDataString(id.StartsWith("manager/", StringComparison.Ordinal)
-            ? id["manager/".Length..] : id);
+        Uri.EscapeDataString(ValidManagerId(id)["manager/".Length..]);
 
     // A pending transcript is an explicit, successful HTTP read state rather than
     // an unknown conversation or a fabricated empty history.

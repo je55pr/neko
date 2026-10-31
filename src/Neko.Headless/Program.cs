@@ -30,6 +30,7 @@ if (command == "help")
     Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch|reconcile <id>; reconcile-creation; reconcile-manager <manager/name>");
     Console.WriteLine("manager-queue <manager/name> <text> [--key key]; manager-messages <manager/name>; manager-message|manager-cancel|manager-retry <manager/name> <message-id>");
     Console.WriteLine("manager-track <manager/name> <accepted-worker-conversation> [repo pr-number] [--operation id] [--deadline ISO]; manager-jobs <manager>; manager-job <manager> <job-id>; manager-interrupt <manager> <job-id> <reason>");
+    Console.WriteLine("manager-create <name> <initial-prompt>; manager-list; manager-status|manager-history <name>; manager-send <name> <text> (no --wait until manager terminal watcher exists)");
     Console.WriteLine("Stop requires provider support; otherwise it returns Unsupported/stop_not_supported without cancelling.");
     return;
 }
@@ -179,8 +180,12 @@ try
 catch (Exception exception)
 {
     // Deliberately exclude provider exception messages and local paths.
-    Console.Error.WriteLine(exception is OperationCanceledException
-        ? "Cancelled." : "Neko failed to start or complete the command. Check local configuration and logs.");
+    Console.Error.WriteLine(exception switch
+    {
+        OperationCanceledException => "Cancelled.",
+        UnsupportedManagerWaitException => new UnsupportedManagerWaitException().Message,
+        _ => "Neko failed to start or complete the command. Check local configuration and logs."
+    });
     Environment.ExitCode = 1;
 }
 
