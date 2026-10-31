@@ -208,7 +208,7 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             // which this automated finding was actually reported.
             var revision = GetString(comment, "original_commit_id");
             if (string.IsNullOrWhiteSpace(author) ||
-                string.IsNullOrWhiteSpace(revision)) return false;
+                !PrReviewGate.ValidSha(revision)) return false;
             if (StringComparer.OrdinalIgnoreCase.Equals(author, configuredReviewer) &&
                 revision == head) return false;
         }

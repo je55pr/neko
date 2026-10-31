@@ -302,8 +302,12 @@ internal sealed class WorkerJobService : IDisposable
                         job = AddEvent(job, "review_findings",
                             "Source review requested changes.",
                             "review." + Hash(review.Url), reviewUrl: review.Url);
+                    // Marker-free empty reviews are a valid opt-in policy.
+                    // Continue notifying the manager whenever the trusted bot
+                    // instead publishes substantive findings on that head.
                     if (!string.IsNullOrWhiteSpace(_policy.AutomatedReviewer) &&
-                        !string.IsNullOrWhiteSpace(_policy.AutomatedNoFindingsMarker))
+                        (!string.IsNullOrWhiteSpace(_policy.AutomatedNoFindingsMarker) ||
+                         _policy.AllowVerifiedEmptyAutomatedReview))
                         foreach (var review in source.Reviews.Where(r =>
                             r.Substantive && r.HeadSha == job.HeadSha &&
                             StringComparer.OrdinalIgnoreCase.Equals(

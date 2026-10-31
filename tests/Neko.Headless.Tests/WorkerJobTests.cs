@@ -29,13 +29,13 @@ public sealed partial class HeadlessRuntimeTests
         ManagerInboxService Inbox, ManagerInboxJournal InboxJournal,
         ManagerRegistry Registry) SetupJobs(string folder, ChatRuntime runtime,
         ManagerService managers, TimeProvider clock, PrSourceFake? source = null,
-        WorkerJobJournal? jobJournal = null)
+        WorkerJobJournal? jobJournal = null, PrReviewPolicy? policyOverride = null)
     {
         var registry = new ManagerRegistry(folder, clock);
         var inboxJournal = new ManagerInboxJournal(folder, clock);
         var inbox = new ManagerInboxService(inboxJournal, managers, runtime, clock);
         var prSource = source ?? new PrSourceFake(GoodSource(clock.GetUtcNow()));
-        var policy = GatePolicy();
+        var policy = policyOverride ?? GatePolicy();
         var workflows = new PrWorkflowService(new PrWorkflowStore(folder, clock),
             prSource, runtime, policy, clock);
         var journal = jobJournal ?? new WorkerJobJournal(folder, clock);
@@ -275,6 +275,51 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Equal(0, source.PostCalls);
         Assert.Equal(0, source.MergeCalls);
         Assert.Equal(0, provider.SendCalls);
+    }
+
+    [Fact]
+    public async Task MarkerFreeAutomatedFindingStillNotifiesIdleManagerOnce()
+    {
+        using var folder = new TemporaryDirectory();
+        var clock = new InboxClock();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        var chat = new ChatJournal(folder.Path);
+        SeedAcceptedWorker(chat);
+        new PrWorkflowStore(folder.Path, clock).Create("sample/project", 7,
+            PrHead, PrBase, "creator", "worker-2", "chat-1");
+        var initial = GoodSource(clock.GetUtcNow());
+        var botFinding = new PrReview("https://example.org/reviews/bot-finding",
+            "auto-account", PrHead, "commented", true, clock.GetUtcNow(),
+            SourceReviewId: 501, AutomatedNoFindings: false);
+        var current = initial with { Reviews =
+            [.. initial.Reviews.Where(r => r.Author != "auto-account"), botFinding] };
+        var source = new PrSourceFake(current);
+        var policy = GatePolicy() with {
+            AutomatedNoFindingsMarker = null,
+            AllowVerifiedEmptyAutomatedReview = true
+        };
+        var setup = SetupJobs(folder.Path, runtime, managers, clock,
+            source: source, policyOverride: policy);
+        using var jobs = setup.Jobs;
+        using var inbox = setup.Inbox;
+        var (registered, error) = jobs.Register("manager/main",
+            new WorkerJobRegisterRequest("worker-2", "op-2", "sample/project", 7));
+        Assert.Null(error);
+        Assert.NotNull(registered);
+        await jobs.ProcessAllAsync(CancellationToken.None);
+        var job = jobs.Get("manager/main", registered.Job.Id)!;
+        Assert.Single(job.Events, e => e.Kind == "review_findings" &&
+            e.ReviewUrl == botFinding.Url);
+        Assert.Single(setup.InboxJournal.List("manager/main"));
+        clock.AdvanceSeconds(180);
+        await jobs.ProcessAllAsync(CancellationToken.None);
+        Assert.Single(jobs.Get("manager/main", job.Id)!.Events);
+        Assert.Single(setup.InboxJournal.List("manager/main"));
+        Assert.Equal(0, provider.SendCalls);
+        Assert.Equal(0, source.PostCalls);
+        Assert.Equal(0, source.MergeCalls);
     }
 
     [Fact]

@@ -252,6 +252,11 @@ public sealed class GhPrSourceAdapterTests
             """);
         Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
             unknownRevision.RootElement, sha, "review-bot"));
+        using var malformedRevision = JsonDocument.Parse("""
+            [{"user":{"login":"review-bot"},"original_commit_id":"bogus"}]
+            """);
+        Assert.False(GhPrSourceAdapter.NoAutomatedInlineCommentsOnHead(
+            malformedRevision.RootElement, sha, "review-bot"));
     }
 
     [Fact]
