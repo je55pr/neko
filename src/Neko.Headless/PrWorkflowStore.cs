@@ -5,7 +5,8 @@ using Neko;
 
 namespace Neko.Headless;
 
-/// <summary>Atomic fsynced PR state, under the host's existing exclusive state lease.</summary>
+/// <summary>Atomic checkpoint snapshots with in-place flushed one-use dispatch guards,
+/// under the host's existing exclusive state lease.</summary>
 internal sealed class PrWorkflowStore
 {
     private readonly string _directory;
@@ -66,7 +67,18 @@ internal sealed class PrWorkflowStore
         }
     }
 
-    public PrWorkflow Update(string repository, int number, Func<PrWorkflow, PrWorkflow> change)
+    public PrWorkflow Update(string repository, int number, Func<PrWorkflow, PrWorkflow> change) =>
+        UpdateCore(repository, number, change, durableDispatchGuard: false);
+
+    // The caller must persist this irrevocable guard before any external write.
+    // Unlike rename-based snapshots, flushing an existing file in place avoids
+    // depending on persistence of a new directory entry after a power failure.
+    public PrWorkflow ReserveForDispatch(string repository, int number,
+        Func<PrWorkflow, PrWorkflow> change) =>
+        UpdateCore(repository, number, change, durableDispatchGuard: true);
+
+    private PrWorkflow UpdateCore(string repository, int number,
+        Func<PrWorkflow, PrWorkflow> change, bool durableDispatchGuard)
     {
         lock (_gate)
         {
@@ -79,12 +91,20 @@ internal sealed class PrWorkflowStore
                 changed.ManagerConversationId != old.ManagerConversationId ||
                 changed.CreatedAt != old.CreatedAt)
                 throw new InvalidOperationException("Workflow identity is immutable.");
-            if (changed == old) return old;
+            if (changed == old)
+            {
+                if (durableDispatchGuard)
+                    throw new InvalidOperationException("One-use dispatch reservation was unchanged.");
+                return old;
+            }
             if (!PrReviewGate.ValidSha(changed.HeadSha) ||
                 !PrReviewGate.ValidSha(changed.BaseSha) ||
                 changed.Audit is null || changed.Audit.Count > 10000)
                 throw new InvalidOperationException("Invalid workflow checkpoint.");
-            Write(file, changed);
+            if (durableDispatchGuard)
+                WriteDispatchGuard(file, changed);
+            else
+                Write(file, changed);
             return changed;
         }
     }
@@ -116,6 +136,21 @@ internal sealed class PrWorkflowStore
             value.Audit.Any(a => a.At == default || string.IsNullOrWhiteSpace(a.Action)))
             throw new InvalidDataException("Workflow checkpoint invalid.");
         return value;
+    }
+
+    private void WriteDispatchGuard(string file, PrWorkflow workflow)
+    {
+        _beforePersist?.Invoke(workflow);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(workflow);
+        // An incomplete in-place write makes the checkpoint unreadable, which
+        // fails closed. A completed Flush(true) commits the reservation before
+        // an external call, without relying on a directory rename for durability.
+        using var stream = new FileStream(file, FileMode.Open, FileAccess.Write,
+            FileShare.None, 4096, FileOptions.WriteThrough);
+        stream.Position = 0;
+        stream.Write(bytes);
+        stream.SetLength(bytes.Length);
+        stream.Flush(flushToDisk: true);
     }
 
     private void Write(string file, PrWorkflow workflow)

@@ -76,7 +76,8 @@ public sealed partial class HeadlessRuntimeTests
             string expectedHead, string body, CancellationToken cancellation)
         {
             cancellation.ThrowIfCancellationRequested();
-            if (repository != Current.Repository || number != Current.Number)
+            if (!StringComparer.OrdinalIgnoreCase.Equals(repository, Current.Repository) ||
+                number != Current.Number)
                 throw new ArgumentException("Unexpected test PR identity.");
             PostCalls++;
             if (expectedHead != Current.HeadSha)
@@ -105,7 +106,8 @@ public sealed partial class HeadlessRuntimeTests
             CancellationToken cancellation)
         {
             cancellation.ThrowIfCancellationRequested();
-            if (repository != Current.Repository || number != Current.Number)
+            if (!StringComparer.OrdinalIgnoreCase.Equals(repository, Current.Repository) ||
+                number != Current.Number)
                 throw new ArgumentException("Unexpected test PR identity.");
             MergeCalls++;
             if (expectedHead != Current.HeadSha)
@@ -117,11 +119,11 @@ public sealed partial class HeadlessRuntimeTests
         }
     }
 
-    private static void ReadyRecord(PrWorkflowStore store)
+    private static void ReadyRecord(PrWorkflowStore store, string repository = "sample/project")
     {
-        var created = store.Create("sample/project", 7, PrHead, PrBase,
+        var created = store.Create(repository, 7, PrHead, PrBase,
             "creator-chat", "developer-chat", "manager-chat");
-        store.Update("sample/project", 7, workflow => store.Append(workflow with {
+        store.Update(repository, 7, workflow => store.Append(workflow with {
             State = "awaiting_automated_review", ReviewLaunchState = "accepted",
             ReviewLaunchAt = created.CreatedAt.AddMilliseconds(10),
             Reviewer = new PrWorkerEvidence("fresh-review-chat", PrHead,
@@ -152,6 +154,35 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Equal("Sample/Project", service.Get("SAMPLE/PROJECT", 7)!.Repository);
         Assert.Equal("Sample/Project", new PrWorkflowStore(folder.Path)
             .Get("sample/project", 7)!.Repository);
+        var inspected = await service.InspectAsync("sample/project", 7, CancellationToken.None);
+        Assert.DoesNotContain("source_identity_mismatch", inspected.Gate.Blockers);
+        var refreshed = await service.RefreshRevisionAsync("SAMPLE/PROJECT", 7,
+            CancellationToken.None);
+        Assert.Equal("Sample/Project", refreshed.Repository);
+        var launched = await service.LaunchReviewerAsync("sample/project", 7,
+            "Review the current PR", "independent-account", CancellationToken.None);
+        Assert.Equal("accepted", launched.ReviewLaunchState);
+        Assert.Equal("Sample/Project", new PrWorkflowStore(folder.Path)
+            .Get("sample/project", 7)!.Repository);
+    }
+
+    [Fact]
+    public async Task CanonicalRepositoryCaseAndCallerAliasCanPassGateAndMerge()
+    {
+        using var folder = new TemporaryDirectory();
+        using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow) with {
+            Repository = "Sample/Project"
+        });
+        var store = new PrWorkflowStore(folder.Path);
+        ReadyRecord(store, "Sample/Project");
+        var service = new PrWorkflowService(store, source, runtime, GatePolicy());
+        var inspected = await service.InspectAsync("sample/project", 7, CancellationToken.None);
+        Assert.True(inspected.Gate.Ready);
+        var result = await service.MergeAsync("SAMPLE/PROJECT", 7, CancellationToken.None);
+        Assert.Equal("merged", result.Outcome);
+        Assert.Equal(1, source.MergeCalls);
+        Assert.Equal("Sample/Project", result.Workflow.Repository);
     }
 
     [Fact]
@@ -285,6 +316,26 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Equal(0, source.MergeCalls);
         Assert.Null(new PrWorkflowStore(folder.Path)
             .Get("sample/project", 7)!.MergeAttemptId);
+    }
+
+    [Fact]
+    public void OneUseDispatchGuardIsDurablyVisibleToFreshStore()
+    {
+        using var folder = new TemporaryDirectory();
+        var store = new PrWorkflowStore(folder.Path);
+        store.Create("sample/project", 7, PrHead, PrBase,
+            "creator-chat", "developer-chat", "manager-chat");
+        var reserved = store.ReserveForDispatch("sample/project", 7,
+            w => store.Append(w with { MergeAttemptId = "one-shot", MergeOutcome = "uncertain" },
+                "merge_reserved", "before_external_dispatch", "one-shot"));
+        Assert.Equal("one-shot", reserved.MergeAttemptId);
+        var fromDisk = new PrWorkflowStore(folder.Path).Get("sample/project", 7)!;
+        Assert.Equal("one-shot", fromDisk.MergeAttemptId);
+        Assert.Contains(fromDisk.Audit!, a => a.Action == "merge_reserved");
+        Assert.Throws<InvalidOperationException>(() => store.ReserveForDispatch(
+            "sample/project", 7, w => w.MergeAttemptId is not null
+                ? throw new InvalidOperationException("Attempt already consumed.")
+                : w with { MergeAttemptId = "two-shot" }));
     }
 
     [Fact]

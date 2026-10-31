@@ -111,7 +111,8 @@ public static class PrReviewGate
         if (policy.AllowedRepositories?.Any(allowed =>
                 StringComparer.OrdinalIgnoreCase.Equals(allowed, workflow.Repository)) != true)
             blockers.Add("repository_not_authorized");
-        if (source.Repository != workflow.Repository || source.Number != workflow.Number)
+        if (!StringComparer.OrdinalIgnoreCase.Equals(source.Repository, workflow.Repository) ||
+            source.Number != workflow.Number)
             blockers.Add("source_identity_mismatch");
         if (source.State != "open" || source.Merged) blockers.Add("pr_not_open");
         if (!source.Mergeable) blockers.Add("pr_not_mergeable");

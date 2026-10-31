@@ -149,7 +149,8 @@ internal sealed class PrWorkflowService
             ReviewPostingUnresolved(current))
             throw new InvalidOperationException("Unresolved external action blocks revision rearm.");
         var source = await _source.ReadAsync(repository, number, cancellation);
-        if (source.Repository != repository || source.Number != number ||
+        if (!StringComparer.OrdinalIgnoreCase.Equals(source.Repository, repository) ||
+            source.Number != number ||
             source.State != "open" || source.Merged ||
             !PrReviewGate.ValidSha(source.HeadSha) || !PrReviewGate.ValidSha(source.BaseSha))
             throw new InvalidOperationException("Source revision unavailable.");
@@ -201,7 +202,8 @@ internal sealed class PrWorkflowService
         if (current.ReviewLaunchState != "unstarted" || current.MergeAttemptId is not null)
             throw new InvalidOperationException("Review creation already reserved.");
         var source = await _source.ReadAsync(repository, number, cancellation);
-        if (source.Repository != repository || source.Number != number ||
+        if (!StringComparer.OrdinalIgnoreCase.Equals(source.Repository, repository) ||
+            source.Number != number ||
             source.HeadSha != current.HeadSha || source.BaseSha != current.BaseSha ||
             source.State != "open" || source.Merged)
             throw new InvalidOperationException("Source head/base changed.");
@@ -218,7 +220,7 @@ internal sealed class PrWorkflowService
             throw new ArgumentException("Reviewer assignment is invalid.");
         var promptSha = Convert.ToHexString(SHA256.HashData(
             Encoding.UTF8.GetBytes(prepared.Text)));
-        _store.Update(repository, number, existing =>
+        _store.ReserveForDispatch(repository, number, existing =>
         {
             // Bind the remote assignment to the same immutable revision that
             // was read and included in its prompt. A concurrent pr-refresh
@@ -318,7 +320,8 @@ internal sealed class PrWorkflowService
         var verdict = ParseReviewerVerdict(body);
         var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
         var source = await _source.ReadAsync(repository, number, cancellation);
-        if (source.Repository != repository || source.Number != number ||
+        if (!StringComparer.OrdinalIgnoreCase.Equals(source.Repository, repository) ||
+            source.Number != number ||
             source.State != "open" || source.HeadSha != record.HeadSha ||
             source.BaseSha != record.BaseSha)
             throw new InvalidOperationException("PR revision changed before review posting.");
@@ -332,7 +335,7 @@ internal sealed class PrWorkflowService
         var attemptId = Guid.NewGuid().ToString("N");
 
         // This one-use durable reservation comes before any external write.
-        _store.Update(repository, number, current =>
+        _store.ReserveForDispatch(repository, number, current =>
         {
             if (current.Reviewer?.ReviewPostAttemptId is not null ||
                 current.HeadSha != record.HeadSha || current.BaseSha != record.BaseSha)
@@ -404,7 +407,7 @@ internal sealed class PrWorkflowService
                 return new PrMergeReport(checkedReport.Workflow, checkedReport.Gate, "blocked");
             var attemptId = Guid.NewGuid().ToString("N");
             // Persist irreversible attempt marker before any external merge write.
-            var reserved = _store.Update(repository, number, w =>
+            var reserved = _store.ReserveForDispatch(repository, number, w =>
             {
                 if (w.MergeAttemptId is not null ||
                     w.HeadSha != checkedReport.Workflow.HeadSha ||
