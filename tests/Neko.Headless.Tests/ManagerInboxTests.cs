@@ -404,7 +404,7 @@ public sealed partial class HeadlessRuntimeTests
         string messageId;
         using (var initial = InboxRuntime(folder.Path, provider))
         {
-            var managers = await CreateIdleManager(initial, folder.Path);
+            await CreateIdleManager(initial, folder.Path);
             var journal = new ManagerInboxJournal(folder.Path);
             messageId = journal.Enqueue("manager/main", "unknown dispatch", null).Message.Id;
             journal.Transition("manager/main", messageId, InboxStates.Queued,
