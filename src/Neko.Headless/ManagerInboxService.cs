@@ -26,6 +26,13 @@ internal sealed class ManagerInboxService : IDisposable
         _runtime = runtime;
         _clock = clock ?? TimeProvider.System;
         _journal.MarkInterruptedDispatches();
+        foreach (var manager in _managers.List())
+        {
+            var unresolved = _journal.List(manager.Id).FirstOrDefault(message =>
+                message.State is InboxStates.Uncertain or InboxStates.Dispatching);
+            if (unresolved is not null)
+                _managers.BlockForInboxUncertainty(manager.Id, unresolved.Id);
+        }
     }
 
     public static bool ValidKey(string? key) =>
@@ -86,8 +93,8 @@ internal sealed class ManagerInboxService : IDisposable
             if (next.State is InboxStates.Accepted or InboxStates.Generating)
             {
                 var manager = _managers.Get(managerId);
-                if (manager?.ConversationId != next.ConversationId ||
-                    manager.ConversationId is null)
+                if (manager is null || manager.ConversationId is null ||
+                    manager.ConversationId != next.ConversationId)
                     return false;
                 var checkpoint = _runtime.Get(manager.ConversationId);
                 if (checkpoint?.Status == "idle" &&
@@ -114,7 +121,8 @@ internal sealed class ManagerInboxService : IDisposable
                 return false;
             }
 
-            if (next.State != InboxStates.Queued || next.NotBefore > _clock.GetUtcNow())
+            if (next.State != InboxStates.Queued ||
+                next.NotBefore is { } notBefore && notBefore > _clock.GetUtcNow())
                 return false;
 
             var current = _managers.Get(managerId);
@@ -154,14 +162,22 @@ internal sealed class ManagerInboxService : IDisposable
             }
             if (receipt.Disposition == SendDisposition.Accepted)
             {
-                _journal.Transition(managerId, next.Id, InboxStates.Dispatching,
-                    message => message with {
-                        State = InboxStates.Accepted,
-                        AcceptedAt = _clock.GetUtcNow(),
-                        ConversationId = current.ConversationId,
-                        RemoteMessageId = receipt.MessageId,
-                        Reason = receipt.Reason
-                    });
+                try
+                {
+                    _journal.Transition(managerId, next.Id, InboxStates.Dispatching,
+                        message => message with {
+                            State = InboxStates.Accepted,
+                            AcceptedAt = _clock.GetUtcNow(),
+                            ConversationId = current.ConversationId,
+                            RemoteMessageId = receipt.MessageId,
+                            Reason = receipt.Reason
+                        });
+                }
+                catch
+                {
+                    TryMarkUncertain(managerId, next.Id, "acceptance_checkpoint_failed");
+                    throw;
+                }
                 return true;
             }
             // An unavailable history preflight and a temporarily busy manager
@@ -171,19 +187,35 @@ internal sealed class ManagerInboxService : IDisposable
                 "conversation_not_idle")
             {
                 var seconds = Math.Max(15, receipt.RetryAfterSeconds ?? 15);
-                _journal.Transition(managerId, next.Id, InboxStates.Dispatching,
-                    message => message with { State = InboxStates.Queued,
-                        DispatchedAt = null,
-                        NotBefore = _clock.GetUtcNow().AddSeconds(seconds),
-                        Reason = receipt.Reason });
+                try
+                {
+                    _journal.Transition(managerId, next.Id, InboxStates.Dispatching,
+                        message => message with { State = InboxStates.Queued,
+                            DispatchedAt = null,
+                            NotBefore = _clock.GetUtcNow().AddSeconds(seconds),
+                            Reason = receipt.Reason });
+                }
+                catch
+                {
+                    TryMarkUncertain(managerId, next.Id, "preflight_checkpoint_failed");
+                    throw;
+                }
                 return false;
             }
 
-            _journal.Transition(managerId, next.Id, InboxStates.Dispatching,
-                message => message with { State = InboxStates.Rejected,
-                    Reason = receipt.Reason, Retryable = receipt.Retryable,
-                    NotBefore = receipt.RetryAfterSeconds is int seconds
-                        ? _clock.GetUtcNow().AddSeconds(Math.Max(0, seconds)) : null });
+            try
+            {
+                _journal.Transition(managerId, next.Id, InboxStates.Dispatching,
+                    message => message with { State = InboxStates.Rejected,
+                        Reason = receipt.Reason, Retryable = receipt.Retryable,
+                        NotBefore = receipt.RetryAfterSeconds is int seconds
+                            ? _clock.GetUtcNow().AddSeconds(Math.Max(0, seconds)) : null });
+            }
+            catch
+            {
+                TryMarkUncertain(managerId, next.Id, "rejection_checkpoint_failed");
+                throw;
+            }
             return true;
         }
         finally { gate.Release(); }
@@ -229,7 +261,9 @@ internal sealed class ManagerInboxService : IDisposable
             _journal.Transition(managerId, messageId, InboxStates.Dispatching,
                 message => message with { State = InboxStates.Uncertain, Reason = reason });
         }
-        catch (IOException) { /* Durable dispatching remains fail-closed on restart. */ }
+        catch (Exception) { /* Durable dispatching remains fail-closed on restart. */ }
+        // Hold the in-process manager gate even if disk persistence failed.
+        _managers.BlockForInboxUncertainty(managerId, messageId);
     }
 
     public void Dispose()

@@ -35,6 +35,14 @@ internal static class LocalClient
                 continue;
             }
             if (args[i] == "--wait") continue;
+            if (args[i] == "--key")
+            {
+                if (command != "manager-queue" || i + 1 >= args.Length ||
+                    args[i + 1].StartsWith("--"))
+                    throw new ArgumentException("--key requires a value for manager-queue.");
+                i++;
+                continue;
+            }
             positional.Add(args[i]);
         }
 
@@ -47,9 +55,7 @@ internal static class LocalClient
                 args[keyIndex + 1].StartsWith("--"))
                 throw new ArgumentException("--key requires a value for manager-queue.");
             idempotencyKey = args[keyIndex + 1];
-            // The generic positional parser includes --key; strip both tokens.
-            positional.Remove("--key");
-            positional.Remove(idempotencyKey);
+            // The generic positional parser already removed these tokens.
         }
         string route;
         HttpMethod method = HttpMethod.Get;

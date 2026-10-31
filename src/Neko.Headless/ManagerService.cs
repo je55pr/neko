@@ -23,6 +23,30 @@ internal sealed class ManagerService
     private readonly ManagerRegistry _registry;
     private readonly ChatRuntime _runtime;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _sendGates = new();
+    private readonly ConcurrentDictionary<string, string> _inboxBlocks = new();
+
+    // If the inbox reserved a remote dispatch but the process died before the
+    // manager journal took over, fail closed even if the conversation is idle.
+    // Keep an in-process latch if registry storage itself is unavailable.
+    public void BlockForInboxUncertainty(string id, string operationId)
+    {
+        if (_registry.Get(id) is null) return;
+        _inboxBlocks[id] = operationId;
+        _registry.Update(id, record =>
+            record.LifecycleState is "idle" or "generating" or "sending"
+                ? record with { LifecycleState = "uncertain",
+                    PendingOperationId = operationId } : record);
+    }
+
+    private void ReleaseVerifiedInboxBlock(string id, string conversationId)
+    {
+        if (!_inboxBlocks.TryGetValue(id, out var operationId)) return;
+        var record = _runtime.Get(conversationId);
+        if (record?.Status == "idle" &&
+            record.LastReconciliation is { Outcome: "restored" } proof &&
+            proof.OperationId == operationId)
+            _inboxBlocks.TryRemove(id, out _);
+    }
 
     public ManagerService(ManagerRegistry registry, ChatRuntime runtime)
     {
@@ -133,6 +157,9 @@ internal sealed class ManagerService
         {
             var current = Get(id);
             if (current is null) return null;
+            if (_inboxBlocks.ContainsKey(id))
+                return new ManagerSendResult(current,
+                    new SendReceipt(SendDisposition.Rejected, "inbox_uncertainty_blocked"));
             if (current.ConversationId is null || current.LifecycleState != "idle")
                 return new ManagerSendResult(current,
                     new SendReceipt(SendDisposition.Rejected, "manager_not_idle"));
@@ -215,6 +242,7 @@ internal sealed class ManagerService
                     record.LifecycleState == "uncertain" &&
                     record.ConversationId == resolved.ConversationId
                         ? record with { LifecycleState = "idle" } : record);
+                ReleaseVerifiedInboxBlock(id, resolved.ConversationId);
                 return new(Snapshot(updated), resolved);
             }
             return new(Get(id)!, resolved);
