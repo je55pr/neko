@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -13,7 +14,14 @@ internal static class LocalClient
             new Uri($"http://127.0.0.1:{config.Port}/"), Timeout = Timeout.InfiniteTimeSpan };
         client.DefaultRequestHeaders.Authorization =
             new AuthenticationHeaderValue("Bearer", config.AccessToken);
+        var exitCode = await RunCommandAsync(client, command, args, Console.Out, Console.Error);
+        if (exitCode != 0) Environment.ExitCode = exitCode;
+    }
 
+    // Exercise the actual command and HTTP path with injected in-memory responses.
+    internal static async Task<int> RunCommandAsync(
+        HttpClient client, string command, string[] args, TextWriter output, TextWriter error)
+    {
         var positional = new List<string>();
         var skipConfigValue = false;
         for (var i = 1; i < args.Length; i++)
@@ -60,7 +68,7 @@ internal static class LocalClient
                 break;
             case "watch" when positional.Count == 1:
                 await WatchAsync(client, positional[0]);
-                return;
+                return 0;
             default: throw new ArgumentException("Unsupported command or incorrect arguments.");
         }
 
@@ -68,20 +76,46 @@ internal static class LocalClient
         if (body is not null) request.Content = new StringContent(body, Encoding.UTF8, "application/json");
         using var response = await client.SendAsync(request);
         var result = await response.Content.ReadAsStringAsync();
+        if (command == "read" && TryWriteReadStatus(
+            response.StatusCode, result, output, error, out var exitCode))
+            return exitCode;
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException("The local service rejected the request.");
-        Console.WriteLine(result);
-        if (!wait || command is not ("create" or "send")) return;
+        output.WriteLine(result);
+        if (!wait || command is not ("create" or "send")) return 0;
 
         using var document = JsonDocument.Parse(result);
         var root = document.RootElement;
         if (!root.TryGetProperty("disposition", out var disposition) ||
             (disposition.ValueKind == JsonValueKind.String
                 ? disposition.GetString() != nameof(SendDisposition.Accepted)
-                : disposition.GetInt32() != (int)SendDisposition.Accepted)) return;
+                : disposition.GetInt32() != (int)SendDisposition.Accepted)) return 0;
         var id = command == "send" ? positional[0] :
             root.TryGetProperty("conversationId", out var property) ? property.GetString() : null;
         if (id is not null) await WatchAsync(client, id);
+        return 0;
+    }
+
+    // A pending transcript is an explicit, successful HTTP read state rather than
+    // an unknown conversation or a fabricated empty history.
+    internal static bool TryWriteReadStatus(
+        HttpStatusCode status, string payload, TextWriter output, TextWriter error,
+        out int exitCode)
+    {
+        exitCode = 0;
+        if (status == HttpStatusCode.Accepted)
+        {
+            output.WriteLine(payload);
+            error.WriteLine("History pending for a known conversation; retry read later.");
+            return true;
+        }
+        if (status == HttpStatusCode.NotFound)
+        {
+            exitCode = 1;
+            error.WriteLine("Conversation not found.");
+            return true;
+        }
+        return false;
     }
 
     private static async Task WatchAsync(HttpClient client, string id)

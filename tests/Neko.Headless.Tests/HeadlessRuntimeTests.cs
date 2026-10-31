@@ -5,7 +5,7 @@ using Neko.Headless;
 
 namespace Neko.Headless.Tests;
 
-public sealed class HeadlessRuntimeTests
+public sealed partial class HeadlessRuntimeTests
 {
     [Fact]
     public async Task ScopedConversationCanBeCreatedCompletedAndContinued()
@@ -25,7 +25,7 @@ public sealed class HeadlessRuntimeTests
         var sent = await runtime.SendAsync("chat-1", "second", CancellationToken.None);
         Assert.Equal(SendDisposition.Accepted, sent.Disposition);
         await WaitForTerminal(runtime, "chat-1");
-        var history = await runtime.ReadAsync("chat-1", CancellationToken.None);
+        var history = (await runtime.ReadAsync("chat-1", CancellationToken.None)).History;
         Assert.NotNull(history);
         Assert.Equal(4, history.Messages.Count);
         Assert.Equal("second", history.Messages[2].Text);
@@ -81,7 +81,7 @@ public sealed class HeadlessRuntimeTests
             runtime.List().Single().Status!="sending";attempt++)
             await Task.Delay(10);
         inner.InjectMessage("updated during read");
-        var read=await runtime.ReadAsync("chat-1",CancellationToken.None);
+        var read=(await runtime.ReadAsync("chat-1",CancellationToken.None)).History;
         Assert.NotNull(read);
         Assert.Contains(read.Messages,message=>message.Text=="updated during read");
         Assert.Contains(runtime.List().Single().History!.Messages,
@@ -127,7 +127,7 @@ public sealed class HeadlessRuntimeTests
         }
         using var second = new ChatRuntime(
             new ScopedConversationProvider(new FakeProvider(), "scope-a"), new ChatJournal(folder.Path));
-        var cached = await second.ReadAsync("chat-1", CancellationToken.None);
+        var cached = (await second.ReadAsync("chat-1", CancellationToken.None)).History;
         Assert.Equal(2, cached?.Messages.Count);
         var rejected = await second.SendAsync("chat-1", "do not misroute", CancellationToken.None);
         Assert.Equal("provider_history_unavailable", rejected.Reason);
@@ -194,7 +194,7 @@ public sealed class HeadlessRuntimeTests
             (await runtime.SendAsync("chat-1", "follow-up", CancellationToken.None)).Disposition);
         await WaitForTerminal(runtime, "chat-1");
         Assert.Equal("idle", runtime.Get("chat-1")?.Status);
-        Assert.Equal(4, (await runtime.ReadAsync("chat-1", CancellationToken.None))?.Messages.Count);
+        Assert.Equal(4, (await runtime.ReadAsync("chat-1", CancellationToken.None)).History?.Messages.Count);
         Assert.Equal(0, inner.StopCalls);
     }
 
@@ -295,7 +295,7 @@ public sealed class HeadlessRuntimeTests
         Assert.Fail("No completed reply.");
     }
 
-    private sealed class FakeProvider : IScopedConversationProvider
+    private sealed partial class FakeProvider : IScopedConversationProvider, IProviderRateLimitStatus
     {
         public string? Scope;
         public int UnscopedCreations;
@@ -306,6 +306,9 @@ public sealed class HeadlessRuntimeTests
         public bool SupportsStop { get; set; } = true;
         public int StopCalls;
         public bool FailNextRead;
+        public int? RateLimitRetryAfterSeconds { get; set; }
+        public int ReadCalls;
+        public int SendCalls;
         public TaskCompletionSource<SendReceipt>? PendingSend;
         public void CompletePending() =>
             _events.Writer.TryWrite(new PublicConversationUpdate(
@@ -334,6 +337,7 @@ public sealed class HeadlessRuntimeTests
         }
         public Task<SendReceipt> SendAsync(string id, string text, CancellationToken cancellation)
         {
+            Interlocked.Increment(ref SendCalls);
             if(PendingSend is not null)return PendingSend.Task;
             if (UncertainNextSend) return Task.FromResult(
                 new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"));
@@ -362,6 +366,10 @@ public sealed class HeadlessRuntimeTests
         }
         public Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation)
         {
+            Interlocked.Increment(ref ReadCalls);
+            if (PendingRead is not null) return PendingRead.Task;
+            if (ThrowOnRead) throw new InvalidOperationException("Simulated read unavailable.");
+            if (ReturnNullHistory) return Task.FromResult<VisibleConversation?>(null);
             if (FailNextRead)
             {
                 FailNextRead = false;

@@ -42,11 +42,13 @@ The server binds to `127.0.0.1` on the configured port. Every endpoint requires 
 | `/health` | GET | Health check |
 | `/conversations` | GET | Locally tracked conversations |
 | `/conversations` | POST | Create a conversation in the configured scope |
-| `/conversations/{id}` | GET | Latest saved history, with server refresh |
+| `/conversations/{id}` | GET | 200: transcript (refreshed from provider, or last saved checkpoint); 202: known ID but no history yet; 404: unknown ID |
 | `/conversations/{id}/status` | GET | Current local operation status |
 | `/conversations/{id}/messages` | POST | Continue an existing conversation |
 | `/conversations/{id}/events` | GET | Server-sent incremental text updates |
 | `/conversations/{id}/stop` | POST | Returns `Unsupported` / `stop_not_supported` without changing conversation state; remote stop is **not implemented** |
+
+A known conversation whose provider history and local checkpoint are both unavailable returns HTTP **202 Accepted** with `{"status":"pending","reason":"provider_history_unavailable","conversationId":"..."}`. This means no transcript is available yet, **not** that generation has completed or that messages are empty. Retry the read later; `GET /conversations/{id}/status` separately reports generation state. When history becomes available, the same GET returns its original 200 transcript shape. Unknown IDs remain HTTP 404. The CLI prints pending JSON and an explanatory diagnostic with success exit status; unknown IDs produce a specific error and a nonzero exit status.
 
 Create/send JSON receipts (also printed unchanged by the CLI) now include optional `retryable` and `retryAfterSeconds` fields. `retryable: true` means the particular request was definitively rejected and a **new, explicitly requested** guarded attempt is safe; it does not promise eventual success. `retryAfterSeconds` is the bounded, rounded-up **remaining local provider cooldown** when known, not a guarantee of availability. Null means unknown or inapplicable, **not** retry immediately. `Accepted` and `Uncertain` must never be automatically resent, regardless of those fields. Existing `disposition`, `reason`, and operation state meanings are unchanged.
 
