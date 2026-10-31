@@ -142,17 +142,35 @@ public sealed class SupervisorExecutionBoundaryTests
             UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardOutput = true, RedirectStandardError = true
         };
+        start.ArgumentList.Add("-NoLogo");
         start.ArgumentList.Add("-NoProfile");
         start.ArgumentList.Add("-NonInteractive");
-        start.ArgumentList.Add("-Command");
-        start.ArgumentList.Add(command);
+        start.ArgumentList.Add("-ExecutionPolicy");
+        start.ArgumentList.Add("Bypass");
+        // EncodedCommand avoids differing Windows shell argument quoting.
+        start.ArgumentList.Add("-EncodedCommand");
+        start.ArgumentList.Add(Convert.ToBase64String(
+            System.Text.Encoding.Unicode.GetBytes(command)));
         using var child = Process.Start(start)!;
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        var stdout = child.StandardOutput.ReadToEndAsync(timeout.Token);
-        var stderr = child.StandardError.ReadToEndAsync(timeout.Token);
-        await child.WaitForExitAsync(timeout.Token);
-        var message = await stdout + "\n" + await stderr;
-        return (child.ExitCode, message);
+        // A cold Windows PowerShell 5.1 startup on a shared CI runner may take
+        // much longer than on the developer machine. Keep the subprocess
+        // bounded, but avoid a flaky 15-second deadline.
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        try
+        {
+            var stdout = child.StandardOutput.ReadToEndAsync(timeout.Token);
+            var stderr = child.StandardError.ReadToEndAsync(timeout.Token);
+            await child.WaitForExitAsync(timeout.Token);
+            var message = await stdout + "\n" + await stderr;
+            return (child.ExitCode, message);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            try { child.Kill(entireProcessTree: true); }
+            catch (InvalidOperationException) { }
+            throw new TimeoutException(
+                "Isolated PowerShell inventory test did not exit within 90 seconds.");
+        }
     }
 
     private sealed class ScratchFolder : IDisposable
