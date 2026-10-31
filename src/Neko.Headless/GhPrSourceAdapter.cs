@@ -88,6 +88,14 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         root.TryGetProperty(key, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString() : null;
 
+    // A missing, null or non-string review body is not an explicit blank
+    // automated review. Never grant a no-findings assertion on parsing failure.
+    internal static bool ExplicitEmptyReviewBody(JsonElement review) =>
+        review.ValueKind == JsonValueKind.Object &&
+        review.TryGetProperty("body", out var body) &&
+        body.ValueKind == JsonValueKind.String &&
+        body.GetString() == "";
+
     // A deleted source account has no login. Keep those review identities
     // distinct so one deleted account's approval cannot erase another's
     // active change request. Such markers never match configured accounts.
@@ -399,7 +407,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
                 _policy?.AutomatedReviewer, reviewId, reviewComments,
                 body, _policy?.AutomatedNoFindingsMarker,
                 _policy?.AllowVerifiedEmptyAutomatedReview == true &&
-                    verdict == "commented" && GetString(r, "commit_id") == head,
+                    verdict == "commented" && GetString(r, "commit_id") == head &&
+                    ExplicitEmptyReviewBody(r),
                 emptyReviewCommentsClear);
             sourceReviews.Add(new PrReview(GetString(r, "html_url") ?? "",
                 authorId, GetString(r, "commit_id") ?? "", verdict,

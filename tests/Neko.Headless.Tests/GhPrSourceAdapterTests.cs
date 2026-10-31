@@ -209,6 +209,22 @@ public sealed class GhPrSourceAdapterTests
             "another-account", "automated-account", 78, linked, body, marker));
     }
 
+    [Theory]
+    [InlineData("{\"body\":\"\"}", true)]
+    [InlineData("{}", false)]
+    [InlineData("{\"body\":null}", false)]
+    [InlineData("{\"body\":7}", false)]
+    [InlineData("{\"body\":[]}", false)]
+    [InlineData("{\"body\":\" \"}", false)]
+    [InlineData("{\"body\":\"finding\"}", false)]
+    public void OnlyExplicitJsonEmptyStringCanBeAZeroFindingReview(
+        string json, bool valid)
+    {
+        using var document = JsonDocument.Parse(json);
+        Assert.Equal(valid, GhPrSourceAdapter.ExplicitEmptyReviewBody(
+            document.RootElement));
+    }
+
     [Fact]
     public void VerifiedEmptyAutomatedReviewRequiresOptInAndExhaustiveCommentEvidence()
     {
