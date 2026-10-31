@@ -295,7 +295,7 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Fail("No completed reply.");
     }
 
-    private sealed class FakeProvider : IScopedConversationProvider
+    private sealed class FakeProvider : IScopedConversationProvider, IProviderRateLimitStatus
     {
         public string? Scope;
         public int UnscopedCreations;
@@ -308,7 +308,9 @@ public sealed partial class HeadlessRuntimeTests
         public bool FailNextRead;
         public bool ReturnNullHistory;
         public bool ThrowOnRead;
+        public int? RateLimitRetryAfterSeconds { get; set; }
         public int ReadCalls;
+        public int SendCalls;
         public TaskCompletionSource<VisibleConversation?>? PendingRead;
         public TaskCompletionSource<SendReceipt>? PendingSend;
         public void CompletePending() =>
@@ -338,6 +340,7 @@ public sealed partial class HeadlessRuntimeTests
         }
         public Task<SendReceipt> SendAsync(string id, string text, CancellationToken cancellation)
         {
+            Interlocked.Increment(ref SendCalls);
             if(PendingSend is not null)return PendingSend.Task;
             if (UncertainNextSend) return Task.FromResult(
                 new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"));

@@ -36,7 +36,24 @@ public enum SendDisposition { Rejected, Accepted, Uncertain }
 
 public sealed record SendReceipt(
     SendDisposition Disposition,string Reason="",string? ConversationId=null,
-    string? MessageId=null);
+    string? MessageId=null)
+{
+    // Only true when the operation was definitively rejected before acceptance
+    // and a later explicit attempt is safe. Null means no retry claim is made;
+    // an Uncertain/Accepted receipt must never be automatically replayed.
+    public bool? Retryable { get; init; }
+    // Remaining local cooldown, if known. Null does not mean zero seconds.
+    public int? RetryAfterSeconds { get; init; }
+}
+
+/// <summary>
+/// Optional, local-only rate-limit observation. Reading it must not issue
+/// network requests; a null value means no active known provider cooldown.
+/// </summary>
+public interface IProviderRateLimitStatus
+{
+    int? RateLimitRetryAfterSeconds { get; }
+}
 
 public enum StopDisposition { NotActive, Requested, Uncertain, Unsupported }
 

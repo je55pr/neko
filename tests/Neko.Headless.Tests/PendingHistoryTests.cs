@@ -51,6 +51,54 @@ public sealed partial class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task RateLimitedHistoryReadKeepsKnownPendingAndUnknownMissingWithoutReplay()
+    {
+        using var folder = new TemporaryDirectory();
+        var inner = new FakeProvider
+        {
+            ReturnNullHistory = true,
+            RateLimitRetryAfterSeconds = 75
+        };
+        var journal = new ChatJournal(folder.Path);
+        journal.Set(new ChatRecord("chat-1", "idle"));
+        using var runtime = new ChatRuntime(
+            new ScopedConversationProvider(inner, "scope-a"), journal);
+
+        var (pendingStatus, pendingBody) = await RequestHistoryAsync(runtime, "chat-1");
+        Assert.Equal(StatusCodes.Status202Accepted, pendingStatus);
+        using (var pending = JsonDocument.Parse(pendingBody))
+        {
+            Assert.Equal("pending", pending.RootElement.GetProperty("status").GetString());
+            Assert.Equal("provider_history_unavailable",
+                pending.RootElement.GetProperty("reason").GetString());
+            Assert.False(pending.RootElement.TryGetProperty("messages", out _));
+        }
+        var (missingStatus, _) = await RequestHistoryAsync(runtime, "missing");
+        Assert.Equal(StatusCodes.Status404NotFound, missingStatus);
+        Assert.Equal(1, inner.ReadCalls);
+        Assert.Equal(0, inner.SendCalls);
+        Assert.Equal("idle", runtime.Get("chat-1")!.Status);
+
+        var rejected = await runtime.SendAsync("chat-1", "blocked by history", CancellationToken.None);
+        Assert.Equal(SendDisposition.Rejected, rejected.Disposition);
+        Assert.Equal("provider_history_unavailable", rejected.Reason);
+        Assert.True(rejected.Retryable);
+        Assert.Equal(75, rejected.RetryAfterSeconds);
+        Assert.Equal(0, inner.SendCalls);
+        Assert.Equal("idle", runtime.Get("chat-1")!.Status);
+
+        inner.ReturnNullHistory = false;
+        inner.RateLimitRetryAfterSeconds = null;
+        inner.InjectMessage("remote transcript restored");
+        var (restoredStatus, restoredBody) = await RequestHistoryAsync(runtime, "chat-1");
+        Assert.Equal(StatusCodes.Status200OK, restoredStatus);
+        using var restored = JsonDocument.Parse(restoredBody);
+        Assert.Equal("remote transcript restored",
+            restored.RootElement.GetProperty("messages")[0].GetProperty("text").GetString());
+        Assert.Equal(0, inner.SendCalls);
+    }
+
+    [Fact]
     public async Task UnknownConversationReturns404WithoutProviderRead()
     {
         using var folder = new TemporaryDirectory();
