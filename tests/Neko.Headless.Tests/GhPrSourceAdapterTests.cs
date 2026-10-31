@@ -249,6 +249,31 @@ public sealed class GhPrSourceAdapterTests
                 missingOriginal.RootElement, head, "review-bot"));
     }
 
+    [Fact]
+    public void InvalidStandaloneBotFindingProvenanceFailsClosed()
+    {
+        const string head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        var invalid = new[] {
+            // Even a reanchored, OLD-head comment must have a valid original.
+            """{"id":20,"user":{"login":"review-bot"},"original_commit_id":"bogus","commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","html_url":"https://github.com/example/pr#comment-20"}""",
+            // Current-head unlinked findings require stable positive IDs.
+            """{"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"https://github.com/example/pr#comment"}""",
+            """{"id":0,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"https://github.com/example/pr#comment-0"}""",
+            """{"id":-1,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"https://github.com/example/pr#comment-negative"}""",
+            // URLs must be present and use HTTPS.
+            """{"id":21,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}""",
+            """{"id":22,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"http://github.com/example/pr#comment-22"}""",
+            """{"id":23,"user":{"login":"review-bot"},"original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","html_url":"not-a-url"}"""
+        };
+        foreach (var entry in invalid)
+        {
+            using var comments = JsonDocument.Parse("[" + entry + "]");
+            Assert.Throws<InvalidOperationException>(() =>
+                GhPrSourceAdapter.StandaloneAutomatedFindings(
+                    comments.RootElement, head, "review-bot"));
+        }
+    }
+
     [Theory]
     [InlineData("{\"body\":\"\"}", true)]
     [InlineData("{}", false)]
