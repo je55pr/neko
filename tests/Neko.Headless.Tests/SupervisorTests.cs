@@ -120,9 +120,12 @@ public sealed class SupervisorTests
         var assembly = Path.Combine(image, "Neko.Headless.dll");
         var runtime = Path.Combine(image, "Neko.Headless.exe");
         var dependency = Path.Combine(image, "Neko.Core.dll");
-        var provider = Path.Combine(folder.Path, "provider.dll");
+        var providerDir = Path.Combine(folder.Path, "transport");
+        Directory.CreateDirectory(providerDir);
+        var provider = Path.Combine(providerDir, "provider.dll");
+        var sidecar = Path.Combine(providerDir, "WebView2.Sidecar.dll");
         var settings = Path.Combine(folder.Path, "provider-settings.json");
-        foreach (var path in new[] { assembly, runtime, dependency, provider, settings })
+        foreach (var path in new[] { assembly, runtime, dependency, provider, sidecar, settings })
             File.WriteAllText(path, "original-file");
         var config = Config(folder.Path) with {
             ProviderAssembly = provider, ProviderSettings = settings
@@ -132,7 +135,15 @@ public sealed class SupervisorTests
         Assert.Contains(Path.GetFullPath(assembly), original.Keys);
         Assert.Contains(Path.GetFullPath(dependency), original.Keys);
         Assert.Contains(Path.GetFullPath(provider), original.Keys);
+        Assert.Contains(Path.GetFullPath(sidecar), original.Keys);
         Assert.Contains(Path.GetFullPath(settings), original.Keys);
+        Assert.True(SupervisorControls.PinnedFilesMatch(original));
+        File.WriteAllText(sidecar, "replaced-sidecar");
+        Assert.False(SupervisorControls.PinnedFilesMatch(original));
+        var changedSidecar = SupervisorControls.PinnedRuntimeFiles(
+            runtime, assembly, config);
+        Assert.NotEqual(original[Path.GetFullPath(sidecar)],
+            changedSidecar[Path.GetFullPath(sidecar)]);
         File.WriteAllText(dependency, "replaced-dependency");
         var changed = SupervisorControls.PinnedRuntimeFiles(runtime, assembly, config);
         Assert.NotEqual(original[Path.GetFullPath(dependency)],
@@ -341,6 +352,9 @@ public sealed class SupervisorTests
                 command.ArgumentList.Add("exit");
                 command.ArgumentList.Add("42");
                 return Process.Start(command)!;
+            }, pinnedFiles: new Dictionary<string, string> {
+                [LocalNoopExecutable()] =
+                    SupervisorControls.ManifestDigest(LocalNoopExecutable())
             });
         Assert.Equal(0, await supervisor.RunAsync(cancel.Token));
 
@@ -360,6 +374,43 @@ public sealed class SupervisorTests
         Assert.Contains(logs, line => line.Contains("restart_scheduled"));
         Assert.DoesNotContain(logs, line => line.Contains("send_") ||
             line.Contains("reconcile_") || line.Contains("creation_cleared"));
+    }
+
+    [Fact]
+    public async Task ChangedPinnedExecutableBlocksEveryAutomaticRestart()
+    {
+        using var folder = new TestFolder();
+        var config = Config(folder.Path);
+        var path = SaveConfig(folder.Path, config);
+        var dependency = Path.Combine(folder.Path, "sidecar.dll");
+        File.WriteAllText(dependency, "original");
+        var pinned = new Dictionary<string, string> {
+            [dependency] = SupervisorControls.ManifestDigest(dependency)
+        };
+        var launches = 0;
+        using var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        var supervisor = new HostSupervisor(path, config,
+            LocalNoopExecutable(), typeof(HostSupervisor).Assembly.Location,
+            () =>
+            {
+                launches++;
+                // Simulate a binary replacement while the first child runs.
+                File.WriteAllText(dependency, "replaced");
+                var command = new ProcessStartInfo("cmd.exe") {
+                    UseShellExecute = false, CreateNoWindow = true
+                };
+                command.ArgumentList.Add("/C");
+                command.ArgumentList.Add("exit");
+                command.ArgumentList.Add("0");
+                return Process.Start(command)!;
+            }, pinnedFiles: pinned);
+        Assert.Equal(4, await supervisor.RunAsync(cancel.Token));
+        Assert.Equal(1, launches);
+        var latest = new SupervisorStore(folder.Path).Read();
+        Assert.Equal("blocked", latest?.State);
+        Assert.Equal("execution_image_changed", latest?.Reason);
+        Assert.Contains(new SupervisorStore(folder.Path).Tail(), line =>
+            line.Contains("execution_image_changed_restart_requires_operator"));
     }
 
     private static string LocalNoopExecutable()

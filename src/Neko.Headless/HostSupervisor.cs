@@ -202,10 +202,12 @@ internal sealed class HostSupervisor
     private readonly string _executable;
     private readonly string _assembly;
     private readonly Func<Process>? _startOverride;
+    private IReadOnlyDictionary<string, string>? _pinnedFiles;
     private readonly int _pid = Environment.ProcessId;
 
     public HostSupervisor(string configPath, HostConfiguration config,
-        string executable, string assembly, Func<Process>? startOverride = null)
+        string executable, string assembly, Func<Process>? startOverride = null,
+        IReadOnlyDictionary<string, string>? pinnedFiles = null)
     {
         _configPath = Path.GetFullPath(configPath);
         _config = config;
@@ -214,6 +216,7 @@ internal sealed class HostSupervisor
         _executable = Path.GetFullPath(executable);
         _assembly = Path.GetFullPath(assembly);
         _startOverride = startOverride;
+        _pinnedFiles = pinnedFiles;
     }
 
     private void Publish(string state, string reason, int? childPid = null,
@@ -290,6 +293,27 @@ internal sealed class HostSupervisor
                         ? "port_owned_by_other_configuration"
                         : "port_occupied_without_state_owner");
                     return 5;
+                }
+
+                // Re-check the exact registered execution image on EVERY
+                // launch, including after an exited child. A one-time logon
+                // validation is insufficient for crash-restart supervision.
+                try
+                {
+                    _pinnedFiles ??= SupervisorControls.PinnedRuntimeFiles(
+                        _executable, _assembly, _config);
+                }
+                catch (Exception)
+                {
+                    _store.TryLog("execution_image_unverifiable");
+                    Publish("blocked", "execution_image_unverifiable");
+                    return 4;
+                }
+                if (!SupervisorControls.PinnedFilesMatch(_pinnedFiles))
+                {
+                    _store.TryLog("execution_image_changed_restart_requires_operator");
+                    Publish("blocked", "execution_image_changed");
+                    return 4;
                 }
 
                 Process child;

@@ -58,16 +58,24 @@ internal static class SupervisorControls
             ?? throw new InvalidOperationException("Host assembly directory unavailable.");
         var files = new SortedDictionary<string, string>(
             StringComparer.OrdinalIgnoreCase);
-        foreach (var path in Directory.EnumerateFiles(folder, "*",
-                     SearchOption.AllDirectories))
+        // Provider implementations may be built into a *different* output
+        // directory, with native and managed sidecar dependencies. Pin both
+        // dependency closures, not just the provider's primary assembly.
+        foreach (var directory in new[] { folder,
+                     Path.GetDirectoryName(config.ProviderAssembly)! }
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            var extension = Path.GetExtension(path);
-            if (extension.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
-                extension.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
-                extension.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
-                extension.Equals(".so", StringComparison.OrdinalIgnoreCase) ||
-                extension.Equals(".dylib", StringComparison.OrdinalIgnoreCase))
-                files[Path.GetFullPath(path)] = ManifestDigest(path);
+            foreach (var path in Directory.EnumerateFiles(directory, "*",
+                         SearchOption.AllDirectories))
+            {
+                var extension = Path.GetExtension(path);
+                if (extension.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+                    extension.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
+                    extension.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+                    extension.Equals(".so", StringComparison.OrdinalIgnoreCase) ||
+                    extension.Equals(".dylib", StringComparison.OrdinalIgnoreCase))
+                    files[Path.GetFullPath(path)] = ManifestDigest(path);
+            }
         }
         foreach (var path in new[] { runtime, assembly, config.ProviderAssembly,
                      config.ProviderSettings })
@@ -83,19 +91,63 @@ internal static class SupervisorControls
         return files;
     }
 
-    private static bool ManifestVerified(string key)
+    internal static bool PinnedFilesMatch(
+        IReadOnlyDictionary<string, string>? pinned)
+    {
+        if (pinned is not { Count: > 0 }) return false;
+        try
+        {
+            foreach (var file in pinned)
+            {
+                if (!Path.IsPathFullyQualified(file.Key) ||
+                    file.Value.Length != 64 ||
+                    !StringComparer.OrdinalIgnoreCase.Equals(
+                        file.Value, ManifestDigest(file.Key)))
+                    return false;
+            }
+            return true;
+        }
+        catch (Exception error) when (error is IOException or
+            UnauthorizedAccessException or ArgumentException)
+        { return false; }
+    }
+
+    private static SupervisorLaunchManifest? TrustedManifest(string key)
     {
         using var values = Registry.CurrentUser.OpenSubKey(ManifestKey, writable: false);
         var stored = values?.GetValue(key) as string;
         var launcher = values?.GetValue(key + "-launcher") as string;
         if (stored is not { Length: 64 } || launcher is not { Length: 64 })
-            return false;
-        try { return StringComparer.OrdinalIgnoreCase.Equals(
-            stored, ManifestDigest(ManifestPath(key))) &&
-            StringComparer.OrdinalIgnoreCase.Equals(
-                launcher, ManifestDigest(InstalledLauncherPath(key))); }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-        { return false; }
+            return null;
+        try
+        {
+            if (!StringComparer.OrdinalIgnoreCase.Equals(
+                    stored, ManifestDigest(ManifestPath(key))) ||
+                !StringComparer.OrdinalIgnoreCase.Equals(
+                    launcher, ManifestDigest(InstalledLauncherPath(key))))
+                return null;
+            var manifest = ReadManifest(ManifestPath(key));
+            return PinnedFilesMatch(manifest?.PinnedFiles) ? manifest : null;
+        }
+        catch (Exception error) when (error is IOException or
+            UnauthorizedAccessException or JsonException or ArgumentException)
+        { return null; }
+    }
+
+    private static bool ManifestVerified(string key) => TrustedManifest(key) is not null;
+
+    internal static IReadOnlyDictionary<string, string> InstalledPinset(
+        string key, string identity, string executable, string assembly)
+    {
+        var manifest = TrustedManifest(key) ?? throw new InvalidOperationException(
+            "Trusted startup image is unavailable or has changed. Reinstall deliberately.");
+        if (manifest.ExpectedIdentity != identity ||
+            !StringComparer.OrdinalIgnoreCase.Equals(
+                Path.GetFullPath(manifest.Runtime), Path.GetFullPath(executable)) ||
+            !StringComparer.OrdinalIgnoreCase.Equals(
+                Path.GetFullPath(manifest.Assembly), Path.GetFullPath(assembly)))
+            throw new InvalidOperationException("Registered startup identity differs.");
+        return manifest.PinnedFiles;
     }
 
     private static string Quote(string value) =>
@@ -177,13 +229,19 @@ internal static class SupervisorControls
                     "supervision refused before accessing state. Reinstall deliberately.");
                 return 4;
             }
+            // An installed invocation must use the HKCU-backed trusted pinset,
+            // not a fresh snapshot of potentially changed executable bytes.
+            var image = pinned >= 0
+                ? InstalledPinset(keyId, SupervisorIdentity.For(config),
+                    executable, assembly)
+                : PinnedRuntimeFiles(executable, assembly, config);
             using var stop = new CancellationTokenSource();
             ConsoleCancelEventHandler handler = (_, e) => { e.Cancel = true; stop.Cancel(); };
             Console.CancelKeyPress += handler;
             try
             {
                 return await new HostSupervisor(configPath, config,
-                    executable, assembly).RunAsync(stop.Token);
+                    executable, assembly, pinnedFiles: image).RunAsync(stop.Token);
             }
             finally { Console.CancelKeyPress -= handler; }
         }

@@ -32,9 +32,12 @@ launcher verifies this registry-backed digest *before* executing any path from
 the manifest, so modifying a writable checkout or manifest alone cannot redirect
 logon execution. A digest of the installed private launcher copy is also pinned
 and shown in `supervisor-status` integrity verification. Additionally the
-manifest pins the hashes of the host executable, its runtime dependencies and
-the configured provider files; the launcher verifies those bytes before it
-starts the host. Changing any such file requires explicit reinstallation.
+manifest pins the hashes of the host executable, its runtime dependencies,
+the provider assembly and its separate output-directory dependencies, and
+configured provider settings. The launcher verifies those bytes before startup,
+and the supervisor validates the same trusted pinset **before every child
+launch**, including restarts after a crash. Changing any such file requires
+explicit reinstallation.
 This does not claim security against malware already running as the same
 user, which can also modify that user's registry or race validation. Windows limits Run-key commands to 260 characters;
 installation fails safely if the private launcher path makes even this short
@@ -100,8 +103,10 @@ with an operator-visible blocked status and child PID, *leaving that child
 running* rather than killing an uncertain host. Investigate and stop it manually
 before attempting another startup.
 
-When a **child process actually exits**, supervision relaunches the normal
-`serve` command with the same config. It backs off 1, 2, 4, 8 and 16
+When a **child process actually exits**, supervision rechecks the trusted
+execution-image digests before relaunching the normal `serve` command with
+the same config. Any changed binary blocks recovery until deliberate
+reinstallation. It backs off 1, 2, 4, 8 and 16
 seconds for up to five restarts in a rolling 15-minute window, then stops
 with `restart_budget_exhausted`. If a process remains alive but is not
 ready after 30 seconds, it is reported as `host_alive_but_not_ready`, but
