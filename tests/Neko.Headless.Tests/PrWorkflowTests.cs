@@ -63,13 +63,16 @@ public sealed partial class HeadlessRuntimeTests
         public int MergeCalls;
         public int PostCalls;
         public string AuthenticatedPublisher = "independent-account";
+        public TaskCompletionSource<bool>? PublisherReadStarted;
+        public TaskCompletionSource<string>? PublisherReadGate;
         public bool ThrowAfterMergeDispatch;
         public bool ThrowAfterReviewDispatch;
         public void FailReviewPostingAfterDispatch() => ThrowAfterReviewDispatch = true;
         public Task<string> AuthenticatedPublisherAsync(CancellationToken cancellation)
         {
             cancellation.ThrowIfCancellationRequested();
-            return Task.FromResult(AuthenticatedPublisher);
+            PublisherReadStarted?.TrySetResult(true);
+            return PublisherReadGate?.Task ?? Task.FromResult(AuthenticatedPublisher);
         }
 
         public Task<PrReview> PostReviewAsync(string repository, int number,

@@ -327,6 +327,57 @@ public sealed partial class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task HeadAbaCannotPostOldReviewerVerdictAsReplacementReviewer()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = ManagerRuntime(folder.Path, provider);
+        var (service, source, r1Id) = await ReadyToPublishReview(folder, runtime);
+        provider.SetInitialReviewerResult(
+            "REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\n" +
+            "Original reviewer R1 found no blocking defects in the actual source.");
+        var publisherEntered = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var publisherGate = new TaskCompletionSource<string>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        source.PublisherReadStarted = publisherEntered;
+        source.PublisherReadGate = publisherGate;
+
+        // Stop R1's publication after verified history/source inspection but
+        // before its irrevocable source-post reservation is persisted.
+        var stalePublication = service.PublishReviewAsync(
+            "sample/project", 7, CancellationToken.None);
+        await publisherEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Legitimate explicit refreshes can traverse A -> B -> A. The second
+        // reviewer is a new independent conversation on the original SHA.
+        source.Current = source.Current with { HeadSha = PrChanged };
+        var atB = await service.RefreshRevisionAsync(
+            "sample/project", 7, CancellationToken.None);
+        Assert.Null(atB.Reviewer);
+        source.Current = source.Current with { HeadSha = PrHead };
+        var atA = await service.RefreshRevisionAsync(
+            "sample/project", 7, CancellationToken.None);
+        Assert.Null(atA.Reviewer);
+        provider.ManagerCreationConversationIdOverride = "chat-2";
+        var replacement = await service.LaunchReviewerAsync(
+            "sample/project", 7, "Fresh independent review of returned head A.",
+            "independent-account", CancellationToken.None);
+        var r2Id = replacement.Reviewer!.ConversationId;
+        Assert.NotEqual(r1Id, r2Id);
+        Assert.Equal("accepted", replacement.ReviewLaunchState);
+
+        publisherGate.SetResult("independent-account");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => stalePublication);
+        Assert.Equal(0, source.PostCalls);
+        var persisted = new PrWorkflowStore(folder.Path).Get("sample/project", 7)!;
+        Assert.Equal(r2Id, persisted.Reviewer!.ConversationId);
+        Assert.False(persisted.Reviewer.Completed);
+        Assert.Null(persisted.Reviewer.ReviewPostAttemptId);
+        Assert.Null(persisted.Reviewer.CompletionMessageId);
+    }
+
+    [Fact]
     public async Task WrongAuthenticatedPublisherDoesNotConsumeReviewReservation()
     {
         using var folder = new TemporaryDirectory();

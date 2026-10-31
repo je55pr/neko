@@ -279,6 +279,28 @@ internal sealed class PrWorkflowService
         }, "reviewer_bound", "created_for_current_head"));
     }
 
+    // A head can change A -> B -> A while an awaited source read is pending.
+    // SHA equality alone cannot prove that the original reviewer assignment
+    // still owns the revision. Bind every posting phase to the original worker.
+    private static bool SameReviewAssignment(PrWorkflow current, PrWorkflow original)
+    {
+        var expected = original.Reviewer;
+        var actual = current.Reviewer;
+        return expected is not null && actual is not null &&
+            current.HeadSha == original.HeadSha &&
+            current.BaseSha == original.BaseSha &&
+            current.ReviewLaunchState == "accepted" &&
+            current.ReviewLaunchAt == original.ReviewLaunchAt &&
+            current.MergeAttemptId is null &&
+            actual.ConversationId == expected.ConversationId &&
+            actual.CreatedAt == expected.CreatedAt &&
+            actual.CreatedForHead == expected.CreatedForHead &&
+            actual.CreationPromptSha256 == expected.CreationPromptSha256 &&
+            actual.CreationUserMessageId == expected.CreationUserMessageId &&
+            StringComparer.OrdinalIgnoreCase.Equals(
+                actual.ReviewerAccount, expected.ReviewerAccount);
+    }
+
     /// <summary>
     /// The host posts the verified worker output itself. A URL echoed by a
     /// worker is never evidence that the worker authored a source review.
@@ -337,9 +359,10 @@ internal sealed class PrWorkflowService
         // This one-use durable reservation comes before any external write.
         _store.ReserveForDispatch(repository, number, current =>
         {
-            if (current.Reviewer?.ReviewPostAttemptId is not null ||
-                current.HeadSha != record.HeadSha || current.BaseSha != record.BaseSha)
-                throw new InvalidOperationException("Concurrent review posting.");
+            if (!SameReviewAssignment(current, record) ||
+                current.Reviewer!.ReviewPostAttemptId is not null)
+                throw new InvalidOperationException(
+                    "Review assignment changed before publication reservation.");
             return _store.Append(current with {
                 Reviewer = current.Reviewer! with {
                     ReviewPostAttemptId = attemptId,
@@ -373,15 +396,22 @@ internal sealed class PrWorkflowService
                     r.Verdict == receipt.Verdict))
                 throw new InvalidOperationException("Published review could not be verified.");
             return _store.Update(repository, number, current =>
-                _store.Append(current with {
-                    Reviewer = current.Reviewer! with {
+            {
+                if (!SameReviewAssignment(current, record) ||
+                    current.Reviewer!.ReviewPostAttemptId != attemptId ||
+                    current.Reviewer.PostedBodySha256 != digest)
+                    throw new InvalidOperationException(
+                        "Review assignment changed before source verification.");
+                return _store.Append(current with {
+                    Reviewer = current.Reviewer with {
                         Completed = true, CompletedAt = _clock.GetUtcNow(),
                         ReviewUrl = receipt.Url, Verdict = receipt.Verdict,
                         ReviewerAccount = receipt.Author,
                         ReviewPostOutcome = "posted"
                     }, LastSourceEvidence = verified,
                     State = verdict == "no_blockers" ? "checks_pending" : "changes_requested"
-                }, "review_post_verified", "source_receipt_verified", attemptId));
+                }, "review_post_verified", "source_receipt_verified", attemptId);
+            });
         }
         catch
         {
