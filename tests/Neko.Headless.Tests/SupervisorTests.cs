@@ -95,6 +95,75 @@ public sealed class SupervisorTests
     }
 
     [Fact]
+    public void ProviderSettingsAndAssemblyContentChangesInvalidateSupervisorIdentity()
+    {
+        using var folder = new TestFolder();
+        var config = Config(folder.Path);
+        File.WriteAllText(config.ProviderSettings, "{\"scope\":\"initial\"}");
+        File.WriteAllText(config.ProviderAssembly, "assembly-v1");
+        var baseline = SupervisorIdentity.For(config);
+        File.WriteAllText(config.ProviderSettings, "{\"scope\":\"changed\"}");
+        Assert.NotEqual(baseline, SupervisorIdentity.For(config));
+        File.WriteAllText(config.ProviderSettings, "{\"scope\":\"initial\"}");
+        File.WriteAllText(config.ProviderAssembly, "assembly-v2");
+        Assert.NotEqual(baseline, SupervisorIdentity.For(config));
+        File.WriteAllText(config.ProviderAssembly, "assembly-v1");
+        Assert.Equal(baseline, SupervisorIdentity.For(config));
+    }
+
+    [Fact]
+    public void PinnedExecutionFilesDetectChangedDependenciesAndProvider()
+    {
+        using var folder = new TestFolder();
+        var image = Path.Combine(folder.Path, "image");
+        Directory.CreateDirectory(image);
+        var assembly = Path.Combine(image, "Neko.Headless.dll");
+        var runtime = Path.Combine(image, "Neko.Headless.exe");
+        var dependency = Path.Combine(image, "Neko.Core.dll");
+        var provider = Path.Combine(folder.Path, "provider.dll");
+        var settings = Path.Combine(folder.Path, "provider-settings.json");
+        foreach (var path in new[] { assembly, runtime, dependency, provider, settings })
+            File.WriteAllText(path, "original-file");
+        var config = Config(folder.Path) with {
+            ProviderAssembly = provider, ProviderSettings = settings
+        };
+        var original = SupervisorControls.PinnedRuntimeFiles(runtime, assembly, config);
+        Assert.Contains(Path.GetFullPath(runtime), original.Keys);
+        Assert.Contains(Path.GetFullPath(assembly), original.Keys);
+        Assert.Contains(Path.GetFullPath(dependency), original.Keys);
+        Assert.Contains(Path.GetFullPath(provider), original.Keys);
+        Assert.Contains(Path.GetFullPath(settings), original.Keys);
+        File.WriteAllText(dependency, "replaced-dependency");
+        var changed = SupervisorControls.PinnedRuntimeFiles(runtime, assembly, config);
+        Assert.NotEqual(original[Path.GetFullPath(dependency)],
+            changed[Path.GetFullPath(dependency)]);
+        File.WriteAllText(provider, "replaced-provider");
+        var changedProvider = SupervisorControls.PinnedRuntimeFiles(
+            runtime, assembly, config);
+        Assert.NotEqual(original[Path.GetFullPath(provider)],
+            changedProvider[Path.GetFullPath(provider)]);
+    }
+
+    [Fact]
+    public void PinnedSupervisorIdentityIncludesAllExecutionRelevantPolicy()
+    {
+        using var folder = new TestFolder();
+        var config = Config(folder.Path);
+        var baseline = SupervisorIdentity.For(config);
+        Assert.NotEqual(baseline, SupervisorIdentity.For(
+            config with { ProviderFactory = "Different.Factory" }));
+        Assert.NotEqual(baseline, SupervisorIdentity.For(
+            config with { ReviewGate = new PrReviewPolicy([], "bot", "app") }));
+        var cli = Path.Combine(folder.Path, "gh.exe");
+        File.WriteAllText(cli, "cli-original");
+        var configuredCli = config with { ExternalPrCliExecutable = cli };
+        var cliIdentity = SupervisorIdentity.For(configuredCli);
+        Assert.NotEqual(baseline, cliIdentity);
+        File.WriteAllText(cli, "cli-changed");
+        Assert.NotEqual(cliIdentity, SupervisorIdentity.For(configuredCli));
+    }
+
+    [Fact]
     public void StartupManifestDigestDetectsTampering()
     {
         using var folder = new TestFolder();
@@ -131,12 +200,15 @@ public sealed class SupervisorTests
         var config = Config(folder.Path);
         using var handler = new ReplyHandler(request =>
         {
-            Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
-            Assert.Equal(config.AccessToken, request.Headers.Authorization?.Parameter);
+            Assert.Null(request.Headers.Authorization);
+            Assert.Equal("/health/attest", request.RequestUri?.AbsolutePath);
+            var nonce = request.RequestUri!.Query.Split('=')[1];
+            Assert.True(HostAttestation.ValidNonce(nonce));
             return new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = JsonContent.Create(new HostHealth(
-                    "ready", SupervisorIdentity.For(config), 2, true, 1))
+                Content = JsonContent.Create(HostAttestation.Create(new HostHealth(
+                    "ready", SupervisorIdentity.For(config), 2, true, 1),
+                    nonce, config.AccessToken))
             };
         });
         using var probe = new SupervisorHealthProbe(config, handler);
@@ -156,13 +228,62 @@ public sealed class SupervisorTests
     {
         using var folder = new TestFolder();
         var config = Config(folder.Path);
-        using var handler = new ReplyHandler(_ => new HttpResponseMessage(responseCode)
+        using var handler = new ReplyHandler(request =>
         {
-            Content = JsonContent.Create(new HostHealth(status, "wrong-state",
-                0, false, 0))
+            Assert.Null(request.Headers.Authorization);
+            var nonce = request.RequestUri!.Query.Split('=')[1];
+            return new HttpResponseMessage(responseCode)
+            {
+                Content = JsonContent.Create(HostAttestation.Create(new HostHealth(
+                    status, status == "starting" ? SupervisorIdentity.For(config) :
+                        "wrong-state", 0, false, 0), nonce, config.AccessToken))
+            };
         });
         using var probe = new SupervisorHealthProbe(config, handler);
         Assert.Equal(expected, (await probe.CheckAsync(CancellationToken.None)).Kind.ToString());
+    }
+
+    [Fact]
+    public async Task UnknownLoopbackListenerCannotCaptureTokenOrForgeHealth()
+    {
+        using var folder = new TestFolder();
+        var config = Config(folder.Path);
+        using var rogue = new ReplyHandler(request =>
+        {
+            Assert.Null(request.Headers.Authorization);
+            Assert.Equal("/health/attest", request.RequestUri?.AbsolutePath);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = JsonContent.Create(new HostHealthAttestation(
+                    new HostHealth("ready", SupervisorIdentity.For(config),
+                        0, false, 0),
+                    request.RequestUri!.Query.Split('=')[1],
+                    new string('A', 64)))
+            };
+        });
+        using var probe = new SupervisorHealthProbe(config, rogue);
+        Assert.Equal(HostProbeKind.DifferentInstance,
+            (await probe.CheckAsync(CancellationToken.None)).Kind);
+    }
+
+    [Fact]
+    public void HealthAttestationRejectsReplayedOrModifiedEvidence()
+    {
+        using var folder = new TestFolder();
+        var config = Config(folder.Path);
+        var health = new HostHealth("ready", SupervisorIdentity.For(config),
+            1, false, 0);
+        var nonce = Convert.ToHexString(
+            System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
+        var signed = HostAttestation.Create(health, nonce, config.AccessToken);
+        Assert.True(HostAttestation.Verify(signed, nonce, config.AccessToken));
+        Assert.False(HostAttestation.Verify(signed, new string('F', 64),
+            config.AccessToken));
+        Assert.False(HostAttestation.Verify(signed with {
+            Health = health with { InstanceId = "other" }
+        }, nonce, config.AccessToken));
+        Assert.False(HostAttestation.Verify(signed, nonce, "wrong-secret"));
+        Assert.False(HostAttestation.ValidNonce("invalid"));
     }
 
     [Fact]

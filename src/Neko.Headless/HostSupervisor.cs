@@ -134,34 +134,42 @@ internal sealed class SupervisorHealthProbe : IDisposable
 {
     private readonly HttpClient _client;
     private readonly string _instanceId;
+    private readonly string _secret;
 
     public SupervisorHealthProbe(HostConfiguration config,
         HttpMessageHandler? handler = null)
     {
         _instanceId = SupervisorIdentity.For(config);
+        _secret = config.AccessToken;
         _client = handler is null ? new HttpClient() : new HttpClient(handler);
         _client.BaseAddress = new Uri($"http://127.0.0.1:{config.Port}/");
         _client.Timeout = TimeSpan.FromSeconds(2);
-        _client.DefaultRequestHeaders.Authorization =
-            new AuthenticationHeaderValue("Bearer", config.AccessToken);
+        // Deliberately never add a bearer header. Port ownership is untrusted.
     }
 
     public async Task<HostProbe> CheckAsync(CancellationToken token)
     {
         try
         {
-            using var response = await _client.GetAsync("health", token);
+            var nonce = Convert.ToHexString(
+                System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
+            using var response = await _client.GetAsync(
+                "health/attest?nonce=" + nonce, token);
             if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
                 return new(HostProbeKind.Unauthorized);
             if (!response.IsSuccessStatusCode)
                 return new(HostProbeKind.Unhealthy);
-            var health = await response.Content.ReadFromJsonAsync<HostHealth>(
+            var attestation = await response.Content.ReadFromJsonAsync<HostHealthAttestation>(
                 new JsonSerializerOptions(JsonSerializerDefaults.Web), token);
-            if (health is null || health.Status != "ready")
-                return new(HostProbeKind.Unhealthy);
-            return health.InstanceId == _instanceId
-                ? new(HostProbeKind.Ready, health)
-                : new(HostProbeKind.DifferentInstance);
+            // A rogue listener can fabricate any JSON but cannot authenticate
+            // a fresh nonce. Never trust a claimed identity without its MAC.
+            if (!HostAttestation.Verify(attestation, nonce, _secret))
+                return new(HostProbeKind.DifferentInstance);
+            var health = attestation!.Health;
+            if (health.InstanceId != _instanceId)
+                return new(HostProbeKind.DifferentInstance);
+            return health.Status == "ready" ? new(HostProbeKind.Ready, health)
+                : new(HostProbeKind.Unhealthy);
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {

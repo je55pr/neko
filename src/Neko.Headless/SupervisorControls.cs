@@ -6,7 +6,8 @@ using Microsoft.Win32;
 namespace Neko.Headless;
 
 internal sealed record SupervisorLaunchManifest(
-    string Runtime, string Assembly, string Config, string ExpectedIdentity);
+    string Runtime, string Assembly, string Config, string ExpectedIdentity,
+    IReadOnlyDictionary<string, string> PinnedFiles);
 
 /// <summary>Opt-in HKCU logon startup. Never registers a service or elevates.</summary>
 internal static class SupervisorControls
@@ -46,6 +47,39 @@ internal static class SupervisorControls
 
     internal static string ManifestDigest(string path) =>
         Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+
+    // Pin the actual executable image and loadable dependencies, not merely
+    // the startup script and the JSON containing paths. Any changed output
+    // requires explicit uninstall/reinstall before the next logon.
+    internal static IReadOnlyDictionary<string, string> PinnedRuntimeFiles(
+        string runtime, string assembly, HostConfiguration config)
+    {
+        var folder = Path.GetDirectoryName(assembly)
+            ?? throw new InvalidOperationException("Host assembly directory unavailable.");
+        var files = new SortedDictionary<string, string>(
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var path in Directory.EnumerateFiles(folder, "*",
+                     SearchOption.AllDirectories))
+        {
+            var extension = Path.GetExtension(path);
+            if (extension.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".so", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".dylib", StringComparison.OrdinalIgnoreCase))
+                files[Path.GetFullPath(path)] = ManifestDigest(path);
+        }
+        foreach (var path in new[] { runtime, assembly, config.ProviderAssembly,
+                     config.ProviderSettings })
+            files[Path.GetFullPath(path)] = ManifestDigest(path);
+        if (!string.IsNullOrWhiteSpace(config.ExternalPrCliExecutable) &&
+            Path.IsPathFullyQualified(config.ExternalPrCliExecutable))
+        {
+            var cli = Path.GetFullPath(config.ExternalPrCliExecutable);
+            files[cli] = ManifestDigest(cli);
+        }
+        return files;
+    }
 
     private static bool ManifestVerified(string key)
     {
@@ -99,7 +133,7 @@ internal static class SupervisorControls
         var existing = ReadManifest(path);
         if (existing is not null)
         {
-            if (existing != manifest)
+            if (JsonSerializer.Serialize(existing) != JsonSerializer.Serialize(manifest))
                 throw new InvalidOperationException(
                     "Existing startup manifest differs. Remove the previous installation first.");
             return;
@@ -170,7 +204,8 @@ internal static class SupervisorControls
                     "Private launcher path is too long for Windows logon startup.");
             var manifestPath = ManifestPath(keyId);
             var manifest = new SupervisorLaunchManifest(
-                executable, assembly, configPath, SupervisorIdentity.For(config));
+                executable, assembly, configPath, SupervisorIdentity.For(config),
+                PinnedRuntimeFiles(executable, assembly, config));
             using var key = Registry.CurrentUser.CreateSubKey(RunKey, writable: true)
                 ?? throw new InvalidOperationException("Cannot open per-user startup registry.");
             if (key.GetValue(valueName) is string previous && previous != launch)

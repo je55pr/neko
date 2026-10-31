@@ -81,6 +81,15 @@ try
     var app = builder.Build();
     app.Use(async (context, next) =>
     {
+        // This one read-only challenge endpoint is intentionally credential-free:
+        // an unknown loopback port owner must never receive a bearer token.
+        // Its response is authenticated by a nonce-bound HMAC instead.
+        if (context.Request.Method == "GET" &&
+            context.Request.Path == "/health/attest")
+        {
+            await next();
+            return;
+        }
         var supplied = context.Request.Headers.Authorization.ToString();
         var expected = "Bearer " + config.AccessToken;
         if (!CryptographicOperations.FixedTimeEquals(
@@ -94,6 +103,12 @@ try
 
     app.MapGet("/health", () => Results.Json(HostHealthSnapshot.Create(
         config, journal, runtime, managers, inbox)));
+    app.MapGet("/health/attest", (string? nonce) =>
+        !HostAttestation.ValidNonce(nonce)
+            ? Results.BadRequest()
+            : Results.Json(HostAttestation.Create(
+                HostHealthSnapshot.Create(config, journal, runtime, managers, inbox),
+                nonce!, config.AccessToken)));
     app.MapGet("/pr-workflows", () => Results.Json(prWorkflows.List()));
     app.MapPost("/pr-workflows", (PrWorkflowCreateRequest body, CancellationToken ct) =>
         PrWorkflowEndpoints.CreateAsync(prWorkflows, body, ct));

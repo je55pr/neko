@@ -28,6 +28,27 @@ $runtime = [string]$manifest.runtime
 $assembly = [string]$manifest.assembly
 $configPath = [string]$manifest.config
 $expected = [string]$manifest.expectedIdentity
+# Read-only verification of the entire pinned execution image, including
+# dependencies and configured provider bytes, BEFORE launching any binary.
+# The manifest itself is authenticated by the HKCU digest above.
+if ($null -eq $manifest.pinnedFiles) { throw 'Missing pinned execution manifest.' }
+$entries = @($manifest.pinnedFiles.PSObject.Properties)
+if ($entries.Count -eq 0) { throw 'Empty pinned execution manifest.' }
+$pinned = @{}
+foreach ($file in $entries) {
+    $path = [string]$file.Name
+    $digest = [string]$file.Value
+    if (-not [IO.Path]::IsPathFullyQualified($path) -or
+        $digest -cnotmatch '^[A-F0-9]{64}$') {
+        throw 'Malformed pinned execution manifest.'
+    }
+    $pinned[$path] = $digest
+    $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($actual -cne $digest) { throw 'Pinned executable dependency changed.' }
+}
+if (-not $pinned.ContainsKey($runtime) -or -not $pinned.ContainsKey($assembly)) {
+    throw 'Pinned runtime or assembly entry missing.'
+}
 if ([IO.Path]::GetFileNameWithoutExtension($runtime) -ieq 'dotnet') {
     & $runtime $assembly supervise --config $configPath --expected-instance $expected
 } else {
