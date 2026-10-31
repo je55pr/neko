@@ -60,8 +60,10 @@ blocked until a new commit or an eventual per-run evidence contract. This is
 an intentional conservative availability limit, not a signed run/review pair.
 Standalone automated inline comments with no linked submitted review are
 preserved as separate current-head finding evidence and generate durable,
-deduplicated manager notifications. They never masquerade as submitted
-reviews or as zero-findings approvals. The adapter uses the comment's
+deduplicated manager notifications. They never masquerade as submitted reviews or as zero-findings approvals.
+The merge gate explicitly blocks current-head standalone automated findings
+even if another review contains a positive zero-count marker or the ordinary
+unresolved-thread restriction is disabled. The adapter uses the comment's
 `original_commit_id` for head attribution and rejects unverifiable bot
 comment identities.
 

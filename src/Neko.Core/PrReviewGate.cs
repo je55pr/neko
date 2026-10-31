@@ -244,6 +244,14 @@ public static class PrReviewGate
         if ((policy.RequireNoUnresolvedThreads ||
              policy.AllowVerifiedEmptyAutomatedReview) && source.UnresolvedThreads != 0)
             blockers.Add("unresolved_review_threads:" + source.UnresolvedThreads);
+        // A standalone current-head automated finding without a submitted
+        // review is not an approval and cannot be cleared by a separate
+        // zero-count review marker or a successful automated check.
+        if (source.InlineFindings?.Any(f =>
+                f.OriginalHeadSha == workflow.HeadSha &&
+                StringComparer.OrdinalIgnoreCase.Equals(
+                    f.Author, policy.AutomatedReviewer)) == true)
+            blockers.Add("automated_inline_findings_untriaged");
         // An earlier head's active change request remains binding until that
         // reviewer issues a newer decisive approval or the review is dismissed.
         // A mere COMMENTED review does not supersede a change request.

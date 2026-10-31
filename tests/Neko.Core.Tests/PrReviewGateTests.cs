@@ -58,6 +58,28 @@ public sealed class PrReviewGateTests
     }
 
     [Fact]
+    public void StandaloneAutomatedFindingBlocksMergeEvenWithPositiveMarker()
+    {
+        var changed = Source() with {
+            InlineFindings = [new PrInlineFinding(
+                "https://example.org/pull/12#comment-15", "review-bot", Head, 15)]
+        };
+        var decision = Evaluate(source: changed);
+        Assert.False(decision.Ready);
+        Assert.Contains("automated_inline_findings_untriaged", decision.Blockers);
+        Assert.Contains("automated_inline_findings_untriaged",
+            Evaluate(source: changed, policy: Policy with {
+                RequireNoUnresolvedThreads = false
+            }).Blockers);
+        var oldHead = changed with {
+            InlineFindings = [changed.InlineFindings![0] with {
+                OriginalHeadSha = Changed
+            }]
+        };
+        Assert.True(Evaluate(source: oldHead).Ready);
+    }
+
+    [Fact]
     public void CompleteIndependentAndAutomatedReviewsPermitMerge()
     {
         var result = Evaluate();
