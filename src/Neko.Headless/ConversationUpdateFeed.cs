@@ -72,7 +72,8 @@ internal sealed class ConversationUpdateFeed
             _lastPublicUpdateAt = _time.GetUtcNow();
             _lastPublicUpdateType = $"{update.Kind}.{update.Operation}";
             if (update.Kind == PublicUpdateKind.Final &&
-                update.Operation is PublicUpdateOperation.Complete or PublicUpdateOperation.Fail)
+                update.Operation is PublicUpdateOperation.Complete or PublicUpdateOperation.Fail
+                    or PublicUpdateOperation.ObservationExpired)
             {
                 _finished = true;
                 _terminalOperation = update.Operation.ToString();

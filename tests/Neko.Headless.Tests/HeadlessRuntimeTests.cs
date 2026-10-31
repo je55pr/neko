@@ -641,7 +641,8 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Fail("No completed reply.");
     }
 
-    private sealed partial class FakeProvider : IScopedConversationProvider, IProviderRateLimitStatus
+    private sealed partial class FakeProvider : IScopedConversationProvider, IProviderRateLimitStatus,
+        IAuthoritativeReconciliationProvider
     {
         public string? Scope;
         public int UnscopedCreations;
@@ -688,7 +689,12 @@ public sealed partial class HeadlessRuntimeTests
                     "provider_busy") { Retryable = true });
             }
             if (UncertainNextCreation)
-                return Task.FromResult(new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"));
+            {
+                if (CorrelatedUncertainCreationId is not null)
+                    AddExchange(message.Text);
+                return Task.FromResult(new SendReceipt(SendDisposition.Uncertain,
+                    "delivery_unknown", ConversationId: CorrelatedUncertainCreationId));
+            }
             if (PendingCreate is not null)
             {
                 AddExchange(message.Text);

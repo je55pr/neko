@@ -4,6 +4,8 @@ using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Security.Cryptography;
+using System.Text;
 using Neko;
 
 namespace Neko.Transport;
@@ -17,7 +19,8 @@ public sealed class Factory : IConversationProviderFactory
     }
 }
 
-internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRateLimitStatus, IDisposable
+internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRateLimitStatus,
+    IAuthoritativeReconciliationProvider, IDisposable
 {
     // Project-scoped creation was verified by an independent saved-history
     // read on 2026-10-30, without any per-chat WebView2 navigation.
@@ -495,11 +498,12 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
             string? finalText=null;
             var completedMessageId="";
             var complete=false;
+            var observerExpired=false;
+            using var deadline=CancellationTokenSource.CreateLinkedTokenSource(
+                _lifetime.Token);
+            deadline.CancelAfter(TimeSpan.FromMinutes(12));
             try
             {
-                using var deadline=CancellationTokenSource.CreateLinkedTokenSource(
-                    _lifetime.Token);
-                deadline.CancelAfter(TimeSpan.FromMinutes(12));
                 while(!deadline.IsCancellationRequested)
                 {
                     await Task.Delay(3500,deadline.Token);
@@ -570,7 +574,12 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
                     completedMessageId=snapshot.LastAssistantId;
                     break;
                 }
+                observerExpired=deadline.IsCancellationRequested &&
+                    !_lifetime.IsCancellationRequested && !complete;
             }
+            catch(OperationCanceledException) when(
+                deadline.IsCancellationRequested && !_lifetime.IsCancellationRequested)
+            { observerExpired=true; }
             catch(Exception){}
             finally
             {
@@ -581,12 +590,17 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
                 channel.Writer.TryWrite(new PublicConversationUpdate(
                     complete?completedMessageId:updateId,
                     PublicUpdateKind.Final,
-                    complete?PublicUpdateOperation.Complete:
-                        PublicUpdateOperation.Fail));
+                    ObserverTerminalOperation(complete,observerExpired)));
                 channel.Writer.TryComplete();
             }
         });
     }
+
+    internal static PublicUpdateOperation ObserverTerminalOperation(
+        bool verifiedComplete, bool deadlineExpired) =>
+        verifiedComplete ? PublicUpdateOperation.Complete :
+            deadlineExpired ? PublicUpdateOperation.ObservationExpired :
+                PublicUpdateOperation.Fail;
 
     public async IAsyncEnumerable<PublicConversationUpdate> WatchAsync(
         string id, [EnumeratorCancellation] CancellationToken cancellation)
@@ -596,9 +610,88 @@ internal sealed class ProjectProvider : IScopedConversationProvider, IProviderRa
         {
             yield return update;
             if(update.Operation is PublicUpdateOperation.Complete or
-               PublicUpdateOperation.Fail)yield break;
+               PublicUpdateOperation.Fail or
+               PublicUpdateOperation.ObservationExpired)yield break;
         }
     }
+    internal static ReconciliationInspection VerifyCompletedTurn(
+        ReconciliationProbe probe, VisibleConversation conversation,
+        string assistantId, string assistantStatus, string assistantText,
+        string currentNode, string streamState)
+    {
+        if (conversation.Id != probe.ConversationId ||
+            (!probe.AcceptedSubmission && !probe.CorrelatedCreation &&
+             string.IsNullOrWhiteSpace(probe.CorrelatedUserMessageId)))
+            return new(false, "missing_dispatch_correlation");
+        var messages=conversation.Messages;
+        var baseline=probe.BaselineMessageIds;
+        if (baseline is null || messages.Count < baseline.Count + 2 ||
+            baseline.Count > 100000)
+            return new(false, "history_not_correlated");
+        for(var i=0;i<baseline.Count;i++)
+            if(string.IsNullOrWhiteSpace(baseline[i]) ||
+               messages[i].Id!=baseline[i])
+                return new(false, "history_not_correlated");
+        var suffix=messages.Skip(baseline.Count).ToArray();
+        if(suffix[0].Role!=VisibleMessageRole.User ||
+           suffix.Count(m=>m.Role==VisibleMessageRole.User)!=1 ||
+           suffix.Skip(1).Any(m=>m.Role!=VisibleMessageRole.Assistant))
+            return new(false, "ambiguous_remote_turn");
+        var user=suffix[0];
+        var hash=Convert.ToHexString(SHA256.HashData(
+            Encoding.UTF8.GetBytes(user.Text)));
+        if(!string.Equals(hash,probe.PromptSha256,StringComparison.Ordinal) ||
+           string.IsNullOrWhiteSpace(user.Id) ||
+           (probe.CorrelatedUserMessageId is not null &&
+            user.Id!=probe.CorrelatedUserMessageId))
+            return new(false, "turn_mismatch");
+        if(streamState is "FAILED" or "ERROR" or "CANCELLED")
+            return new(false, "remote_terminal_failure");
+        if(!IsVerifiedVisibleCompletion(assistantId,assistantStatus,
+                assistantText,currentNode,streamState) ||
+           suffix[^1].Id!=assistantId ||
+           messages.Count(m=>m.Id==user.Id)!=1 ||
+           messages.Count(m=>m.Id==assistantId)!=1)
+            return new(false, "remote_not_verified_complete");
+        return new(true,"authoritative_turn_complete",conversation,user.Id,assistantId);
+    }
+
+    public async Task<ReconciliationInspection> InspectAsync(
+        ReconciliationProbe probe, CancellationToken cancellation)
+    {
+        cancellation.ThrowIfCancellationRequested();
+        if(!Guid.TryParse(probe.ConversationId,out _))
+            return new(false,"invalid_conversation_id");
+        if(IsRateLimited())return new(false,"provider_rate_limited");
+        try
+        {
+            // Force fresh independent reads: a locally cached transcript
+            // cannot release a durable delivery guard.
+            var snapshot=await SnapshotAsync(probe.ConversationId);
+            if(snapshot is null)
+                return new(false,IsRateLimited()?"provider_rate_limited":
+                    "history_unavailable");
+            if(IsRateLimited())return new(false,"provider_rate_limited");
+            using var response=await _browser.ReadAsync(
+                _settings.Format(_settings.StreamStatusPath,"id",probe.ConversationId),
+                "status");
+            var root=response.RootElement;
+            ObserveReadThrottle(root);
+            if(IsRateLimited())return new(false,"provider_rate_limited");
+            var state=root.TryGetProperty("ok",out var ok) &&
+                ok.ValueKind==JsonValueKind.True &&
+                root.TryGetProperty("streamState",out var value) &&
+                value.ValueKind==JsonValueKind.String
+                    ?value.GetString()??"":"";
+            if(state.Length==0)return new(false,"status_unavailable");
+            return VerifyCompletedTurn(probe,snapshot.Conversation,
+                snapshot.LastAssistantId,snapshot.LastAssistantStatus,
+                snapshot.LastAssistantText,snapshot.CurrentNode,state);
+        }
+        catch(OperationCanceledException) when(cancellation.IsCancellationRequested) { throw; }
+        catch(Exception) { return new(false,"verification_unavailable"); }
+    }
+
     public async Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation) =>
         (await SnapshotAsync(id, allowRecent: true))?.Conversation;
 

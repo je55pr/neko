@@ -40,6 +40,13 @@ internal static class ManagerEndpoints
         return result is null ? Results.NotFound() : Results.Json(result);
     }
 
+    public static async Task<IResult> ReconcileAsync(
+        ManagerService managers, string name, CancellationToken cancellation)
+    {
+        var result = await managers.ReconcileAsync(IdFor(name), cancellation);
+        return result is null ? Results.NotFound() : Results.Json(result);
+    }
+
     public static async Task<IResult> ReadAsync(
         ManagerService managers, string name, CancellationToken cancellation)
     {

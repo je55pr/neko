@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using Neko;
 
 namespace Neko.Headless;
@@ -69,7 +71,11 @@ internal sealed class ChatRuntime : IDisposable
             progress?.TerminalOperation);
     }
 
-    public async Task<SendReceipt> CreateAsync(string text, CancellationToken cancellation)
+    private static string PromptHash(string text) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
+
+    public async Task<SendReceipt> CreateAsync(string text, CancellationToken cancellation,
+        string? ownerId = null)
     {
         try { await _creationGate.WaitAsync(cancellation); }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
@@ -81,7 +87,7 @@ internal sealed class ChatRuntime : IDisposable
             var prepared = OutboundMessagePreparation.ForNew(text);
             if (prepared.Message is null)
                 return new SendReceipt(SendDisposition.Rejected, "invalid_submission");
-            if (!_journal.TryStartCreation())
+            if (!_journal.TryStartCreation(PromptHash(prepared.Message.Text), ownerId))
                 return new SendReceipt(SendDisposition.Rejected, "previous_creation_unresolved");
 
             var feed = new ConversationUpdateFeed(_timeProvider);
@@ -89,12 +95,14 @@ internal sealed class ChatRuntime : IDisposable
             try { receipt = await _commands.CreateAsync(prepared.Message, cancellation); }
             catch (Exception) { receipt = new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"); }
 
-            // Do not record an unusable remote identity or clear the global
-            // creation latch. A new message could never safely address it.
-            if (receipt.Disposition == SendDisposition.Accepted &&
-                (string.IsNullOrWhiteSpace(receipt.ConversationId) ||
-                 receipt.ConversationId.Length > OutboundMessagePreparation.MaxConversationIdLength ||
-                 receipt.ConversationId.Any(char.IsControl)))
+            // Persist server-correlated identity even if history verification
+            // is still pending. Never infer an ID from a matching prompt.
+            var usableId = !string.IsNullOrWhiteSpace(receipt.ConversationId) &&
+                receipt.ConversationId.Length <= OutboundMessagePreparation.MaxConversationIdLength &&
+                !receipt.ConversationId.Any(char.IsControl);
+            if (receipt.Disposition != SendDisposition.Rejected && usableId)
+                _journal.SetCreationCorrelation(receipt.ConversationId!);
+            if (receipt.Disposition == SendDisposition.Accepted && !usableId)
                 return new SendReceipt(SendDisposition.Uncertain, "conversation_id_unknown");
 
             if (receipt.Disposition == SendDisposition.Rejected)
@@ -103,7 +111,9 @@ internal sealed class ChatRuntime : IDisposable
             {
                 _journal.Set(new ChatRecord(receipt.ConversationId!, "generating",
                     ProgressTurnId: feed.TurnId));
-                _journal.ClearCreation();
+                // Manager creation must bind its registry identity durably
+                // before the global creation guard can be released.
+                if (ownerId is null) _journal.ClearCreation();
                 StartPump(receipt.ConversationId!, feed);
             }
             // An unconfirmed creation retains the on-disk lock; no replay.
@@ -113,7 +123,8 @@ internal sealed class ChatRuntime : IDisposable
     }
 
     public async Task<SendReceipt> SendAsync(
-        string id, string text, CancellationToken cancellation)
+        string id, string text, CancellationToken cancellation,
+        string? operationId = null)
     {
         var gate = _gates.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellation);
@@ -155,7 +166,10 @@ internal sealed class ChatRuntime : IDisposable
             {
                 _journal.Update(id, latest => latest with {
                     Status="sending",History=upstream,
-                    ProgressTurnId=feed.TurnId
+                    ProgressTurnId=feed.TurnId,
+                    PendingTurn=new PendingTurnEvidence(PromptHash(prepared.Message.Text),
+                        upstream.Messages.Select(message=>message.Id).ToArray(),
+                        OperationId: operationId)
                 });
             }
             catch
@@ -174,16 +188,29 @@ internal sealed class ChatRuntime : IDisposable
             switch (receipt.Disposition)
             {
                 case SendDisposition.Rejected:
-                    _journal.Update(id, latest => latest with { Status = "idle" });
+                    _journal.Update(id, latest => latest with {
+                        Status = "idle", PendingTurn = null
+                    });
                     feed.Publish(new PublicConversationUpdate(id,PublicUpdateKind.Final,
                         PublicUpdateOperation.Fail));
                     break;
                 case SendDisposition.Accepted:
-                    _journal.Update(id, latest => latest with { Status = "generating" });
+                    _journal.Update(id, latest => latest with {
+                        Status = "generating",
+                        PendingTurn = latest.PendingTurn is { } turn
+                            ? turn with { AcceptedSubmission = true,
+                                CorrelatedUserMessageId = receipt.MessageId }
+                            : null
+                    });
                     StartPump(id,feed);
                     break;
                 default:
-                    _journal.Update(id, latest => latest with { Status = "uncertain" });
+                    _journal.Update(id, latest => latest with {
+                        Status = "uncertain",
+                        PendingTurn = latest.PendingTurn is { } turn
+                            ? turn with { CorrelatedUserMessageId = receipt.MessageId }
+                            : null
+                    });
                     feed.Publish(new PublicConversationUpdate(id,PublicUpdateKind.Final,
                         PublicUpdateOperation.Fail));
                     break;
@@ -228,6 +255,213 @@ internal sealed class ChatRuntime : IDisposable
             return receipt;
         }
         finally { gate.Release(); }
+    }
+
+    private static bool MatchesInspection(
+        ReconciliationProbe probe, ReconciliationInspection inspection)
+    {
+        if (!inspection.VerifiedComplete || inspection.History is null ||
+            inspection.History.Id != probe.ConversationId ||
+            string.IsNullOrWhiteSpace(inspection.UserMessageId) ||
+            string.IsNullOrWhiteSpace(inspection.AssistantMessageId))
+            return false;
+        var all = inspection.History.Messages;
+        var baseline = probe.BaselineMessageIds;
+        if (baseline is null || all.Count < baseline.Count + 2 ||
+            all.Count > 100000 || baseline.Count > 100000)
+            return false;
+        for (var i = 0; i < baseline.Count; i++)
+            if (string.IsNullOrWhiteSpace(baseline[i]) ||
+                baseline[i] != all[i].Id) return false;
+        var suffix = all.Skip(baseline.Count).ToArray();
+        if (suffix[0].Role != VisibleMessageRole.User ||
+            suffix.Count(m => m.Role == VisibleMessageRole.User) != 1 ||
+            suffix.Skip(1).Any(m => m.Role != VisibleMessageRole.Assistant) ||
+            suffix[0].Id != inspection.UserMessageId ||
+            suffix[^1].Id != inspection.AssistantMessageId ||
+            PromptHash(suffix[0].Text) != probe.PromptSha256 ||
+            (probe.CorrelatedUserMessageId is not null &&
+             suffix[0].Id != probe.CorrelatedUserMessageId))
+            return false;
+        return all.All(m => !string.IsNullOrWhiteSpace(m.Id)) &&
+            all.Select(m => m.Id).Distinct(StringComparer.Ordinal).Count() == all.Count;
+    }
+
+    /// <summary>Read-only remote inspection; only an exact verified terminal
+    /// turn and a durable checkpoint can release the local send guard.</summary>
+    public async Task<ReconciliationResult> ReconcileAsync(
+        string id, CancellationToken cancellation)
+    {
+        var gate = _gates.GetOrAdd(id, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellation);
+        try
+        {
+            var record = _journal.Get(id);
+            if (record is null) return new("not_found", "unknown_conversation");
+            if (record.Status != "uncertain")
+                return new("not_applicable", "conversation_not_uncertain", id);
+            var turn = record.PendingTurn;
+            if (turn is null || string.IsNullOrWhiteSpace(turn.PromptSha256) ||
+                turn.BaselineMessageIds is null)
+                return Blocked(id, turn?.PromptSha256 ?? "", "missing_correlation_evidence");
+            if (!turn.AcceptedSubmission &&
+                string.IsNullOrWhiteSpace(turn.CorrelatedUserMessageId))
+                return Blocked(id, turn.PromptSha256, "missing_dispatch_correlation");
+
+            var probe = new ReconciliationProbe(id, turn.PromptSha256,
+                turn.BaselineMessageIds, turn.AcceptedSubmission,
+                CorrelatedUserMessageId: turn.CorrelatedUserMessageId);
+            var inspection = await InspectAsync(probe, cancellation);
+            if (!MatchesInspection(probe, inspection))
+                return Blocked(id, turn.PromptSha256,
+                    inspection.VerifiedComplete ? "history_not_correlated" : inspection.Reason);
+            var now = _timeProvider.GetUtcNow();
+            var decision = new ReconciliationDecision(now, "restored",
+                inspection.Reason, turn.PromptSha256,
+                inspection.UserMessageId, inspection.AssistantMessageId,
+                turn.OperationId);
+            var saved = _journal.Update(id, current =>
+                current.Status == "uncertain" &&
+                current.PendingTurn is { } pending &&
+                pending.PromptSha256 == turn.PromptSha256 &&
+                pending.OperationId == turn.OperationId &&
+                pending.BaselineMessageIds.SequenceEqual(turn.BaselineMessageIds)
+                    ? current with { Status = "idle", PendingTurn = null,
+                        History = inspection.History, LastReconciliation = decision }
+                    : current);
+            if (saved?.LastReconciliation != decision || saved.Status != "idle")
+                return new("blocked", "concurrent_state_change", id);
+            return new("restored", "authoritative_turn_complete", id,
+                inspection.UserMessageId, inspection.AssistantMessageId);
+        }
+        finally { gate.Release(); }
+    }
+
+    /// <summary>A server-issued conversation identity is required to bind an
+    /// interrupted creation. Matching user text alone is never sufficient.</summary>
+    public async Task<ReconciliationResult> ReconcileCreationAsync(
+        string? ownerId, CancellationToken cancellation)
+    {
+        await _creationGate.WaitAsync(cancellation);
+        try
+        {
+            var pending = _journal.GetPendingCreation();
+            if (pending is null) return new("not_applicable", "no_pending_creation");
+            if (pending.OwnerId != ownerId)
+                return new("blocked", "creation_owner_mismatch");
+            if (string.IsNullOrWhiteSpace(pending.PromptSha256) ||
+                string.IsNullOrWhiteSpace(pending.CorrelatedConversationId))
+            {
+                _journal.RecordCreationCheck("missing_creation_correlation");
+                return new("blocked", "missing_creation_correlation");
+            }
+            var id = pending.CorrelatedConversationId;
+            var prior = _journal.Get(id);
+            if (prior?.Status == "idle" &&
+                prior.LastReconciliation is { Outcome: "restored" } decision &&
+                decision.PromptSha256 == pending.PromptSha256)
+            {
+                if (ownerId is null) _journal.ClearCreation();
+                return new("restored", "authoritative_turn_complete", id,
+                    decision.UserMessageId, decision.AssistantMessageId);
+            }
+            // A crash may have persisted the conversation but not yet cleared
+            // creation.pending. This is safe to examine only if no follow-up
+            // turn has been recorded under the same identity.
+            if (prior is not null && (prior.PendingTurn is not null ||
+                prior.Status is not ("idle" or "generating" or "uncertain")))
+                return new("blocked", "conversation_identity_already_registered", id);
+
+            var probe = new ReconciliationProbe(id, pending.PromptSha256,
+                Array.Empty<string>(), CorrelatedCreation: true);
+            var inspection = await InspectAsync(probe, cancellation);
+            if (!MatchesInspection(probe, inspection))
+            {
+                var reason=inspection.VerifiedComplete
+                    ? "history_not_correlated" : inspection.Reason;
+                _journal.RecordCreationCheck(reason);
+                return new("blocked", reason, id,
+                    RetryAfterSeconds: RateLimitSeconds);
+            }
+            var proof = new ReconciliationDecision(_timeProvider.GetUtcNow(),
+                "restored", inspection.Reason, pending.PromptSha256,
+                inspection.UserMessageId, inspection.AssistantMessageId);
+            if (prior is null)
+                _journal.Set(new ChatRecord(id, "idle", inspection.History,
+                    LastReconciliation: proof));
+            else
+            {
+                var saved=_journal.Update(id, current =>
+                    current.PendingTurn is null &&
+                    current.Status is "idle" or "generating" or "uncertain"
+                        ? current with { Status="idle", History=inspection.History,
+                            LastReconciliation=proof }
+                        : current);
+                if (saved?.LastReconciliation != proof)
+                    return new("blocked", "concurrent_state_change", id);
+            }
+            // Manager binding is a separate durable write. Keep the global
+            // creation guard until that write succeeds, including after crash.
+            if (ownerId is null) _journal.ClearCreation();
+            return new("restored", "authoritative_turn_complete", id,
+                inspection.UserMessageId, inspection.AssistantMessageId);
+        }
+        finally { _creationGate.Release(); }
+    }
+
+    public bool FinishAcceptedManagerCreation(string managerId, string conversationId)
+    {
+        var pending = _journal.GetPendingCreation();
+        var record = _journal.Get(conversationId);
+        if (pending?.OwnerId != managerId ||
+            pending.CorrelatedConversationId != conversationId ||
+            record is null || record.ProgressTurnId is null)
+            return false;
+        _journal.ClearCreation();
+        return true;
+    }
+
+    public bool HasVerifiedManagerTurn(string conversationId, string? operationId)
+    {
+        var record = _journal.Get(conversationId);
+        return operationId is not null && record?.Status == "idle" &&
+            record.LastReconciliation is { Outcome: "restored" } proof &&
+            proof.OperationId == operationId;
+    }
+
+    public void FinishReconciledManagerCreation(string managerId, string conversationId)
+    {
+        var pending = _journal.GetPendingCreation();
+        var record = _journal.Get(conversationId);
+        if (pending?.OwnerId != managerId ||
+            pending.CorrelatedConversationId != conversationId ||
+            record?.Status != "idle" ||
+            record.LastReconciliation is not { Outcome: "restored" })
+            throw new InvalidOperationException("Creation binding is not verified.");
+        _journal.ClearCreation();
+    }
+
+    private int? RateLimitSeconds =>
+        (_provider as IProviderRateLimitStatus)?.RateLimitRetryAfterSeconds;
+
+    private async Task<ReconciliationInspection> InspectAsync(
+        ReconciliationProbe probe, CancellationToken cancellation)
+    {
+        if (_provider is not IAuthoritativeReconciliationProvider provider)
+            return new(false, "verification_unsupported");
+        try { return await provider.InspectAsync(probe, cancellation); }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        { throw; }
+        catch (Exception) { return new(false, "verification_unavailable"); }
+    }
+
+    private ReconciliationResult Blocked(string id, string hash, string reason)
+    {
+        _journal.Update(id, latest => latest.Status == "uncertain"
+            ? latest with { LastReconciliation = new ReconciliationDecision(
+                _timeProvider.GetUtcNow(), "blocked", reason, hash) }
+            : latest);
+        return new("blocked", reason, id, RetryAfterSeconds: RateLimitSeconds);
     }
 
     internal async Task<HistoryReadResult> ReadAsync(string id, CancellationToken cancellation)
@@ -278,7 +512,8 @@ internal sealed class ChatRuntime : IDisposable
                 await foreach (var update in _provider.WatchAsync(id, _lifetime.Token))
                 {
                     if (update.Kind != PublicUpdateKind.Final ||
-                        update.Operation is not (PublicUpdateOperation.Complete or PublicUpdateOperation.Fail))
+                        update.Operation is not (PublicUpdateOperation.Complete or PublicUpdateOperation.Fail
+                            or PublicUpdateOperation.ObservationExpired))
                     {
                         feed.Publish(update);
                         continue;
@@ -289,10 +524,17 @@ internal sealed class ChatRuntime : IDisposable
                     // Do not acknowledge a remote completion until its local
                     // checkpoint is durable. A failed write must close the feed
                     // with Fail instead of leaving SSE watchers waiting forever.
-                    if (_journal.Update(id, latest => latest with {
-                        Status = update.Operation == PublicUpdateOperation.Complete ? "idle" : "uncertain",
-                        History = snapshot ?? latest.History
-                    }) is null)
+                    if (_journal.Update(id, latest =>
+                        latest.Status == "idle" &&
+                        latest.LastReconciliation is { Outcome: "restored" } &&
+                        latest.PendingTurn is null
+                            ? latest : latest with {
+                                Status = update.Operation == PublicUpdateOperation.Complete
+                                    ? "idle" : "uncertain",
+                                History = snapshot ?? latest.History,
+                                PendingTurn = update.Operation == PublicUpdateOperation.Complete
+                                    ? null : latest.PendingTurn
+                            }) is null)
                         throw new IOException("The terminal checkpoint is unavailable.");
                     feed.Publish(update);
                     terminalPublished = true;
@@ -308,7 +550,11 @@ internal sealed class ChatRuntime : IDisposable
                     {
                         // Best effort only: if storage remains unavailable, the
                         // journal may be stale, but live consumers must finish.
-                        _journal.Update(id, current => current with { Status = "uncertain" });
+                        _journal.Update(id, current =>
+                            current.Status == "idle" &&
+                            current.LastReconciliation is { Outcome: "restored" } &&
+                            current.PendingTurn is null ? current :
+                                current with { Status = "uncertain" });
                     }
                     catch (Exception) { /* Never suppress the terminal feed event. */ }
                     feed.Publish(new PublicConversationUpdate(

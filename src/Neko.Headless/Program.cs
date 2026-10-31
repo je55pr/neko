@@ -24,8 +24,8 @@ var configPath = configIndex >= 0 && configIndex + 1 < args.Length
 
 if (command == "help")
 {
-    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch [args] [--wait] [--config path]");
-    Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch <id>");
+    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager [args] [--wait] [--config path]");
+    Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch|reconcile <id>; reconcile-creation; reconcile-manager <manager/name>");
     Console.WriteLine("Stop requires provider support; otherwise it returns Unsupported/stop_not_supported without cancelling.");
     return;
 }
@@ -71,6 +71,8 @@ try
         ManagerEndpoints.CreateAsync(managers, body, cancellation));
     app.MapGet("/managers/{name}", (string name, CancellationToken cancellation) =>
         ManagerEndpoints.GetAsync(managers, name, cancellation));
+    app.MapPost("/managers/{name}/reconcile", (string name, CancellationToken cancellation) =>
+        ManagerEndpoints.ReconcileAsync(managers, name, cancellation));
     app.MapGet("/managers/{name}/history", (string name, CancellationToken cancellation) =>
         ManagerEndpoints.ReadAsync(managers, name, cancellation));
     app.MapPost("/managers/{name}/messages", (string name, TextRequest body,
@@ -94,6 +96,13 @@ try
     app.MapPost("/conversations/{id}/messages", async (
         string id, TextRequest body, CancellationToken cancellation) =>
         Results.Json(await runtime.SendAsync(id, body.Text ?? "", cancellation)));
+    app.MapPost("/conversations/creation/reconcile", async (CancellationToken cancellation) =>
+        Results.Json(await runtime.ReconcileCreationAsync(null, cancellation)));
+    app.MapPost("/conversations/{id}/reconcile", async (string id, CancellationToken cancellation) =>
+    {
+        var result = await runtime.ReconcileAsync(id, cancellation);
+        return result.Outcome == "not_found" ? Results.NotFound() : Results.Json(result);
+    });
     app.MapPost("/conversations/{id}/stop", async (string id, CancellationToken cancellation) =>
         Results.Json(await runtime.StopAsync(id, cancellation)));
 
