@@ -5,9 +5,14 @@ using Microsoft.Win32;
 
 namespace Neko.Headless;
 
+internal sealed record SupervisorExecutionImage(
+    IReadOnlyDictionary<string, string> PinnedFiles,
+    IReadOnlyList<string> PinnedDirectories);
+
 internal sealed record SupervisorLaunchManifest(
     string Runtime, string Assembly, string Config, string ExpectedIdentity,
-    IReadOnlyDictionary<string, string> PinnedFiles);
+    IReadOnlyDictionary<string, string> PinnedFiles,
+    IReadOnlyList<string> PinnedDirectories);
 
 /// <summary>Opt-in HKCU logon startup. Never registers a service or elevates.</summary>
 internal static class SupervisorControls
@@ -51,19 +56,29 @@ internal static class SupervisorControls
     // Pin the actual executable image and loadable dependencies, not merely
     // the startup script and the JSON containing paths. Any changed output
     // requires explicit uninstall/reinstall before the next logon.
+    internal static IReadOnlyList<string> PinnedRuntimeDirectories(
+        string assembly, HostConfiguration config)
+    {
+        var host = Path.GetDirectoryName(assembly)
+            ?? throw new InvalidOperationException("Host assembly directory unavailable.");
+        var provider = Path.GetDirectoryName(config.ProviderAssembly)
+            ?? throw new InvalidOperationException("Provider assembly directory unavailable.");
+        return new[] { host, provider }
+            .Select(Path.GetFullPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
     internal static IReadOnlyDictionary<string, string> PinnedRuntimeFiles(
         string runtime, string assembly, HostConfiguration config)
     {
-        var folder = Path.GetDirectoryName(assembly)
-            ?? throw new InvalidOperationException("Host assembly directory unavailable.");
         var files = new SortedDictionary<string, string>(
             StringComparer.OrdinalIgnoreCase);
         // Provider implementations may be built into a *different* output
         // directory, with native and managed sidecar dependencies. Pin both
         // dependency closures, not just the provider's primary assembly.
-        foreach (var directory in new[] { folder,
-                     Path.GetDirectoryName(config.ProviderAssembly)! }
-                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        foreach (var directory in PinnedRuntimeDirectories(assembly, config))
         {
             foreach (var path in Directory.EnumerateFiles(directory, "*",
                          SearchOption.AllDirectories))
@@ -91,10 +106,21 @@ internal static class SupervisorControls
         return files;
     }
 
-    internal static bool PinnedFilesMatch(
-        IReadOnlyDictionary<string, string>? pinned)
+    private static bool LoadableFile(string path)
     {
-        if (pinned is not { Count: > 0 }) return false;
+        var ext = Path.GetExtension(path);
+        return ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+            ext.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
+            ext.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+            ext.Equals(".so", StringComparison.OrdinalIgnoreCase) ||
+            ext.Equals(".dylib", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool PinnedFilesMatch(SupervisorExecutionImage? image)
+    {
+        if (image?.PinnedFiles is not { Count: > 0 } pinned ||
+            image.PinnedDirectories is not { Count: > 0 } roots)
+            return false;
         try
         {
             foreach (var file in pinned)
@@ -104,6 +130,17 @@ internal static class SupervisorControls
                     !StringComparer.OrdinalIgnoreCase.Equals(
                         file.Value, ManifestDigest(file.Key)))
                     return false;
+            }
+            // A late-added sidecar must fail just as a changed original file
+            // does. These roots are part of the registry-pinned manifest.
+            foreach (var root in roots)
+            {
+                if (!Path.IsPathFullyQualified(root) ||
+                    !Directory.Exists(root)) return false;
+                foreach (var path in Directory.EnumerateFiles(root, "*",
+                             SearchOption.AllDirectories).Where(LoadableFile))
+                    if (!pinned.ContainsKey(Path.GetFullPath(path)))
+                        return false;
             }
             return true;
         }
@@ -127,7 +164,9 @@ internal static class SupervisorControls
                     launcher, ManifestDigest(InstalledLauncherPath(key))))
                 return null;
             var manifest = ReadManifest(ManifestPath(key));
-            return PinnedFilesMatch(manifest?.PinnedFiles) ? manifest : null;
+            return PinnedFilesMatch(manifest is null ? null :
+                new SupervisorExecutionImage(manifest.PinnedFiles,
+                    manifest.PinnedDirectories)) ? manifest : null;
         }
         catch (Exception error) when (error is IOException or
             UnauthorizedAccessException or JsonException or ArgumentException)
@@ -136,7 +175,36 @@ internal static class SupervisorControls
 
     private static bool ManifestVerified(string key) => TrustedManifest(key) is not null;
 
-    internal static IReadOnlyDictionary<string, string> InstalledPinset(
+    internal static bool MatchesInstalledCheckout(SupervisorLaunchManifest? manifest,
+        string executable, string assembly) =>
+        manifest is not null &&
+        StringComparer.OrdinalIgnoreCase.Equals(
+            Path.GetFullPath(manifest.Runtime), Path.GetFullPath(executable)) &&
+        StringComparer.OrdinalIgnoreCase.Equals(
+            Path.GetFullPath(manifest.Assembly), Path.GetFullPath(assembly));
+
+    // Removal may be necessary after executable drift, so verify only the
+    // registry-pinned manifest bytes and original checkout ownership here,
+    // without requiring all executable hashes to still be valid.
+    private static bool RegisteredCheckoutMatches(
+        string key, string executable, string assembly)
+    {
+        using var values = Registry.CurrentUser.OpenSubKey(ManifestKey, writable: false);
+        var digest = values?.GetValue(key) as string;
+        if (digest is not { Length: 64 }) return false;
+        try
+        {
+            return StringComparer.OrdinalIgnoreCase.Equals(
+                    digest, ManifestDigest(ManifestPath(key))) &&
+                MatchesInstalledCheckout(
+                    ReadManifest(ManifestPath(key)), executable, assembly);
+        }
+        catch (Exception error) when (error is IOException or
+            UnauthorizedAccessException or JsonException or ArgumentException)
+        { return false; }
+    }
+
+    internal static SupervisorExecutionImage InstalledPinset(
         string key, string identity, string executable, string assembly)
     {
         var manifest = TrustedManifest(key) ?? throw new InvalidOperationException(
@@ -147,7 +215,8 @@ internal static class SupervisorControls
             !StringComparer.OrdinalIgnoreCase.Equals(
                 Path.GetFullPath(manifest.Assembly), Path.GetFullPath(assembly)))
             throw new InvalidOperationException("Registered startup identity differs.");
-        return manifest.PinnedFiles;
+        return new SupervisorExecutionImage(
+            manifest.PinnedFiles, manifest.PinnedDirectories);
     }
 
     private static string Quote(string value) =>
@@ -234,14 +303,16 @@ internal static class SupervisorControls
             var image = pinned >= 0
                 ? InstalledPinset(keyId, SupervisorIdentity.For(config),
                     executable, assembly)
-                : PinnedRuntimeFiles(executable, assembly, config);
+                : new SupervisorExecutionImage(
+                    PinnedRuntimeFiles(executable, assembly, config),
+                    PinnedRuntimeDirectories(assembly, config));
             using var stop = new CancellationTokenSource();
             ConsoleCancelEventHandler handler = (_, e) => { e.Cancel = true; stop.Cancel(); };
             Console.CancelKeyPress += handler;
             try
             {
                 return await new HostSupervisor(configPath, config,
-                    executable, assembly, pinnedFiles: image).RunAsync(stop.Token);
+                    executable, assembly, pinnedImage: image).RunAsync(stop.Token);
             }
             finally { Console.CancelKeyPress -= handler; }
         }
@@ -265,13 +336,16 @@ internal static class SupervisorControls
             var manifestPath = ManifestPath(keyId);
             var manifest = new SupervisorLaunchManifest(
                 executable, assembly, configPath, SupervisorIdentity.For(config),
-                PinnedRuntimeFiles(executable, assembly, config));
+                PinnedRuntimeFiles(executable, assembly, config),
+                PinnedRuntimeDirectories(assembly, config));
             using var key = Registry.CurrentUser.CreateSubKey(RunKey, writable: true)
                 ?? throw new InvalidOperationException("Cannot open per-user startup registry.");
-            if (key.GetValue(valueName) is string previous && previous != launch)
+            if (key.GetValue(valueName) is string previous &&
+                (previous != launch ||
+                 !RegisteredCheckoutMatches(keyId, executable, assembly)))
                 throw new InvalidOperationException(
                     "A different supervisor is already registered for this state directory. " +
-                    "Remove that installation explicitly before changing it.");
+                    "Remove that installation from its original checkout before changing it.");
             WriteLauncher(sourceScript, script);
             WriteManifest(manifestPath, manifest);
             using var digests = Registry.CurrentUser.CreateSubKey(ManifestKey, writable: true)
@@ -298,13 +372,16 @@ internal static class SupervisorControls
             var script = InstalledLauncherPath(keyId);
             var launch = StartupCommand(script, keyId);
             using var key = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
-            if (key?.GetValue(valueName) is string existing)
+            var registered = key?.GetValue(valueName) as string;
+            if (registered is not null || File.Exists(ManifestPath(keyId)))
             {
-                if (existing != launch)
+                if (registered is not null && registered != launch ||
+                    !RegisteredCheckoutMatches(keyId, executable, assembly))
                     throw new InvalidOperationException(
-                        "Registered command differs; remove it from the original checkout.");
-                key.DeleteValue(valueName);
+                        "Startup registration belongs to another checkout or " +
+                        "has an invalid manifest. Remove it from the original checkout.");
             }
+            if (registered is not null) key!.DeleteValue(valueName);
             // This is only a local launcher manifest, not host state or a credential.
             using var digests = Registry.CurrentUser.OpenSubKey(ManifestKey, writable: true);
             digests?.DeleteValue(keyId, throwOnMissingValue: false);
@@ -335,6 +412,9 @@ internal static class SupervisorControls
                 supervisorActive = active,
                 installedForUser = installed,
                 startupManifestVerified = installed && ManifestVerified(keyId),
+                launcherFailureLog = Path.Combine(
+                    Path.GetDirectoryName(ManifestPath(keyId))!,
+                    "launcher-failures.log"),
                 lastRecorded = store.Read(),
                 hostProbe = health.Kind.ToString().ToLowerInvariant(),
                 hostHealth = health.Health

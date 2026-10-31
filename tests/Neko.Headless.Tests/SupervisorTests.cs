@@ -137,9 +137,20 @@ public sealed class SupervisorTests
         Assert.Contains(Path.GetFullPath(provider), original.Keys);
         Assert.Contains(Path.GetFullPath(sidecar), original.Keys);
         Assert.Contains(Path.GetFullPath(settings), original.Keys);
-        Assert.True(SupervisorControls.PinnedFilesMatch(original));
+        var pinnedImage = new SupervisorExecutionImage(original,
+            SupervisorControls.PinnedRuntimeDirectories(assembly, config));
+        Assert.True(SupervisorControls.PinnedFilesMatch(pinnedImage));
+        var lateSidecar = Path.Combine(providerDir, "late-loaded.dll");
+        File.WriteAllText(lateSidecar, "unapproved-code");
+        Assert.False(SupervisorControls.PinnedFilesMatch(pinnedImage));
+        File.Delete(lateSidecar);
+        var lateHostDependency = Path.Combine(image, "late-native.so");
+        File.WriteAllText(lateHostDependency, "unapproved-code");
+        Assert.False(SupervisorControls.PinnedFilesMatch(pinnedImage));
+        File.Delete(lateHostDependency);
+        Assert.True(SupervisorControls.PinnedFilesMatch(pinnedImage));
         File.WriteAllText(sidecar, "replaced-sidecar");
-        Assert.False(SupervisorControls.PinnedFilesMatch(original));
+        Assert.False(SupervisorControls.PinnedFilesMatch(pinnedImage));
         var changedSidecar = SupervisorControls.PinnedRuntimeFiles(
             runtime, assembly, config);
         Assert.NotEqual(original[Path.GetFullPath(sidecar)],
@@ -175,6 +186,25 @@ public sealed class SupervisorTests
         Assert.NotEqual(baseline, cliIdentity);
         File.WriteAllText(cli, "cli-changed");
         Assert.NotEqual(cliIdentity, SupervisorIdentity.For(configuredCli));
+    }
+
+    [Fact]
+    public void RegisteredCheckoutOwnershipCannotBeConfusedBySameLauncherCommand()
+    {
+        using var folder = new TestFolder();
+        var assembly = Path.Combine(folder.Path, "buildA", "Neko.Headless.dll");
+        var runtime = Path.Combine(folder.Path, "buildA", "dotnet.exe");
+        var manifest = new SupervisorLaunchManifest(runtime, assembly,
+            Path.Combine(folder.Path, "config.json"), new string('A', 64),
+            new Dictionary<string, string>(), [Path.GetDirectoryName(assembly)!]);
+        Assert.True(SupervisorControls.MatchesInstalledCheckout(
+            manifest, runtime, assembly));
+        Assert.False(SupervisorControls.MatchesInstalledCheckout(manifest,
+            Path.Combine(folder.Path, "buildB", "dotnet.exe"), assembly));
+        Assert.False(SupervisorControls.MatchesInstalledCheckout(manifest,
+            runtime, Path.Combine(folder.Path, "buildB", "Neko.Headless.dll")));
+        Assert.False(SupervisorControls.MatchesInstalledCheckout(
+            null, runtime, assembly));
     }
 
     [Fact]
@@ -352,10 +382,7 @@ public sealed class SupervisorTests
                 command.ArgumentList.Add("exit");
                 command.ArgumentList.Add("42");
                 return Process.Start(command)!;
-            }, pinnedFiles: new Dictionary<string, string> {
-                [LocalNoopExecutable()] =
-                    SupervisorControls.ManifestDigest(LocalNoopExecutable())
-            });
+            }, pinnedImage: CreateTestExecutionImage(folder.Path));
         Assert.Equal(0, await supervisor.RunAsync(cancel.Token));
 
         var recovered = new ChatJournal(folder.Path);
@@ -382,11 +409,14 @@ public sealed class SupervisorTests
         using var folder = new TestFolder();
         var config = Config(folder.Path);
         var path = SaveConfig(folder.Path, config);
-        var dependency = Path.Combine(folder.Path, "sidecar.dll");
+        var image = Path.Combine(folder.Path, "image");
+        Directory.CreateDirectory(image);
+        var dependency = Path.Combine(image, "sidecar.dll");
         File.WriteAllText(dependency, "original");
-        var pinned = new Dictionary<string, string> {
-            [dependency] = SupervisorControls.ManifestDigest(dependency)
-        };
+        var pinned = new SupervisorExecutionImage(
+            new Dictionary<string, string> {
+                [dependency] = SupervisorControls.ManifestDigest(dependency)
+            }, [image]);
         var launches = 0;
         using var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(8));
         var supervisor = new HostSupervisor(path, config,
@@ -403,7 +433,7 @@ public sealed class SupervisorTests
                 command.ArgumentList.Add("exit");
                 command.ArgumentList.Add("0");
                 return Process.Start(command)!;
-            }, pinnedFiles: pinned);
+            }, pinnedImage: pinned);
         Assert.Equal(4, await supervisor.RunAsync(cancel.Token));
         Assert.Equal(1, launches);
         var latest = new SupervisorStore(folder.Path).Read();
@@ -411,6 +441,58 @@ public sealed class SupervisorTests
         Assert.Equal("execution_image_changed", latest?.Reason);
         Assert.Contains(new SupervisorStore(folder.Path).Tail(), line =>
             line.Contains("execution_image_changed_restart_requires_operator"));
+    }
+
+    [Fact]
+    public async Task AddedDependencyBlocksEveryAutomaticRestart()
+    {
+        using var folder = new TestFolder();
+        var config = Config(folder.Path);
+        var path = SaveConfig(folder.Path, config);
+        var image = Path.Combine(folder.Path, "closed-image");
+        Directory.CreateDirectory(image);
+        var dependency = Path.Combine(image, "provider.dll");
+        File.WriteAllText(dependency, "original");
+        var pinned = new SupervisorExecutionImage(
+            new Dictionary<string, string> {
+                [dependency] = SupervisorControls.ManifestDigest(dependency)
+            }, [image]);
+        var launches = 0;
+        using var cancel = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        var supervisor = new HostSupervisor(path, config,
+            LocalNoopExecutable(), typeof(HostSupervisor).Assembly.Location,
+            () =>
+            {
+                launches++;
+                // Existing bytes remain unchanged. A new loadable DLL is enough
+                // to invalidate the closed release image before restart.
+                File.WriteAllText(Path.Combine(image, "late-loaded.dll"),
+                    "unexpected-dependency");
+                var command = new ProcessStartInfo("cmd.exe") {
+                    UseShellExecute = false, CreateNoWindow = true
+                };
+                command.ArgumentList.Add("/C");
+                command.ArgumentList.Add("exit");
+                command.ArgumentList.Add("0");
+                return Process.Start(command)!;
+            }, pinnedImage: pinned);
+        Assert.Equal(4, await supervisor.RunAsync(cancel.Token));
+        Assert.Equal(1, launches);
+        var latest = new SupervisorStore(folder.Path).Read();
+        Assert.Equal("blocked", latest?.State);
+        Assert.Equal("execution_image_changed", latest?.Reason);
+    }
+
+    private static SupervisorExecutionImage CreateTestExecutionImage(string folder)
+    {
+        var directory = Path.Combine(folder, "closed-image");
+        Directory.CreateDirectory(directory);
+        var dll = Path.Combine(directory, "pinned.dll");
+        File.WriteAllText(dll, "test-dependency");
+        return new SupervisorExecutionImage(
+            new Dictionary<string, string> {
+                [dll] = SupervisorControls.ManifestDigest(dll)
+            }, [directory]);
     }
 
     private static string LocalNoopExecutable()

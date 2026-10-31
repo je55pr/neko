@@ -2,6 +2,22 @@
 # user app-data, with its content digest pinned in the user's registry.
 param([Parameter(Mandatory = $true)][string]$Key)
 $ErrorActionPreference = 'Stop'
+# Hidden logon startup has no console. Record only a fixed lifecycle marker,
+# never an exception string, configuration path, token or provider output.
+trap {
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            $logDir = Join-Path $env:LOCALAPPDATA 'Neko\Supervision'
+            if (-not (Test-Path -LiteralPath $logDir -PathType Container)) {
+                $null = New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop
+            }
+            Add-Content -LiteralPath (Join-Path $logDir 'launcher-failures.log') -Value (
+                [DateTimeOffset]::UtcNow.ToString('o') + ' startup_integrity_or_launch_failed'
+            ) -ErrorAction SilentlyContinue
+        }
+    } catch { }
+    exit 1
+}
 if ($Key -cnotmatch '^[A-F0-9]{16}$') { throw 'Invalid supervisor registration key.' }
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     throw 'Local application-data directory unavailable.'
@@ -48,6 +64,25 @@ foreach ($file in $entries) {
 }
 if (-not $pinned.ContainsKey($runtime) -or -not $pinned.ContainsKey($assembly)) {
     throw 'Pinned runtime or assembly entry missing.'
+}
+# The set of loadable dependencies must be closed, not only the hashes of
+# files present at installation. Newly added DLLs/native modules fail closed.
+$directories = @($manifest.pinnedDirectories)
+if ($directories.Count -eq 0) { throw 'Pinned dependency directories missing.' }
+foreach ($directory in $directories) {
+    $dir = [string]$directory
+    if (-not [IO.Path]::IsPathFullyQualified($dir) -or
+        -not (Test-Path -LiteralPath $dir -PathType Container)) {
+        throw 'Pinned dependency directory unavailable.'
+    }
+    foreach ($candidate in Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction Stop) {
+        $extension = [IO.Path]::GetExtension($candidate.FullName).ToLowerInvariant()
+        if (@('.dll','.exe','.json','.so','.dylib') -contains $extension) {
+            if (-not $pinned.ContainsKey([IO.Path]::GetFullPath($candidate.FullName))) {
+                throw 'Unregistered executable dependency detected.'
+            }
+        }
+    }
 }
 if ([IO.Path]::GetFileNameWithoutExtension($runtime) -ieq 'dotnet') {
     & $runtime $assembly supervise --config $configPath --expected-instance $expected

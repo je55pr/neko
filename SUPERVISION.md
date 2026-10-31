@@ -34,15 +34,23 @@ logon execution. A digest of the installed private launcher copy is also pinned
 and shown in `supervisor-status` integrity verification. Additionally the
 manifest pins the hashes of the host executable, its runtime dependencies,
 the provider assembly and its separate output-directory dependencies, and
-configured provider settings. The launcher verifies those bytes before startup,
-and the supervisor validates the same trusted pinset **before every child
-launch**, including restarts after a crash. Changing any such file requires
-explicit reinstallation.
+configured provider settings. It also pins the host and provider output
+directory inventories: new DLL/EXE/JSON/native sidecars fail closed just
+like modified existing files. The launcher verifies bytes and inventory
+before startup, and the supervisor validates the same registered image
+**before every child launch**, including restarts after a crash.
+Changing any such file requires explicit reinstallation. .NET runtime or SDK
+servicing may change a pinned `dotnet.exe` and require reinstallation.
 This does not claim security against malware already running as the same
 user, which can also modify that user's registry or race validation. Windows limits Run-key commands to 260 characters;
 installation fails safely if the private launcher path makes even this short
 entry too long. Installation does **not** start, stop, restart or inspect a live host.
-The launcher runs at the next supported interactive user logon.
+The launcher runs at the next supported interactive user logon. A hidden
+launcher failure records a fixed `startup_integrity_or_launch_failed` event
+without exception text or secrets in
+`%LOCALAPPDATA%\Neko\Supervision\launcher-failures.log`. The
+`supervisor-status` output includes this log's path and reports
+`startupManifestVerified: false` on registered-image drift.
 
 To run supervision interactively, instead of installing automatic startup:
 
@@ -80,8 +88,11 @@ log/status directories are reported as empty rather than crashing. Diagnostic
 writes are best-effort, so an inaccessible status or log file cannot terminate
 a healthy host supervisor; the error type is reported to stderr.
 
-Removal deletes the matching per-user Run entry, trusted registry digest and
-private local launch manifest only. It does not remove host state, pending markers, credentials,
+Removal compares the original checkout executable/assembly paths against
+the registry-pinned manifest, so an unrelated checkout cannot silently
+remove another checkout's startup registration even if the Run command is
+identical. Removal deletes the matching per-user Run entry, trusted registry
+digest and private local launch manifest only. It does not remove host state, pending markers, credentials,
 private browser profiles, an active supervisor or its child. An installation from another checkout is
 not silently overwritten or removed; use that original checkout to remove
 it first. Keep the checkout and compiled host executable in place while the
