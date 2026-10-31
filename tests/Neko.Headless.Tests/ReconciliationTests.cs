@@ -12,6 +12,10 @@ public sealed partial class HeadlessRuntimeTests
         public bool AuthoritativeComplete;
         public bool CorrelateUncertainSend;
         public bool AuthoritativeReadUnavailable;
+        public void SetAuthoritativeReadUnavailable(bool value) =>
+            AuthoritativeReadUnavailable = value;
+        public void SimulateCorrelatedUncertainSend() =>
+            CorrelateUncertainSend = true;
         public string? RawInspectionReason { get; set; }
         public bool AuthoritativeThrow;
         public string? CorrelatedUncertainCreationId;

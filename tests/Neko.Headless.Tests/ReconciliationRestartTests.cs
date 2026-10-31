@@ -16,7 +16,7 @@ public sealed partial class HeadlessRuntimeTests
         await runtime.CreateAsync("first", CancellationToken.None);
         await WaitForTerminal(runtime, "chat-1");
         provider.DeferCompletion = true;
-        provider.CorrelateUncertainSend = true;
+        provider.SimulateCorrelatedUncertainSend();
         provider.UncertainNextSend = true;
         Assert.Equal(SendDisposition.Uncertain,
             (await runtime.SendAsync("chat-1", "correlated", CancellationToken.None))
@@ -122,10 +122,10 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Equal("provider_rate_limited",
             restarted.Get("chat-1")!.LastReconciliation!.Reason);
         provider.RateLimitRetryAfterSeconds = null;
-        provider.AuthoritativeReadUnavailable = true;
+        provider.SetAuthoritativeReadUnavailable(true);
         Assert.Equal("history_unavailable",
             (await restarted.ReconcileAsync("chat-1", CancellationToken.None)).Reason);
-        provider.AuthoritativeReadUnavailable = false;
+        provider.SetAuthoritativeReadUnavailable(false);
         Assert.Equal("restored",
             (await restarted.ReconcileAsync("chat-1", CancellationToken.None)).Outcome);
         Assert.Equal(1, provider.SendCalls);
