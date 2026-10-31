@@ -223,6 +223,43 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         return true;
     }
 
+    // Standalone inline comments have no source review ID. Preserve them
+    // separately, rather than inventing a submitted review that could falsely
+    // satisfy approval or no-findings gates. Use original_commit_id, not the
+    // reanchored commit_id, for precise current-head attribution.
+    internal static IReadOnlyList<PrInlineFinding> StandaloneAutomatedFindings(
+        JsonElement comments, string head, string? automatedReviewer)
+    {
+        var result = new List<PrInlineFinding>();
+        if (string.IsNullOrWhiteSpace(automatedReviewer)) return result;
+        foreach (var comment in comments.EnumerateArray())
+        {
+            if (comment.ValueKind != JsonValueKind.Object ||
+                !comment.TryGetProperty("user", out var user) ||
+                user.ValueKind != JsonValueKind.Object) continue;
+            var author = GetString(user, "login");
+            if (!StringComparer.OrdinalIgnoreCase.Equals(author, automatedReviewer))
+                continue;
+            var revision = GetString(comment, "original_commit_id");
+            if (!PrReviewGate.ValidSha(revision))
+                throw new InvalidOperationException(
+                    "Automated comment original revision unverified.");
+            if (revision != head) continue;
+            if (comment.TryGetProperty("pull_request_review_id", out var review) &&
+                review.ValueKind == JsonValueKind.Number &&
+                review.TryGetInt64(out var linkedId) && linkedId > 0)
+                continue; // The associated submitted review already carries evidence.
+            if (!comment.TryGetProperty("id", out var idElement) ||
+                !idElement.TryGetInt64(out var id) || id <= 0 ||
+                !Uri.TryCreate(GetString(comment, "html_url"),
+                    UriKind.Absolute, out var url) || url.Scheme != Uri.UriSchemeHttps)
+                throw new InvalidOperationException(
+                    "Standalone automated comment identity unverified.");
+            result.Add(new PrInlineFinding(url.ToString(), author!, revision!, id));
+        }
+        return result;
+    }
+
     internal static string BodyDigest(string body) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
 
@@ -387,6 +424,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         var reviewComments = AssociatedReviewIds(comments.RootElement);
         var emptyReviewCommentsClear = NoAutomatedInlineCommentsOnHead(
             comments.RootElement, head, _policy?.AutomatedReviewer);
+        var inlineFindings = StandaloneAutomatedFindings(
+            comments.RootElement, head, _policy?.AutomatedReviewer);
         var sourceReviews = new List<PrReview>();
         foreach (var r in reviews.RootElement.EnumerateArray())
         {
@@ -429,7 +468,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         var unresolved = Member(threadsRoot, "nodes").EnumerateArray()
             .Count(n => !Member(n, "isResolved").GetBoolean());
         return new PrSourceStatus(canonicalRepository, number, head, baseSha, state, author,
-            merged, mergeable, gathered.ToArray(), sourceReviews, unresolved);
+            merged, mergeable, gathered.ToArray(), sourceReviews, unresolved,
+            inlineFindings);
     }
 
     public async Task<string> AuthenticatedPublisherAsync(CancellationToken cancellation)

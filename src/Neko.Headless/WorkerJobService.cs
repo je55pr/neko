@@ -316,6 +316,21 @@ internal sealed class WorkerJobService : IDisposable
                             job = AddEvent(job, "review_findings",
                                 "Automated review contains findings requiring triage.",
                                 "review." + Hash(review.Url), reviewUrl: review.Url);
+                    // An inline bot comment without an associated submitted
+                    // review must still wake the manager, but must never be
+                    // mistaken for an approving or no-findings review.
+                    var standalone = (source.InlineFindings ?? [])
+                        .Where(f => f.OriginalHeadSha == job.HeadSha &&
+                            StringComparer.OrdinalIgnoreCase.Equals(
+                                f.Author, _policy.AutomatedReviewer))
+                        .OrderBy(f => f.CommentId).ToArray();
+                    if (standalone.Length > 0)
+                        job = AddEvent(job, "review_findings",
+                            $"Automated reviewer posted {standalone.Length} standalone " +
+                            "inline finding(s) requiring triage.",
+                            "inline." + Hash(job.HeadSha + ":" +
+                                string.Join(",", standalone.Select(f => f.CommentId))),
+                            reviewUrl: standalone[0].Url);
                     if (source.State != "open" || source.Merged)
                         job = job with { WatchClosed = true };
                 }

@@ -323,6 +323,52 @@ public sealed partial class HeadlessRuntimeTests
     }
 
     [Fact]
+    public async Task StandaloneBotInlineFindingWakesManagerWithoutFakeApproval()
+    {
+        using var folder = new TemporaryDirectory();
+        var clock = new InboxClock();
+        var provider = new FakeProvider();
+        using var runtime = InboxRuntime(folder.Path, provider);
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        var chat = new ChatJournal(folder.Path);
+        SeedAcceptedWorker(chat);
+        new PrWorkflowStore(folder.Path, clock).Create("sample/project", 7,
+            PrHead, PrBase, "creator", "worker-2", "chat-1");
+        const string findingUrl = "https://github.com/example/pull/7#comment-44";
+        var baseline = GoodSource(clock.GetUtcNow());
+        var bot = new PrReview("https://github.com/example/pull/7#review",
+            "auto-account", PrHead, "commented", false, clock.GetUtcNow(),
+            SourceReviewId: 123, AutomatedNoFindings: false);
+        var source = new PrSourceFake(baseline with {
+            Reviews = [.. baseline.Reviews.Where(r => r.Author != "auto-account"), bot],
+            InlineFindings = [new PrInlineFinding(findingUrl, "auto-account", PrHead, 44)]
+        });
+        var policy = GatePolicy() with {
+            AutomatedNoFindingsMarker = null, AllowVerifiedEmptyAutomatedReview = true
+        };
+        var setup = SetupJobs(folder.Path, runtime, managers, clock,
+            source: source, policyOverride: policy);
+        using var jobs = setup.Jobs;
+        using var inbox = setup.Inbox;
+        var (registered, error) = jobs.Register("manager/main",
+            new WorkerJobRegisterRequest("worker-2", "op-2", "sample/project", 7));
+        Assert.Null(error);
+        Assert.NotNull(registered);
+        await jobs.ProcessAllAsync(CancellationToken.None);
+        var events = jobs.Get("manager/main", registered.Job.Id)!.Events;
+        Assert.Single(events, e =>
+            e.Kind == "review_findings" && e.ReviewUrl == findingUrl);
+        Assert.Single(setup.InboxJournal.List("manager/main"));
+        clock.AdvanceSeconds(180);
+        await jobs.ProcessAllAsync(CancellationToken.None);
+        Assert.Single(jobs.Get("manager/main", registered.Job.Id)!.Events);
+        Assert.Single(setup.InboxJournal.List("manager/main"));
+        Assert.Equal(0, provider.SendCalls);
+        Assert.Equal(0, source.PostCalls);
+        Assert.Equal(0, source.MergeCalls);
+    }
+
+    [Fact]
     public async Task ConcurrentHumanEnqueueAndCompletionKeepDistinctOrderedMessages()
     {
         using var folder = new TemporaryDirectory();

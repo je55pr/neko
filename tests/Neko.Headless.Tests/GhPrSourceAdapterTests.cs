@@ -209,6 +209,46 @@ public sealed class GhPrSourceAdapterTests
             "another-account", "automated-account", 78, linked, body, marker));
     }
 
+    [Fact]
+    public void StandaloneBotCommentsOnOriginalHeadRemainFindingEvidence()
+    {
+        const string head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        using var comments = JsonDocument.Parse("""
+            [
+              {"id":15,"user":{"login":"review-bot"},
+               "original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+               "commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+               "pull_request_review_id":null,
+               "html_url":"https://github.com/example/pr#comment-15"},
+              {"id":16,"user":{"login":"review-bot"},
+               "original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+               "pull_request_review_id":100,
+               "html_url":"https://github.com/example/pr#comment-16"},
+              {"id":17,"user":{"login":"review-bot"},
+               "original_commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+               "pull_request_review_id":null,
+               "html_url":"https://github.com/example/pr#comment-17"},
+              {"id":18,"user":{"login":"human"},
+               "original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+               "pull_request_review_id":null,
+               "html_url":"https://github.com/example/pr#comment-18"}
+            ]
+            """);
+        var found = GhPrSourceAdapter.StandaloneAutomatedFindings(
+            comments.RootElement, head, "review-bot");
+        Assert.Single(found);
+        Assert.Equal(15, found[0].CommentId);
+        Assert.Equal(head, found[0].OriginalHeadSha);
+        Assert.Contains("comment-15", found[0].Url);
+        using var missingOriginal = JsonDocument.Parse("""
+            [{"id":20,"user":{"login":"review-bot"},
+              "html_url":"https://github.com/example/pr#comment-20"}]
+            """);
+        Assert.Throws<InvalidOperationException>(() =>
+            GhPrSourceAdapter.StandaloneAutomatedFindings(
+                missingOriginal.RootElement, head, "review-bot"));
+    }
+
     [Theory]
     [InlineData("{\"body\":\"\"}", true)]
     [InlineData("{}", false)]

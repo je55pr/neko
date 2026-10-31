@@ -8,10 +8,12 @@ public sealed record PrCheck(string Name, string HeadSha, string Status, string?
 public sealed record PrReview(string Url, string Author, string HeadSha, string Verdict,
     bool Substantive, DateTimeOffset SubmittedAt, string? BodySha256 = null,
     long? SourceReviewId = null, bool AutomatedNoFindings = false);
+public sealed record PrInlineFinding(string Url, string Author,
+    string OriginalHeadSha, long CommentId);
 public sealed record PrSourceStatus(string Repository, int Number, string HeadSha,
     string BaseSha, string State, string Author, bool Merged, bool Mergeable,
     IReadOnlyList<PrCheck> Checks, IReadOnlyList<PrReview> Reviews,
-    int UnresolvedThreads);
+    int UnresolvedThreads, IReadOnlyList<PrInlineFinding>? InlineFindings = null);
 public sealed record PrReviewPolicy(
     IReadOnlyList<string> RequiredChecks, string AutomatedCheck, string AutomatedReviewer,
     bool RequireNoUnresolvedThreads = true,
