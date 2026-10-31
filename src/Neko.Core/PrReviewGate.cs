@@ -21,6 +21,7 @@ public sealed record PrWorkflow(string Repository, int Number, string HeadSha, s
     DateTimeOffset CreatedAt, string State = "implementing",
     PrWorkerEvidence? Reviewer = null, string? MergeAttemptId = null,
     string? MergeOutcome = null, string? MergedSha = null,
+    string ReviewLaunchState = "unstarted", DateTimeOffset? ReviewLaunchAt = null,
     IReadOnlyList<PrAuditEvent>? Audit = null);
 public sealed record PrGateDecision(bool Ready, string State,
     IReadOnlyList<string> Blockers, DateTimeOffset CheckedAt);
@@ -51,7 +52,8 @@ public static class PrReviewGate
         {
             if (worker.ConversationId == workflow.CreatorConversationId ||
                 worker.ConversationId == workflow.DeveloperConversationId ||
-                worker.ConversationId == workflow.ManagerConversationId)
+                worker.ConversationId == workflow.ManagerConversationId ||
+                worker.ReviewerAccount == source.Author)
                 blockers.Add("reviewer_not_independent");
             if (worker.CreatedForHead != workflow.HeadSha ||
                 worker.CreatedAt < workflow.CreatedAt)

@@ -266,6 +266,12 @@ Keep the authenticated browser profile **outside this repository**. The
 example `local-session-profile/` directory is ignored only to prevent
 accidental staging during local experiments.
 
+## Explicit PR review gate (foundational stage)
+
+The opt-in manager PR evidence workflow and guarded merge command are documented
+in [REVIEW_GATE.md](REVIEW_GATE.md). No merge is permitted with incomplete or
+self-certified review evidence; this is not yet autonomous worker orchestration.
+
 ## Permanent output archives
 
 New turns are archived in `%LOCALAPPDATA%\Neko\conversation-archives`, with the following outputs:
