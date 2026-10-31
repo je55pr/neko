@@ -199,6 +199,61 @@ The older `/managers/main/messages` endpoint remains available for immediate
 guarded sends, but returns `manager_inbox_pending` while an inbox message
 is outstanding, protecting its unconsumed completion evidence.
 
+## Asynchronous worker jobs (issue #33)
+
+A manager can bind an **already accepted** worker conversation/turn to a durable
+job and then finish its own turn. This feature **never launches workers** or
+retries their operations. The caller delegates separately using an authorized
+provider operation, waits for its accepted receipt, then registers that worker
+with `manager-track manager/main <worker-conversation-id>` (optionally
+`--operation <operation-id>`). The service checks the local accepted-turn
+journal, captures its turn token and dispatch count, and rejects an unverified
+worker. A second registration of the same turn with identical metadata returns
+the original job ID; conflicting ownership or metadata returns 409.
+
+To watch a PR, pass `manager-track manager/main <worker-id> <owner/repo>
+<pr-number> [--operation id] [--deadline ISO-8601]`. The PR must already have
+an authorized review workflow that binds the same manager and developer,
+creator, or reviewer conversation. The job captures that exact PR head.
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/managers/main/jobs` | POST | Register `{"workerConversationId":"...","operationId":"...","repository":"owner/repo","prNumber":42,"deadline":"..."}` |
+| `/managers/main/jobs` | GET | List the manager's durable jobs, evidence and notification references |
+| `/managers/main/jobs/{jobId}` | GET | Inspect one bound turn, terminal proof, watcher state, events and inbox receipts |
+| `/managers/main/jobs/{jobId}/interrupt` | POST | Record `{"reason":"..."}` and queue a correlated human-interruption notification |
+
+CLI inspection commands are `manager-jobs manager/main` and
+`manager-job manager/main <job-id>`. Human interruption is
+`manager-interrupt manager/main <job-id> "<reason>"`.
+
+Worker completion requires a **durable restored terminal decision for the exact
+turn and operation**. Inconclusive, interrupted, replaced or missing worker
+checkpoints never imply success. An observed uncertainty, changed turn, deadline
+or verified completion is recorded as an event first. Trusted failing check
+runs and source reviews requesting changes also generate correlated events.
+Events use stable per-job idempotency keys and are enqueued through the
+existing manager inbox. This lets an idle manager receive a fresh turn without
+holding its previous turn open, and lets a busy manager finish before the
+notification is dispatched. Restarting after enqueue but before acknowledgement
+does not create a second logical notification.
+
+The journal is stored under untracked `stateDirectory/worker-jobs/` with
+fsynced, atomically replaced records under the single host state lease.
+The manager registry's outstanding-job list is a repairable index, not the
+authoritative record. Local worker status is checked every 10 seconds while
+active; PR checks are refreshed no faster than every two minutes in steady
+state, at most two reads per pass, with bounded exponential backoff on
+unavailable/rate-limited sources. Pending inbox notices are retried locally,
+never by replaying the worker action.
+
+**Current boundaries:** registration follows an already accepted worker
+operation; delegation and remote worker launch are intentionally not automated.
+A replaced turn without terminal proof needs human reconciliation. A job's PR
+watch stops when the source PR closes. Historical records and event logs are
+bounded, but archival/retention policies and webhook ingestion are not yet
+included.
+
 ## Architecture and reliability
 
 The single WebView2 page supplies the signed-in execution environment. The adapter invokes the site's existing submission function with explicit conversation, parent and scope values. It does not navigate to individual conversations or interact with composer buttons. Read-only network observation captures live response updates. Server history verifies completion.
