@@ -29,6 +29,7 @@ internal sealed class WorkerJobService : IDisposable
     private readonly SemaphoreSlim _scan = new(1, 1);
     private readonly CancellationTokenSource _shutdown = new();
     private Task? _worker;
+    private long _scanIteration;
 
     public WorkerJobService(WorkerJobJournal jobs, ManagerRegistry registry,
         ManagerService managers, ManagerInboxService inbox, ChatRuntime runtime,
@@ -136,19 +137,44 @@ internal sealed class WorkerJobService : IDisposable
             job => AddEvent(job, "human_interruption", reason, key));
     }
 
+    internal static IReadOnlyList<WorkerJob> SelectJobs(
+        IReadOnlyList<WorkerJob> all, DateTimeOffset now, long scan)
+    {
+        var due = all.Where(j => j.NextPollAt is { } at && at <= now)
+            .OrderBy(j => j.ManagerId, StringComparer.Ordinal)
+            .ThenBy(j => j.Id, StringComparer.Ordinal).ToArray();
+        var notifications = all.Where(j =>
+                j.Events.Any(e => e.InboxMessageId is null))
+            .OrderBy(j => j.ManagerId, StringComparer.Ordinal)
+            .ThenBy(j => j.Id, StringComparer.Ordinal).ToArray();
+        var both = due.Length > 0 && notifications.Length > 0;
+        return Rotate(due, both ? 32 : 64, scan)
+            .Concat(Rotate(notifications, both ? 32 : 64, scan))
+            .DistinctBy(j => (j.ManagerId, j.Id))
+            .Take(64).ToArray();
+    }
+
+    private static IEnumerable<WorkerJob> Rotate(WorkerJob[] candidates,
+        int limit, long scan)
+    {
+        if (candidates.Length == 0) return [];
+        var offset = (int)((ulong)scan % (uint)candidates.Length);
+        return candidates.Skip(offset).Concat(candidates.Take(offset)).Take(limit);
+    }
+
     public async Task ProcessAllAsync(CancellationToken cancellation)
     {
         await _scan.WaitAsync(cancellation);
         try
         {
             var now = _clock.GetUtcNow();
-            // Bound work per pass. Already recorded notifications are always
-            // eligible; no remote read is needed to flush them to the inbox.
-            var jobs = _jobs.ListAll().Where(j =>
-                j.Events.Any(e => e.InboxMessageId is null) ||
-                j.NextPollAt is { } due && due <= now)
-                .OrderBy(j => j.NextPollAt ?? DateTimeOffset.MinValue)
-                .Take(64).ToArray();
+            // Reserve capacity for both due worker observations and pending
+            // inbox notifications. A permanently failing inbox must not starve
+            // unrelated workers, and a failing worker must not starve delivery.
+            // Rotate each bounded scan so one failing prefix cannot monopolize
+            // the same slots forever.
+            var jobs = SelectJobs(_jobs.ListAll(), now,
+                Interlocked.Increment(ref _scanIteration));
             var externalReads = 0;
             foreach (var candidate in jobs)
             {

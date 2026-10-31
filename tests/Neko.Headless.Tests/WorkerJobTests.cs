@@ -44,6 +44,31 @@ public sealed partial class HeadlessRuntimeTests
     }
 
     [Fact]
+    public void FailedNotificationBacklogCannotStarveOtherWorkerObservations()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var stalled = Enumerable.Range(1, 90).Select(i => new WorkerJob(
+            i.ToString("x32"), "manager/failing", "worker-" + i, "turn", 1,
+            "operation", null, null, null, null, "attention_required", now, now,
+            null, 0, null,
+            [new WorkerJobEvent("pending-" + i, "worker_uncertain",
+                "notification not yet enqueued", now)])).ToArray();
+        var active = new WorkerJob(new string('f', 32), "manager/healthy",
+            "worker-healthy", "turn", 1, "operation", null, null, null, null,
+            "running", now, now, now.AddSeconds(-1), 0, null, []);
+        var all = stalled.Append(active).ToArray();
+        var flushed = new HashSet<string>(StringComparer.Ordinal);
+        for (var scan = 1; scan <= 100; scan++)
+        {
+            var selected = WorkerJobService.SelectJobs(all, now, scan);
+            Assert.InRange(selected.Count, 1, 64);
+            Assert.Contains(selected, job => job.Id == active.Id);
+            foreach (var job in selected) flushed.Add(job.Id);
+        }
+        Assert.Equal(all.Length, flushed.Count);
+    }
+
+    [Fact]
     public async Task CompletedAcceptedWorkerWakesIdleManagerOnceAcrossRestart()
     {
         using var folder = new TemporaryDirectory();
