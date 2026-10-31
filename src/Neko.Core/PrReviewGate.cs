@@ -13,7 +13,8 @@ public sealed record PrReviewPolicy(
     bool RequireNoUnresolvedThreads = true);
 public sealed record PrWorkerEvidence(string ConversationId, string CreatedForHead,
     DateTimeOffset CreatedAt, bool Completed, DateTimeOffset? CompletedAt,
-    string? ReviewUrl, string? Verdict, string? ReviewerAccount);
+    string? ReviewUrl, string? Verdict, string? ReviewerAccount,
+    string? CompletionMessageId = null);
 public sealed record PrAuditEvent(DateTimeOffset At, string Action, string Detail,
     string? AttemptId = null);
 public sealed record PrWorkflow(string Repository, int Number, string HeadSha, string BaseSha,
@@ -23,6 +24,7 @@ public sealed record PrWorkflow(string Repository, int Number, string HeadSha, s
     string? MergeOutcome = null, string? MergedSha = null,
     string ReviewLaunchState = "unstarted", DateTimeOffset? ReviewLaunchAt = null,
     DateTimeOffset? MergeAuthorizedAt = null, string? MergeAuthorizedBy = null,
+    PrSourceStatus? LastSourceEvidence = null, PrGateDecision? LastGateDecision = null,
     IReadOnlyList<PrAuditEvent>? Audit = null);
 public sealed record PrGateDecision(bool Ready, string State,
     IReadOnlyList<string> Blockers, DateTimeOffset CheckedAt);

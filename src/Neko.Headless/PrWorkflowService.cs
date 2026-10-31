@@ -57,8 +57,12 @@ internal sealed class PrWorkflowService
         var record = _store.Get(repository, number)
             ?? throw new KeyNotFoundException("Workflow unavailable.");
         var status = await _source.ReadAsync(repository, number, cancellation);
-        return new PrWorkflowReport(record, PrReviewGate.Evaluate(record, _policy, status,
-            _clock.GetUtcNow()));
+        var decision = PrReviewGate.Evaluate(record, _policy, status, _clock.GetUtcNow());
+        // Persist source-verifiable checks and reviewer facts before reporting readiness.
+        var observed = _store.Update(repository, number, current => current with {
+            LastSourceEvidence = status, LastGateDecision = decision
+        });
+        return new PrWorkflowReport(observed, decision);
     }
 
     /// <summary>Explicit revision rearm; old evidence is retained only in audit history.</summary>
@@ -86,7 +90,8 @@ internal sealed class PrWorkflowService
             return _store.Append(existing with {
                 HeadSha = source.HeadSha, BaseSha = source.BaseSha,
                 Reviewer = null, ReviewLaunchState = "unstarted", ReviewLaunchAt = null,
-                State = "awaiting_independent_review"
+                State = "awaiting_independent_review", LastSourceEvidence = source,
+                LastGateDecision = null
             }, "revision_rearmed",
                 "previous_head:" + existing.HeadSha + ";previous_base:" + existing.BaseSha);
         });
@@ -173,9 +178,13 @@ internal sealed class PrWorkflowService
             r.Verdict == verdict && r.Substantive && r.SubmittedAt >= worker.CreatedAt);
         if (source.HeadSha != record.HeadSha || source.BaseSha != record.BaseSha || !match)
             throw new InvalidOperationException("Source-side independent review unverified.");
+        var posted = history.History.Messages.Last(m =>
+            m.Role == VisibleMessageRole.Assistant &&
+            m.Text.Contains(reviewUrl, StringComparison.Ordinal));
         return _store.Update(repository, number, w => _store.Append(w with {
             Reviewer = worker with { Completed = true, CompletedAt = _clock.GetUtcNow(),
-                ReviewUrl = reviewUrl, Verdict = verdict }
+                ReviewUrl = reviewUrl, Verdict = verdict,
+                CompletionMessageId = posted.Id }, LastSourceEvidence = source
         }, "review_verified", "local_terminal_and_source_review"));
     }
 
@@ -217,6 +226,10 @@ internal sealed class PrWorkflowService
                             "merge_preflight_rejected", string.Join(",", recheck.Blockers), attemptId));
                     return new PrMergeReport(stopped, recheck, "rejected");
                 }
+                // Fresh preflight proof must also be durable before the merge write.
+                _store.Update(repository, number, w => _store.Append(w with {
+                    LastSourceEvidence = latest, LastGateDecision = recheck
+                }, "merge_preflight_verified", "exact_head_and_policy_pass", attemptId));
                 var mergedSha = await _source.MergeAsync(repository, number,
                     reserved.HeadSha, cancellation);
                 if (!PrReviewGate.ValidSha(mergedSha))

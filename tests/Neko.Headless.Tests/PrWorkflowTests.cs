@@ -92,6 +92,9 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Equal(PrMerged, persisted.MergedSha);
         Assert.Equal("merged", persisted.MergeOutcome);
         Assert.Equal("manager-chat", persisted.MergeAuthorizedBy);
+        Assert.NotNull(persisted.LastSourceEvidence);
+        Assert.Equal(PrHead, persisted.LastSourceEvidence.HeadSha);
+        Assert.True(persisted.LastGateDecision!.Ready);
         Assert.NotNull(persisted.MergeAuthorizedAt);
         Assert.Contains(persisted.Audit!, e => e.Action == "merge_reserved");
         Assert.Contains(persisted.Audit!, e => e.Action == "merged");
@@ -228,6 +231,7 @@ public sealed partial class HeadlessRuntimeTests
         var finished = await service.ConfirmReviewAsync("sample/project", 7,
             PrReviewUrl, "approved", CancellationToken.None);
         Assert.True(finished.Reviewer!.Completed);
+        Assert.False(string.IsNullOrWhiteSpace(finished.Reviewer.CompletionMessageId));
         Assert.Contains(finished.Audit!, e => e.Action == "review_verified");
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             service.LaunchReviewerAsync("sample/project", 7,
