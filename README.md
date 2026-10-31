@@ -17,7 +17,11 @@ Windows, .NET 10 SDK, WebView2 Runtime, and an existing user-authorized session 
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-headless.ps1
 ```
 
-This script builds both the headless host and the tracked transport, copies the native WebView2 runtime dependency, and runs the server with the ignored local configuration.
+This script builds both the headless host and the tracked transport, copies the native WebView2 runtime dependency, and runs the server with the ignored local configuration. To **build without starting** the service, use `scripts/prepare-headless.ps1` instead.
+
+### Opt-in automatic recovery
+
+Windows user-logon supervision is available through `supervisor-install`, `supervise`, `supervisor-status`, `supervisor-logs` and `supervisor-remove`. See [SUPERVISION.md](SUPERVISION.md) for install/remove commands, ownership and crash-restart guarantees, diagnostics, and limitations. Installation never starts or restarts an existing live host; it takes effect at a later supported interactive user logon. An authenticated `/health` response may be ready **while individual conversations or inbox submissions remain uncertain**. Supervision never replays those operations.
 
 ### CLI
 
