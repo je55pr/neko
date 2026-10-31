@@ -13,7 +13,8 @@ internal sealed record PendingTurnEvidence(
 internal sealed record ReconciliationDecision(
     DateTimeOffset CheckedAt, string Outcome, string Reason,
     string PromptSha256, string? UserMessageId = null,
-    string? AssistantMessageId = null, string? OperationId = null);
+    string? AssistantMessageId = null, string? OperationId = null,
+    string? TurnId = null, int? DispatchCount = null);
 
 internal sealed record CreationPendingRecord(
     string? PromptSha256, string? OwnerId,

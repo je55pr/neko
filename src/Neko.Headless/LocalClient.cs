@@ -24,6 +24,8 @@ internal static class LocalClient
     {
         var positional = new List<string>();
         string? idempotencyKey = null;
+        string? operationId = null;
+        DateTimeOffset? deadline = null;
         var i = 1;
         while (i < args.Length)
         {
@@ -35,6 +37,26 @@ internal static class LocalClient
                 continue;
             }
             if (args[i] == "--wait") { i++; continue; }
+            if (args[i] == "--operation")
+            {
+                if (command != "manager-track" || i + 1 >= args.Length ||
+                    args[i + 1].StartsWith("--"))
+                    throw new ArgumentException("--operation requires a value for manager-track.");
+                operationId = args[i + 1];
+                i += 2;
+                continue;
+            }
+            if (args[i] == "--deadline")
+            {
+                if (command != "manager-track" || i + 1 >= args.Length ||
+                    !DateTimeOffset.TryParse(args[i + 1],
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.AssumeUniversal, out var parsed))
+                    throw new ArgumentException("--deadline requires an ISO timestamp.");
+                deadline = parsed;
+                i += 2;
+                continue;
+            }
             if (args[i] == "--key")
             {
                 if (command != "manager-queue" || i + 1 >= args.Length ||
@@ -89,6 +111,28 @@ internal static class LocalClient
                     ? positional[0]["manager/".Length..] : positional[0];
                 route = $"managers/{Uri.EscapeDataString(name)}/reconcile";
                 method = HttpMethod.Post;
+                break;
+            case "manager-jobs" when positional.Count == 1:
+                route = $"managers/{ManagerName(positional[0])}/jobs";
+                break;
+            case "manager-job" when positional.Count == 2:
+                route = $"managers/{ManagerName(positional[0])}/jobs/{Uri.EscapeDataString(positional[1])}";
+                break;
+            case "manager-track" when positional.Count is 2 or 4 &&
+                (positional.Count == 2 || int.TryParse(positional[3], out _)):
+                route = $"managers/{ManagerName(positional[0])}/jobs";
+                method = HttpMethod.Post;
+                body = JsonSerializer.Serialize(new {
+                    workerConversationId = positional[1], operationId,
+                    repository = positional.Count == 4 ? positional[2] : null,
+                    prNumber = positional.Count == 4 ? int.Parse(positional[3]) : (int?)null,
+                    deadline
+                });
+                break;
+            case "manager-interrupt" when positional.Count == 3:
+                route = $"managers/{ManagerName(positional[0])}/jobs/{Uri.EscapeDataString(positional[1])}/interrupt";
+                method = HttpMethod.Post;
+                body = JsonSerializer.Serialize(new { reason = positional[2] });
                 break;
             case "manager-queue" when positional.Count == 2:
                 route = $"managers/{ManagerName(positional[0])}/inbox";

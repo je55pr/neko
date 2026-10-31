@@ -338,7 +338,9 @@ internal sealed partial class ChatRuntime : IDisposable
                                         "restored", "provider_terminal_observed",
                                         completed.PromptSha256,
                                         AssistantMessageId: update.MessageId,
-                                        OperationId: completed.OperationId)
+                                        OperationId: completed.OperationId,
+                                        TurnId: latest.ProgressTurnId,
+                                        DispatchCount: latest.DispatchCount)
                                     : latest.LastReconciliation
                             }) is null)
                         throw new IOException("The terminal checkpoint is unavailable.");

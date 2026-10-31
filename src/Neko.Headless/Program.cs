@@ -24,11 +24,12 @@ var configPath = configIndex >= 0 && configIndex + 1 < args.Length
 
 if (command == "help")
 {
-    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry|pr-register|pr-status|pr-refresh|pr-reviewer|pr-publish-review|pr-merge [args] [--config path] [--wait]");
+    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry|manager-track|manager-jobs|manager-job|manager-interrupt|pr-register|pr-status|pr-refresh|pr-reviewer|pr-publish-review|pr-merge [args] [--config path] [--wait]");
     Console.WriteLine("pr-register <repo> <number> <creator> <developer> <manager>; pr-status|pr-merge <repo> <number>");
     Console.WriteLine("pr-reviewer <repo> <number> <reviewer-account> <task>; pr-publish-review <repo> <number>");
     Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch|reconcile <id>; reconcile-creation; reconcile-manager <manager/name>");
     Console.WriteLine("manager-queue <manager/name> <text> [--key key]; manager-messages <manager/name>; manager-message|manager-cancel|manager-retry <manager/name> <message-id>");
+    Console.WriteLine("manager-track <manager/name> <accepted-worker-conversation> [repo pr-number] [--operation id] [--deadline ISO]; manager-jobs <manager>; manager-job <manager> <job-id>; manager-interrupt <manager> <job-id> <reason>");
     Console.WriteLine("Stop requires provider support; otherwise it returns Unsupported/stop_not_supported without cancelling.");
     return;
 }
@@ -46,7 +47,8 @@ try
     var journal = new ChatJournal(config.StateDirectory);
     using var hostLease = journal.AcquireHostLease();
     using var runtime = new ChatRuntime(provider, journal);
-    var managers = new ManagerService(new ManagerRegistry(config.StateDirectory), runtime);
+    var managerRegistry = new ManagerRegistry(config.StateDirectory);
+    var managers = new ManagerService(managerRegistry, runtime);
     using var inbox = new ManagerInboxService(
         new ManagerInboxJournal(config.StateDirectory), managers, runtime);
     inbox.Start();
@@ -54,6 +56,11 @@ try
     var prWorkflows = new PrWorkflowService(new PrWorkflowStore(config.StateDirectory),
         new GhPrSourceAdapter(config.ExternalPrCliExecutable, reviewPolicy), runtime,
         reviewPolicy);
+
+    using var workerJobs = new WorkerJobService(
+        new WorkerJobJournal(config.StateDirectory), managerRegistry,
+        managers, inbox, runtime, prWorkflows, reviewPolicy);
+    workerJobs.Start();
 
     var builder = WebApplication.CreateSlimBuilder();
     builder.WebHost.UseUrls($"http://127.0.0.1:{config.Port}");
@@ -106,6 +113,15 @@ try
     app.MapPost("/managers/{name}/messages", (string name, TextRequest body,
         CancellationToken cancellation) =>
         ManagerEndpoints.SendAsync(managers, name, body.Text ?? "", cancellation));
+    app.MapGet("/managers/{name}/jobs", (string name) =>
+        WorkerJobEndpoints.List(workerJobs, name));
+    app.MapPost("/managers/{name}/jobs", (string name, WorkerJobRegisterRequest body) =>
+        WorkerJobEndpoints.Register(workerJobs, name, body));
+    app.MapGet("/managers/{name}/jobs/{jobId}", (string name, string jobId) =>
+        WorkerJobEndpoints.Get(workerJobs, name, jobId));
+    app.MapPost("/managers/{name}/jobs/{jobId}/interrupt",
+        (string name, string jobId, WorkerJobInterruptRequest body) =>
+            WorkerJobEndpoints.Interrupt(workerJobs, name, jobId, body));
     app.MapGet("/managers/{name}/inbox", (string name) =>
         ManagerEndpoints.ListInbox(inbox, name));
     app.MapPost("/managers/{name}/inbox", (string name, InboxEnqueueRequest body) =>

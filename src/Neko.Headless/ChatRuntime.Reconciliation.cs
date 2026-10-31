@@ -67,7 +67,7 @@ internal sealed partial class ChatRuntime
             var decision = new ReconciliationDecision(now, "restored",
                 "authoritative_turn_complete", turn.PromptSha256,
                 inspection.UserMessageId, inspection.AssistantMessageId,
-                turn.OperationId);
+                turn.OperationId, record.ProgressTurnId, record.DispatchCount);
             var saved = _journal.Update(id, current =>
                 current.Status == "uncertain" &&
                 current.PendingTurn is { } pending &&
