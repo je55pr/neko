@@ -59,6 +59,47 @@ public sealed class ManagerBootstrapCliTests
         Assert.Null(handler.LastPath);
     }
 
+    [Fact]
+    public async Task AlreadyCanonicalManagerCreateDoesNotDoublePrefix()
+    {
+        using var handler = new ManagerHandler();
+        using var client = new HttpClient(handler) {
+            BaseAddress = new Uri("http://127.0.0.1:9875/")
+        };
+        Assert.Equal(0, await LocalClient.RunCommandAsync(client,
+            "manager-create", ["manager-create", "manager/main", "initial"],
+            new StringWriter(), new StringWriter()));
+        using var payload = JsonDocument.Parse(handler.LastBody!);
+        Assert.Equal("manager/main", payload.RootElement.GetProperty("id").GetString());
+    }
+
+    [Theory]
+    [InlineData("manager-status")]
+    [InlineData("manager-history")]
+    [InlineData("manager-send")]
+    [InlineData("manager-queue")]
+    [InlineData("manager-message")]
+    [InlineData("manager-cancel")]
+    [InlineData("manager-retry")]
+    [InlineData("reconcile-manager")]
+    public async Task InvalidManagerNameIsRejectedBeforeAnyNetworkCall(string command)
+    {
+        using var handler = new ManagerHandler();
+        using var client = new HttpClient(handler) {
+            BaseAddress = new Uri("http://127.0.0.1:9875/")
+        };
+        var args = command switch {
+            "manager-send" or "manager-queue" => new[] {command, "invalid/path", "text"},
+            "manager-message" or "manager-cancel" or "manager-retry" =>
+                [command, "invalid/path", "message-id"],
+            _ => [command, "invalid/path"]
+        };
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            LocalClient.RunCommandAsync(client, command, args,
+                new StringWriter(), new StringWriter()));
+        Assert.Null(handler.LastPath);
+    }
+
     private sealed class ManagerHandler : HttpMessageHandler
     {
         public string? LastPath;

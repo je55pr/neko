@@ -107,10 +107,7 @@ internal static class LocalClient
                 method = HttpMethod.Post;
                 break;
             case "manager-create" when positional.Count == 2:
-                var managerId = positional[0].StartsWith("manager/", StringComparison.Ordinal)
-                    ? positional[0] : "manager/" + positional[0];
-                if (!ManagerRegistry.IsValidId(managerId))
-                    throw new ArgumentException("Invalid manager identity.");
+                var managerId = ValidManagerId(positional[0]);
                 route = "managers";
                 method = HttpMethod.Post;
                 body = JsonSerializer.Serialize(new { id = managerId, text = positional[1] });
@@ -130,9 +127,7 @@ internal static class LocalClient
                 body = JsonSerializer.Serialize(new { text = positional[1] });
                 break;
             case "reconcile-manager" when positional.Count == 1:
-                var name = positional[0].StartsWith("manager/", StringComparison.Ordinal)
-                    ? positional[0]["manager/".Length..] : positional[0];
-                route = $"managers/{Uri.EscapeDataString(name)}/reconcile";
+                route = $"managers/{ManagerName(positional[0])}/reconcile";
                 method = HttpMethod.Post;
                 break;
             case "manager-jobs" when positional.Count == 1:
@@ -253,9 +248,17 @@ internal static class LocalClient
             Uri.EscapeDataString(parts[1]) + "/" + number;
     }
 
+    private static string ValidManagerId(string id)
+    {
+        var canonical = id.StartsWith("manager/", StringComparison.Ordinal)
+            ? id : "manager/" + id;
+        if (!ManagerRegistry.IsValidId(canonical))
+            throw new ArgumentException("Invalid manager identity.");
+        return canonical;
+    }
+
     private static string ManagerName(string id) =>
-        Uri.EscapeDataString(id.StartsWith("manager/", StringComparison.Ordinal)
-            ? id["manager/".Length..] : id);
+        Uri.EscapeDataString(ValidManagerId(id)["manager/".Length..]);
 
     // A pending transcript is an explicit, successful HTTP read state rather than
     // an unknown conversation or a fabricated empty history.
