@@ -7,17 +7,20 @@ namespace Neko.Headless;
 
 internal sealed record ChatRecord(
     string Id, string Status, VisibleConversation? History = null,
-    DateTimeOffset UpdatedAt = default);
+    DateTimeOffset UpdatedAt = default, string? ProgressTurnId = null);
 
 /// <summary>Local checkpoint data. Never stored in the repository.</summary>
 internal sealed class ChatJournal
 {
     private readonly string _directory;
     private readonly object _gate = new();
+    private readonly Action<ChatRecord>? _beforePersist;
 
-    public ChatJournal(string directory)
+    // Optional injection permits deterministic filesystem-failure regressions.
+    public ChatJournal(string directory, Action<ChatRecord>? beforePersist = null)
     {
         _directory = Path.GetFullPath(directory);
+        _beforePersist = beforePersist;
         Directory.CreateDirectory(_directory);
     }
 
@@ -89,6 +92,7 @@ internal sealed class ChatJournal
     {
         lock (_gate)
         {
+            _beforePersist?.Invoke(record);
             var file = FileName(record.Id);
             var temp = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try

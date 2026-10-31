@@ -52,6 +52,43 @@ public sealed class ConversationUpdateFeedTests
         Assert.Single(result);
     }
 
+    [Fact]
+    public async Task ConcurrentPublishingAndStatusSnapshotsRemainConsistent()
+    {
+        var feed = new ConversationUpdateFeed();
+        var writers = Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        {
+            for (var index = 0; index < 100; index++)
+                feed.Publish(Append("payload-does-not-enter-metadata"));
+        })).ToArray();
+        var reader = Task.Run(async () =>
+        {
+            while (writers.Any(writer => !writer.IsCompleted))
+            {
+                var state = feed.Snapshot();
+                Assert.InRange(state.PublicEventCount, 0, 800);
+                Assert.Equal(state.PublicEventCount == 0,
+                    state.LastPublicUpdateType is null);
+                Assert.False(state.IsTerminal);
+                await Task.Yield();
+            }
+        });
+        await Task.WhenAll(writers);
+        await reader;
+        var beforeTerminal = feed.Snapshot();
+        Assert.Equal(800, beforeTerminal.PublicEventCount);
+        Assert.Equal("Final.Append", beforeTerminal.LastPublicUpdateType);
+        Assert.Null(beforeTerminal.TerminalOperation);
+
+        feed.Publish(Complete());
+        Parallel.For(0, 100, _ => feed.Publish(Append("ignored")));
+        var afterTerminal = feed.Snapshot();
+        Assert.Equal(801, afterTerminal.PublicEventCount);
+        Assert.True(afterTerminal.IsTerminal);
+        Assert.Equal("Complete", afterTerminal.TerminalOperation);
+        Assert.Equal("Final.Complete", afterTerminal.LastPublicUpdateType);
+    }
+
     private static async Task<List<PublicConversationUpdate>> ReadAll(ConversationUpdateFeed feed)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
