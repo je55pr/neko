@@ -48,6 +48,7 @@ public sealed class LocalClientReadTests
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             Assert.Equal(HttpMethod.Get, request.Method);
             Assert.Equal("/conversations/chat-1", request.RequestUri?.AbsolutePath);
             RequestCount++;
