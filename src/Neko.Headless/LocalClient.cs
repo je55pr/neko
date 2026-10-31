@@ -6,6 +6,10 @@ using Neko;
 
 namespace Neko.Headless;
 
+internal sealed class UnsupportedManagerWaitException() :
+    ArgumentException("--wait is not supported for manager-create or manager-send; " +
+        "use manager-status/history or durable manager-queue.");
+
 internal static class LocalClient
 {
     public static async Task RunAsync(HostConfiguration config, string command, string[] args)
@@ -75,9 +79,7 @@ internal static class LocalClient
         // terminal watching is implemented, reject the misleading option
         // BEFORE sending either operation; never silently ignore it.
         if (wait && command is ("manager-create" or "manager-send"))
-            throw new ArgumentException(
-                "--wait is not supported for manager-create or manager-send; " +
-                "use manager-status/history or durable manager-queue.");
+            throw new UnsupportedManagerWaitException();
         string route;
         HttpMethod method = HttpMethod.Get;
         string? body = null;

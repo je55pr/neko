@@ -70,7 +70,7 @@ public sealed class ManagerBootstrapCliTests
             BaseAddress = new Uri("http://127.0.0.1:9875/")
         };
         var args = new[] { command, "manager/main", "task", "--wait" };
-        var error = await Assert.ThrowsAsync<ArgumentException>(() =>
+        var error = await Assert.ThrowsAsync<UnsupportedManagerWaitException>(() =>
             LocalClient.RunCommandAsync(client, command, args,
                 new StringWriter(), new StringWriter()));
         Assert.Contains("--wait is not supported", error.Message);

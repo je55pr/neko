@@ -180,8 +180,12 @@ try
 catch (Exception exception)
 {
     // Deliberately exclude provider exception messages and local paths.
-    Console.Error.WriteLine(exception is OperationCanceledException
-        ? "Cancelled." : "Neko failed to start or complete the command. Check local configuration and logs.");
+    Console.Error.WriteLine(exception switch
+    {
+        OperationCanceledException => "Cancelled.",
+        UnsupportedManagerWaitException => new UnsupportedManagerWaitException().Message,
+        _ => "Neko failed to start or complete the command. Check local configuration and logs."
+    });
     Environment.ExitCode = 1;
 }
 
