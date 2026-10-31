@@ -113,7 +113,14 @@ creation for an existing or uncertain manager returns 409
 (`manager_already_exists`) without another provider call. A **definitively
 rejected** creation leaves the same manager ID in `rejected`; a new,
 explicit POST may try creation again. An `Uncertain` result cannot be retried
-automatically or by a repeated create request.
+automatically or by a repeated create request. An accepted remote creation
+without a valid, durably confirmed conversation binding is instead returned as
+`Uncertain`, preserving the logical manager for manual reconciliation.
+Requests cancelled before a creation-gate attempt or during a send's history
+preflight do not count as remote delivery: the former produces a retryable
+`Rejected` receipt after reservation and the latter can restore the manager
+to `idle`. Cancellation after remote dispatch remains `Uncertain`, never
+an automatic retry signal.
 
 Registry records live under the configured, untracked
 `stateDirectory/managers/`, protected by the existing host lease. Each

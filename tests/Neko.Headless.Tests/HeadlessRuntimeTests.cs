@@ -671,7 +671,9 @@ public sealed partial class HeadlessRuntimeTests
         private readonly Channel<PublicConversationUpdate> _events = Channel.CreateUnbounded<PublicConversationUpdate>();
         private readonly List<VisibleConversationMessage> _messages = [];
         public Task<bool> BelongsToScopeAsync(string scope, string id, CancellationToken cancellation) =>
-            Task.FromResult(scope == "scope-a" && id == "chat-1" && _messages.Count > 0);
+            Task.FromResult(scope == "scope-a" &&
+                id == (ManagerCreationConversationIdOverride ?? "chat-1") &&
+                _messages.Count > 0);
         public Task<SendReceipt> CreateInScopeAsync(
             string scope, PreparedOutboundMessage message, CancellationToken cancellation)
         {
@@ -688,10 +690,11 @@ public sealed partial class HeadlessRuntimeTests
             if (PendingCreate is not null)
             {
                 AddExchange(message.Text);
-                return PendingCreate.Task;
+                return PendingCreate.Task.WaitAsync(cancellation);
             }
             AddExchange(message.Text);
-            return Task.FromResult(new SendReceipt(SendDisposition.Accepted, ConversationId: "chat-1"));
+            return Task.FromResult(new SendReceipt(SendDisposition.Accepted,
+                ConversationId: ManagerCreationConversationIdOverride ?? "chat-1"));
         }
         public Task<SendReceipt> CreateAsync(string text, CancellationToken cancellation)
         {
@@ -701,7 +704,7 @@ public sealed partial class HeadlessRuntimeTests
         public Task<SendReceipt> SendAsync(string id, string text, CancellationToken cancellation)
         {
             Interlocked.Increment(ref SendCalls);
-            if(PendingSend is not null)return PendingSend.Task;
+            if(PendingSend is not null)return PendingSend.Task.WaitAsync(cancellation);
             if (UncertainNextSend) return Task.FromResult(
                 new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"));
             AddExchange(text);
@@ -731,7 +734,7 @@ public sealed partial class HeadlessRuntimeTests
         public Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation)
         {
             Interlocked.Increment(ref ReadCalls);
-            if (PendingRead is not null) return PendingRead.Task;
+            if (PendingRead is not null) return PendingRead.Task.WaitAsync(cancellation);
             if (ThrowOnRead) throw new InvalidOperationException("Simulated read unavailable.");
             if (ReturnNullHistory) return Task.FromResult<VisibleConversation?>(null);
             if (FailNextRead)

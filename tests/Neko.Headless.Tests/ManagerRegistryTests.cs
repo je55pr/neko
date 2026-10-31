@@ -12,6 +12,7 @@ public sealed partial class HeadlessRuntimeTests
     {
         public int ManagerCreationCalls;
         public bool RejectNextManagerCreation;
+        public string? ManagerCreationConversationIdOverride;
     }
 
     [Fact]

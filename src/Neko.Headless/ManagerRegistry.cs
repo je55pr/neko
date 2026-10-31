@@ -1,7 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace Neko.Headless;
 
@@ -32,9 +31,25 @@ internal sealed class ManagerRegistry
         Directory.CreateDirectory(_directory);
     }
 
-    public static bool IsValidId(string? id) => id is { Length: >= 9 and <= 72 } &&
-        Regex.IsMatch(id, @"\Amanager/[a-z0-9][a-z0-9_-]{0,63}\z",
-            RegexOptions.CultureInvariant);
+    public static bool IsValidId(string? id)
+    {
+        const string prefix = "manager/";
+        if (id is null || id.Length < prefix.Length + 1 ||
+            id.Length > prefix.Length + 64 ||
+            !id.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+
+        // Bounded ASCII validation avoids regex timeouts and locale-dependent
+        // character classes. The first name character cannot be punctuation.
+        for (var index = prefix.Length; index < id.Length; index++)
+        {
+            var c = id[index];
+            var alphanumeric = c is >= 'a' and <= 'z' or >= '0' and <= '9';
+            if (!alphanumeric && (index == prefix.Length || c is not ('_' or '-')))
+                return false;
+        }
+        return true;
+    }
 
     public static string CheckpointFor(string conversationId) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(conversationId))) + ".json";
@@ -109,7 +124,8 @@ internal sealed class ManagerRegistry
     public ManagerRecord RefreshLifecycle(string id, string expected, string next) =>
         Update(id, current => current.LifecycleState == expected &&
             current.ConversationId is not null &&
-            current.LifecycleState is not ("creating" or "sending" or "uncertain")
+            current.LifecycleState is not ("creating" or "sending" or "uncertain") &&
+            next is not ("creating" or "sending")
                 ? current with { LifecycleState = next } : current);
 
     private ManagerRecord Read(string file)

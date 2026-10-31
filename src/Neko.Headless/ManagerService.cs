@@ -81,12 +81,24 @@ internal sealed class ManagerService
         {
             receipt = await _runtime.CreateAsync(text, cancellation);
         }
+        catch (CreationWaitCancelledException) when (cancellation.IsCancellationRequested)
+        {
+            // The creation gate rejected this waiter before any dispatch or
+            // journal latch. Only an explicit subsequent request can retry.
+            receipt = new SendReceipt(SendDisposition.Rejected, "request_cancelled")
+                { Retryable = true };
+        }
         catch (Exception)
         {
-            // The durable reservation remains even if the result cannot be
-            // persisted. The operator must reconcile an unknown creation.
+            // Unknown failures after entry into the creation gate may have
+            // delivered remotely. Do not convert those to safe cancellations.
             receipt = new SendReceipt(SendDisposition.Uncertain, "delivery_unknown");
         }
+
+        if (receipt.Disposition == SendDisposition.Accepted &&
+            !HasConfirmedBinding(receipt.ConversationId))
+            receipt = new SendReceipt(SendDisposition.Uncertain,
+                "conversation_binding_unconfirmed");
 
         var conversationId = receipt.Disposition == SendDisposition.Accepted
             ? receipt.ConversationId : null;
@@ -129,7 +141,17 @@ internal sealed class ManagerService
 
             SendReceipt receipt;
             try { receipt = await _runtime.SendAsync(current.ConversationId, text, cancellation); }
-            catch (Exception) {
+            catch (OperationCanceledException) when (
+                cancellation.IsCancellationRequested &&
+                _runtime.Get(current.ConversationId)?.Status == "idle")
+            {
+                // The runtime has not yet written its dispatch checkpoint.
+                // It was cancelled at its gate or during provider preflight.
+                receipt = new SendReceipt(SendDisposition.Rejected, "request_cancelled")
+                    { Retryable = true };
+            }
+            catch (Exception)
+            {
                 receipt = new SendReceipt(SendDisposition.Uncertain, "delivery_unknown");
             }
 
@@ -153,6 +175,21 @@ internal sealed class ManagerService
             return new ManagerHistoryResult(null, null);
         var read = await _runtime.ReadAsync(current.ConversationId, cancellation);
         return new ManagerHistoryResult(current.ConversationId, read.History);
+    }
+
+    private bool HasConfirmedBinding(string? conversationId)
+    {
+        if (string.IsNullOrWhiteSpace(conversationId) ||
+            conversationId.Length > OutboundMessagePreparation.MaxConversationIdLength ||
+            conversationId.Any(char.IsControl))
+            return false;
+        try
+        {
+            // A provider receipt alone is insufficient. The normal runtime
+            // must also have durably recorded the exact remote identity.
+            return _runtime.Get(conversationId)?.Id == conversationId;
+        }
+        catch (Exception) { return false; }
     }
 
     private ManagerSnapshot Snapshot(ManagerRecord record)

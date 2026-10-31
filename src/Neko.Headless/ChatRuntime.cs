@@ -3,6 +3,11 @@ using Neko;
 
 namespace Neko.Headless;
 
+// Only thrown when the local creation gate rejected a cancelled waiter.
+// Unlike provider or journal failures, this proves this call never dispatched.
+internal sealed class CreationWaitCancelledException(CancellationToken cancellation)
+    : OperationCanceledException("Creation cancelled before dispatch.", cancellation);
+
 /// <summary>
 /// Single-process headless conversation owner. Pending operations survive restarts
 /// as unresolved until authoritative provider state is reconciled.
@@ -66,7 +71,11 @@ internal sealed class ChatRuntime : IDisposable
 
     public async Task<SendReceipt> CreateAsync(string text, CancellationToken cancellation)
     {
-        await _creationGate.WaitAsync(cancellation);
+        try { await _creationGate.WaitAsync(cancellation); }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            throw new CreationWaitCancelledException(cancellation);
+        }
         try
         {
             var prepared = OutboundMessagePreparation.ForNew(text);
@@ -80,22 +89,25 @@ internal sealed class ChatRuntime : IDisposable
             try { receipt = await _commands.CreateAsync(prepared.Message, cancellation); }
             catch (Exception) { receipt = new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"); }
 
+            // Do not record an unusable remote identity or clear the global
+            // creation latch. A new message could never safely address it.
+            if (receipt.Disposition == SendDisposition.Accepted &&
+                (string.IsNullOrWhiteSpace(receipt.ConversationId) ||
+                 receipt.ConversationId.Length > OutboundMessagePreparation.MaxConversationIdLength ||
+                 receipt.ConversationId.Any(char.IsControl)))
+                return new SendReceipt(SendDisposition.Uncertain, "conversation_id_unknown");
+
             if (receipt.Disposition == SendDisposition.Rejected)
                 _journal.ClearCreation();
-            else if (receipt.Disposition == SendDisposition.Accepted &&
-                     !string.IsNullOrWhiteSpace(receipt.ConversationId))
+            else if (receipt.Disposition == SendDisposition.Accepted)
             {
-                _journal.Set(new ChatRecord(receipt.ConversationId, "generating",
+                _journal.Set(new ChatRecord(receipt.ConversationId!, "generating",
                     ProgressTurnId: feed.TurnId));
                 _journal.ClearCreation();
-                StartPump(receipt.ConversationId, feed);
+                StartPump(receipt.ConversationId!, feed);
             }
-            // An unconfirmed creation (including a missing conversation ID)
-            // retains the on-disk lock. Never blindly create a duplicate.
-            return receipt.Disposition == SendDisposition.Accepted &&
-                   string.IsNullOrWhiteSpace(receipt.ConversationId)
-                ? new SendReceipt(SendDisposition.Uncertain, "conversation_id_unknown")
-                : receipt;
+            // An unconfirmed creation retains the on-disk lock; no replay.
+            return receipt;
         }
         finally { _creationGate.Release(); }
     }
