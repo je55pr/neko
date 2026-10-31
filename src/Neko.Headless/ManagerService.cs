@@ -306,6 +306,11 @@ internal sealed class ManagerService
                     record.Id, record.LifecycleState, journalState);
         }
 
+        // A failed registry checkpoint must not make a locally blocked
+        // manager appear idle to status clients.
+        if (_inboxBlocks.ContainsKey(record.Id))
+            record = record with { LifecycleState = "uncertain" };
+
         return new ManagerSnapshot(record.Id, record.ConversationId,
             record.LifecycleState,
             record.ConversationId is null ? "not_bound" : "unverified",

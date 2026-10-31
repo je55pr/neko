@@ -32,6 +32,7 @@ public sealed partial class HeadlessRuntimeTests
         using var inbox = new ManagerInboxService(
             new ManagerInboxJournal(folder.Path), managers, runtime);
         Assert.Equal(InboxStates.Uncertain, inbox.Get("manager/main", item.Id)!.State);
+        Assert.Equal("uncertain", managers.Get("manager/main")!.LifecycleState);
         Assert.Equal("inbox_uncertainty_blocked",
             (await managers.SendAsync("manager/main", "unsafe follow-up",
                 CancellationToken.None))!.Receipt.Reason);
