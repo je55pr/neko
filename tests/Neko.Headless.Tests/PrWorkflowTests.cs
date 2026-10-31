@@ -10,6 +10,20 @@ public sealed partial class HeadlessRuntimeTests
         public void AddReviewerResult(string text) => _messages.Add(
             new VisibleConversationMessage(Guid.NewGuid().ToString("N"),
                 VisibleMessageRole.Assistant, text));
+
+        public void SetInitialReviewerResult(string text)
+        {
+            var index = _messages.FindIndex(m => m.Role == VisibleMessageRole.Assistant);
+            if (index < 0) throw new InvalidOperationException("Initial reply missing.");
+            _messages[index] = _messages[index] with { Text = text };
+        }
+
+        public void SetLatestReviewerResult(string text)
+        {
+            var index = _messages.FindLastIndex(m => m.Role == VisibleMessageRole.Assistant);
+            if (index < 0) throw new InvalidOperationException("Reply missing.");
+            _messages[index] = _messages[index] with { Text = text };
+        }
     }
 
     private const string PrHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -43,13 +57,22 @@ public sealed partial class HeadlessRuntimeTests
         public int Reads;
         public int MergeCalls;
         public int PostCalls;
+        public string AuthenticatedPublisher = "independent-account";
         public bool ThrowAfterMergeDispatch;
         public bool ThrowAfterReviewDispatch;
+        public void FailReviewPostingAfterDispatch() => ThrowAfterReviewDispatch = true;
+        public Task<string> AuthenticatedPublisherAsync(CancellationToken cancellation)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            return Task.FromResult(AuthenticatedPublisher);
+        }
 
         public Task<PrReview> PostReviewAsync(string repository, int number,
             string expectedHead, string body, CancellationToken cancellation)
         {
             cancellation.ThrowIfCancellationRequested();
+            if (repository != Current.Repository || number != Current.Number)
+                throw new ArgumentException("Unexpected test PR identity.");
             PostCalls++;
             if (expectedHead != Current.HeadSha)
                 throw new InvalidOperationException("PR moved during review posting.");
@@ -65,6 +88,9 @@ public sealed partial class HeadlessRuntimeTests
         public Task<PrSourceStatus> ReadAsync(string repository, int number,
             CancellationToken cancellation)
         {
+            cancellation.ThrowIfCancellationRequested();
+            if (repository != Current.Repository || number != Current.Number)
+                throw new ArgumentException("Unexpected test PR identity.");
             Reads++;
             return Task.FromResult(OnRead?.Invoke(Reads) ?? Current);
         }
@@ -72,6 +98,9 @@ public sealed partial class HeadlessRuntimeTests
         public Task<string> MergeAsync(string repository, int number, string expectedHead,
             CancellationToken cancellation)
         {
+            cancellation.ThrowIfCancellationRequested();
+            if (repository != Current.Repository || number != Current.Number)
+                throw new ArgumentException("Unexpected test PR identity.");
             MergeCalls++;
             if (expectedHead != Current.HeadSha)
                 throw new InvalidOperationException("Source head changed during merge.");
@@ -82,7 +111,7 @@ public sealed partial class HeadlessRuntimeTests
         }
     }
 
-    private static PrWorkflow ReadyRecord(PrWorkflowStore store, DateTimeOffset now)
+    private static PrWorkflow ReadyRecord(PrWorkflowStore store)
     {
         var created = store.Create("sample/project", 7, PrHead, PrBase,
             "creator-chat", "developer-chat", "manager-chat");
@@ -94,7 +123,8 @@ public sealed partial class HeadlessRuntimeTests
                 created.CreatedAt.AddMilliseconds(20), PrReviewUrl, "approved",
                 "independent-account", CompletionMessageId: "worker-reply",
                 ReviewPostAttemptId: "review-attempt", ReviewPostOutcome: "posted",
-                PostedBodySha256: "test-review-body", ReviewerVerdict: "no_blockers")
+                PostedBodySha256: "test-review-body", ReviewerVerdict: "no_blockers",
+                CreationPromptSha256: new string('A', 64))
         }, "review_verified", "test_source_proof"));
     }
 
@@ -106,7 +136,7 @@ public sealed partial class HeadlessRuntimeTests
         var now = DateTimeOffset.UtcNow;
         var source = new PrSourceFake(GoodSource(now));
         var store = new PrWorkflowStore(folder.Path);
-        ReadyRecord(store, now);
+        ReadyRecord(store);
         var service = new PrWorkflowService(store, source, runtime, GatePolicy());
         Assert.True((await service.InspectAsync("sample/project", 7, CancellationToken.None)).Gate.Ready);
         var result = await service.MergeAsync("sample/project", 7, CancellationToken.None);
@@ -136,7 +166,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
         var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
         var store = new PrWorkflowStore(folder.Path);
-        ReadyRecord(store, DateTimeOffset.UtcNow);
+        ReadyRecord(store);
         source.OnRead = call => call >= 2
             ? source.Current with { HeadSha = PrChanged } : source.Current;
         var result = await new PrWorkflowService(store, source, runtime, GatePolicy())
@@ -154,7 +184,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
         var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
         var store = new PrWorkflowStore(folder.Path);
-        ReadyRecord(store, DateTimeOffset.UtcNow);
+        ReadyRecord(store);
         source.OnRead = call => {
             if (call == 2) source.Current = source.Current with { HeadSha = PrChanged };
             return call == 2 ? GoodSource(DateTimeOffset.UtcNow) : source.Current;
@@ -175,7 +205,7 @@ public sealed partial class HeadlessRuntimeTests
         var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow))
             { ThrowAfterMergeDispatch = true };
         var store = new PrWorkflowStore(folder.Path);
-        ReadyRecord(store, DateTimeOffset.UtcNow);
+        ReadyRecord(store);
         var first = await new PrWorkflowService(store, source, runtime, GatePolicy())
             .MergeAsync("sample/project", 7, CancellationToken.None);
         Assert.Equal("uncertain", first.Outcome);
@@ -194,7 +224,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
         var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
         var setup = new PrWorkflowStore(folder.Path);
-        ReadyRecord(setup, DateTimeOffset.UtcNow);
+        ReadyRecord(setup);
         var store = new PrWorkflowStore(folder.Path,
             beforePersist: w => {
                 if (w.MergeAttemptId is not null) throw new IOException("disk full");
@@ -214,7 +244,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
         var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
         var store = new PrWorkflowStore(folder.Path);
-        ReadyRecord(store, DateTimeOffset.UtcNow);
+        ReadyRecord(store);
         var service = new PrWorkflowService(store, source, runtime, GatePolicy());
         var attempts = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ =>
             service.MergeAsync("sample/project", 7, CancellationToken.None)));
@@ -243,12 +273,12 @@ public sealed partial class HeadlessRuntimeTests
         await WaitForTerminal(runtime, created.Reviewer.ConversationId);
 
         // An echoed URL cannot become source-side review provenance.
-        provider.AddReviewerResult("Review posted: " + PrReviewUrl);
+        provider.SetInitialReviewerResult("Review posted: " + PrReviewUrl);
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             service.PublishReviewAsync("sample/project", 7, CancellationToken.None));
         Assert.Equal(0, source.PostCalls);
 
-        provider.AddReviewerResult("REVIEW_VERDICT: NO_BLOCKERS\n\n" +
+        provider.SetInitialReviewerResult("REVIEW_VERDICT: NO_BLOCKERS\n\n" +
             "Independent source, tests, and failure-boundary review found no blockers.");
         var finished = await service.PublishReviewAsync(
             "sample/project", 7, CancellationToken.None);
@@ -272,7 +302,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
         var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
         var store = new PrWorkflowStore(folder.Path);
-        ReadyRecord(store, DateTimeOffset.UtcNow);
+        ReadyRecord(store);
         source.Current = source.Current with { HeadSha = PrChanged };
         var service = new PrWorkflowService(store, source, runtime, GatePolicy());
         var stale = await service.InspectAsync("sample/project", 7, CancellationToken.None);
@@ -299,7 +329,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
         var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
         var store = new PrWorkflowStore(folder.Path);
-        ReadyRecord(store, DateTimeOffset.UtcNow);
+        ReadyRecord(store);
         store.Update("sample/project", 7, record => record with {
             ReviewLaunchState = "uncertain", Reviewer = null
         });

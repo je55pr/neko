@@ -99,7 +99,7 @@ internal sealed class PrWorkflowStore
 
     private string PathFor(string repository, int number) =>
         Path.Combine(_directory, Convert.ToHexString(SHA256.HashData(
-            Encoding.UTF8.GetBytes(repository + "#" + number))) + ".json");
+            Encoding.UTF8.GetBytes(repository.ToLowerInvariant() + "#" + number))) + ".json");
 
     private PrWorkflow? Read(string path) =>
         File.Exists(path) ? ReadRequired(path) : null;

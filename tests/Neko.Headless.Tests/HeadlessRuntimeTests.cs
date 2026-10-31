@@ -665,7 +665,7 @@ public sealed partial class HeadlessRuntimeTests
         public void EndPublicStream() => _events.Writer.TryComplete();
         public void CompletePending() =>
             Publish(new PublicConversationUpdate(
-                Guid.NewGuid().ToString("N"), PublicUpdateKind.Final,
+                _messages[^1].Id, PublicUpdateKind.Final,
                 PublicUpdateOperation.Complete));
         public void InjectMessage(string text) =>
             _messages.Add(new VisibleConversationMessage(
@@ -732,7 +732,7 @@ public sealed partial class HeadlessRuntimeTests
                 VisibleMessageRole.Assistant, "reply " + text));
             if (!DeferCompletion)
                 _events.Writer.TryWrite(new PublicConversationUpdate(
-                    Guid.NewGuid().ToString("N"), PublicUpdateKind.Final, PublicUpdateOperation.Complete));
+                    _messages[^1].Id, PublicUpdateKind.Final, PublicUpdateOperation.Complete));
         }
         public async IAsyncEnumerable<PublicConversationUpdate> WatchAsync(
             string id, [EnumeratorCancellation] CancellationToken cancellation)

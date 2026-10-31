@@ -7,6 +7,7 @@ namespace Neko.Headless;
 internal interface IPrSourceAdapter
 {
     Task<PrSourceStatus> ReadAsync(string repository, int number, CancellationToken cancellation);
+    Task<string> AuthenticatedPublisherAsync(CancellationToken cancellation);
     // Publish the exact verified worker output at the expected commit. The
     // caller persists a one-use reservation before this external write.
     Task<PrReview> PostReviewAsync(string repository, int number, string expectedHead,
@@ -43,6 +44,12 @@ internal sealed class PrWorkflowService
     public PrWorkflow? Get(string repository, int number) => _store.Get(repository, number);
     public IReadOnlyList<PrWorkflow> List() => _store.List();
 
+    private static bool ReviewPostingUnresolved(PrWorkflow workflow) =>
+        workflow.Reviewer is {
+            ReviewPostAttemptId: not null,
+            ReviewPostOutcome: not "posted"
+        };
+
     public async Task<PrWorkflow> CreateAsync(string repository, int number,
         string creator, string developer, string manager, CancellationToken cancellation)
     {
@@ -65,12 +72,27 @@ internal sealed class PrWorkflowService
         var status = await _source.ReadAsync(repository, number, cancellation);
         var decision = PrReviewGate.Evaluate(record, _policy, status, _clock.GetUtcNow());
         // Persist source-verifiable checks and reviewer facts before reporting readiness.
+        var stale = false;
         var observed = _store.Update(repository, number, current =>
-            current.MergeAttemptId is not null ? current : current with {
+        {
+            if (current.HeadSha != record.HeadSha ||
+                current.BaseSha != record.BaseSha ||
+                current.ReviewLaunchState != record.ReviewLaunchState ||
+                current.Reviewer != record.Reviewer ||
+                current.MergeAttemptId != record.MergeAttemptId)
+            {
+                stale = true;
+                return current;
+            }
+            return current.MergeAttemptId is not null ? current : current with {
                 LastSourceEvidence = status, LastGateDecision = decision
-            });
-        // Concurrent merge reservations must never be shown as ready merely
-        // because inspection began before they were persisted.
+            };
+        });
+        // A source read racing revision rearm or reviewer confirmation must
+        // not overwrite newer evidence or report stale readiness.
+        if (stale)
+            return new PrWorkflowReport(observed, new PrGateDecision(false,
+                "blocked", ["inspection_obsoleted_by_workflow_change"], _clock.GetUtcNow()));
         if (observed.MergeAttemptId is not null)
             decision = PrReviewGate.Evaluate(
                 observed, _policy, status, _clock.GetUtcNow());
@@ -85,7 +107,8 @@ internal sealed class PrWorkflowService
             ?? throw new KeyNotFoundException("Workflow unavailable.");
         if ((current.MergeAttemptId is not null &&
             current.MergeOutcome != "rejected_before_dispatch") ||
-            current.ReviewLaunchState is "dispatching" or "uncertain")
+            current.ReviewLaunchState is "dispatching" or "uncertain" ||
+            ReviewPostingUnresolved(current))
             throw new InvalidOperationException("Unresolved external action blocks revision rearm.");
         var source = await _source.ReadAsync(repository, number, cancellation);
         if (source.Repository != repository || source.Number != number ||
@@ -97,6 +120,7 @@ internal sealed class PrWorkflowService
             if ((existing.MergeAttemptId is not null &&
                 existing.MergeOutcome != "rejected_before_dispatch") ||
                 existing.ReviewLaunchState is "dispatching" or "uncertain" ||
+                ReviewPostingUnresolved(existing) ||
                 existing.HeadSha != current.HeadSha || existing.BaseSha != current.BaseSha ||
                 existing.MergeAttemptId != current.MergeAttemptId)
                 throw new InvalidOperationException("Revision change was concurrent.");
@@ -140,6 +164,15 @@ internal sealed class PrWorkflowService
             source.HeadSha != current.HeadSha || source.BaseSha != current.BaseSha ||
             source.State != "open" || source.Merged)
             throw new InvalidOperationException("Source head/base changed.");
+        var assignment = "Independent review assignment for " +
+            repository + "#" + number + " at head " + current.HeadSha +
+            ". Do not merge or post a source review yourself. Return a final" +
+            " substantive review starting with exactly REVIEW_VERDICT: NO_BLOCKERS" +
+            " or REVIEW_VERDICT: BLOCKERS, followed by findings. " + task;
+        var prepared = OutboundMessagePreparation.ForNew(assignment).Message ??
+            throw new ArgumentException("Reviewer assignment is invalid.");
+        var promptSha = Convert.ToHexString(SHA256.HashData(
+            Encoding.UTF8.GetBytes(prepared.Text)));
         current = _store.Update(repository, number, existing =>
         {
             if (existing.ReviewLaunchState != "unstarted" || existing.MergeAttemptId is not null)
@@ -152,13 +185,7 @@ internal sealed class PrWorkflowService
         SendReceipt receipt;
         try
         {
-            receipt = await _runtime.CreateAsync(
-                "Independent review assignment for " + repository + "#" + number +
-                " at head " + current.HeadSha +
-                ". Do not merge or post a source review yourself. Return a final" +
-                " substantive review starting with exactly REVIEW_VERDICT: NO_BLOCKERS" +
-                " or REVIEW_VERDICT: BLOCKERS, followed by findings. " + task,
-                cancellation);
+            receipt = await _runtime.CreateAsync(assignment, cancellation);
         }
         catch (Exception)
         {
@@ -169,7 +196,8 @@ internal sealed class PrWorkflowService
         }
         if (receipt.Disposition != SendDisposition.Accepted ||
             string.IsNullOrWhiteSpace(receipt.ConversationId) ||
-            _runtime.Get(receipt.ConversationId)?.Id != receipt.ConversationId)
+            _runtime.Get(receipt.ConversationId)?.Id != receipt.ConversationId ||
+            _runtime.Get(receipt.ConversationId)?.DispatchCount != 1)
             return _store.Update(repository, number, w => _store.Append(w with {
                 ReviewLaunchState = receipt.Disposition == SendDisposition.Rejected
                     ? "rejected" : "uncertain", State = "blocked"
@@ -177,7 +205,9 @@ internal sealed class PrWorkflowService
         return _store.Update(repository, number, w => _store.Append(w with {
             ReviewLaunchState = "accepted",
             Reviewer = new PrWorkerEvidence(receipt.ConversationId, w.HeadSha,
-                w.ReviewLaunchAt!.Value, false, null, null, null, reviewerAccount)
+                w.ReviewLaunchAt!.Value, false, null, null, null, reviewerAccount,
+                CreationPromptSha256: promptSha,
+                CreationUserMessageId: receipt.MessageId)
         }, "reviewer_bound", "created_for_current_head"));
     }
 
@@ -198,12 +228,24 @@ internal sealed class PrWorkflowService
             throw new InvalidOperationException("Reviewer posting is blocked.");
 
         var history = await _runtime.ReadAsync(worker.ConversationId, cancellation);
+        var local = _runtime.Get(worker.ConversationId);
+        var userTurns = history.History?.Messages
+            .Where(message => message.Role == VisibleMessageRole.User).ToArray();
         var response = history.History?.Messages.LastOrDefault(
             message => message.Role == VisibleMessageRole.Assistant);
-        if (!history.ProviderVerified || response is null ||
-            _runtime.Get(worker.ConversationId)?.Status != "idle" ||
+        if (!history.ProviderVerified || response is null || userTurns is not { Length: 1 } ||
+            local?.Status != "idle" || local.DispatchCount != 1 ||
+            local.LastReconciliation is not { Outcome: "restored" } terminal ||
+            terminal.PromptSha256 != worker.CreationPromptSha256 ||
+            Convert.ToHexString(SHA256.HashData(
+                Encoding.UTF8.GetBytes(userTurns[0].Text))) != worker.CreationPromptSha256 ||
+            (worker.CreationUserMessageId is not null &&
+                userTurns[0].Id != worker.CreationUserMessageId) ||
+            (terminal.AssistantMessageId is not null &&
+                response.Id != terminal.AssistantMessageId) ||
             string.IsNullOrWhiteSpace(response.Id))
-            throw new InvalidOperationException("Reviewer has not durably completed.");
+            throw new InvalidOperationException(
+                "Original reviewer turn is not authoritatively completed.");
         var body = response.Text.Trim();
         if (body.Length is < 50 or > 12000 ||
             !body.StartsWith("REVIEW_VERDICT: ", StringComparison.Ordinal))
@@ -219,6 +261,13 @@ internal sealed class PrWorkflowService
             source.State != "open" || source.HeadSha != record.HeadSha ||
             source.BaseSha != record.BaseSha)
             throw new InvalidOperationException("PR revision changed before review posting.");
+        // Discover the authenticated publication identity before reserving a
+        // one-use remote write. A typo in reviewer configuration cannot consume
+        // the review-post attempt or create an unresolvable external review.
+        var principal = await _source.AuthenticatedPublisherAsync(cancellation);
+        if (!StringComparer.OrdinalIgnoreCase.Equals(principal, worker.ReviewerAccount) ||
+            StringComparer.OrdinalIgnoreCase.Equals(principal, _policy.AutomatedReviewer))
+            throw new InvalidOperationException("Review publishing account mismatched.");
         var attemptId = Guid.NewGuid().ToString("N");
 
         // This one-use durable reservation comes before any external write.

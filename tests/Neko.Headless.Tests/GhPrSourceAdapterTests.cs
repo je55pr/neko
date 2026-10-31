@@ -24,6 +24,33 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
+    public void WorkflowRunIdentityRequiresTrustedHostAndExactRepository()
+    {
+        using var valid = JsonDocument.Parse("""
+            {"app":{"slug":"github-actions"},
+             "details_url":"https://github.com/Sample/Project/actions/runs/123/job/456"}
+            """);
+        Assert.Equal(123, GhPrSourceAdapter.GitHubActionsRunId(
+            valid.RootElement, "sample/project"));
+        Assert.Null(GhPrSourceAdapter.GitHubActionsRunId(
+            valid.RootElement, "sample/another-project"));
+
+        using var forged = JsonDocument.Parse("""
+            {"app":{"slug":"github-actions"},
+             "details_url":"https://attacker.example/sample/project/actions/runs/123/job/456"}
+            """);
+        Assert.Null(GhPrSourceAdapter.GitHubActionsRunId(
+            forged.RootElement, "sample/project"));
+
+        using var otherApp = JsonDocument.Parse("""
+            {"app":{"slug":"independent-checker"},
+             "details_url":"https://github.com/sample/project/actions/runs/123/job/456"}
+            """);
+        Assert.Null(GhPrSourceAdapter.GitHubActionsRunId(
+            otherApp.RootElement, "sample/project"));
+    }
+
+    [Fact]
     public async Task RelativeOrMissingExecutableCannotRunExternalCommands()
     {
         Assert.Throws<ArgumentException>(() => new GhPrSourceAdapter("gh"));

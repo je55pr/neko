@@ -29,6 +29,9 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     {
         if (_trustedExecutable is null)
             throw new InvalidOperationException("External PR adapter is not configured.");
+        // The executable is validated as an existing fully-qualified local
+        // gh binary during configuration. No shell is invoked and arguments
+        // are passed separately, including untrusted review text.
         var start = new ProcessStartInfo(_trustedExecutable) {
             UseShellExecute = false, RedirectStandardOutput = true,
             RedirectStandardError = true, CreateNoWindow = true
@@ -37,8 +40,9 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         foreach (var arg in args) start.ArgumentList.Add(arg);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         timeout.CancelAfter(TimeSpan.FromSeconds(90));
-        using var process = Process.Start(start)
-            ?? throw new InvalidOperationException("External PR adapter unavailable.");
+        using var process = new Process { StartInfo = start };
+        if (!process.Start())
+            throw new InvalidOperationException("External PR adapter unavailable.");
         using var killOnCancel = timeout.Token.Register(() =>
         {
             try { if (!process.HasExited) process.Kill(entireProcessTree: true); }
@@ -78,6 +82,24 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         return prefix + ":" + value;
     }
 
+    internal static long? GitHubActionsRunId(JsonElement run, string repository)
+    {
+        if (!run.TryGetProperty("app", out var app) ||
+            GetString(app, "slug") != "github-actions" ||
+            !Uri.TryCreate(GetString(run, "details_url"), UriKind.Absolute, out var uri) ||
+            uri.Scheme != "https" || uri.Host != "github.com")
+            return null;
+        var parts = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 7 ||
+            !StringComparer.OrdinalIgnoreCase.Equals(
+                parts[0] + "/" + parts[1], repository) ||
+            parts[2] != "actions" || parts[3] != "runs" ||
+            parts[5] != "job" || !long.TryParse(parts[6], out _) ||
+            !long.TryParse(parts[4], out var runId) || runId <= 0)
+            return null;
+        return runId;
+    }
+
     internal static HashSet<long> AssociatedReviewIds(JsonElement comments) =>
         comments.EnumerateArray()
             .Where(c => !string.IsNullOrWhiteSpace(GetString(c, "body")))
@@ -105,6 +127,10 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         var mergeable = pr.TryGetProperty("mergeable", out var merge) &&
             merge.ValueKind == JsonValueKind.True;
         var author = Member(pr, "user", "login").GetString() ?? "";
+        var canonicalRepository = Member(pr, "base", "repo", "full_name").GetString() ?? "";
+        if (!PrWorkflowStore.ValidRepository(canonicalRepository) ||
+            !StringComparer.OrdinalIgnoreCase.Equals(canonicalRepository, repository))
+            throw new InvalidOperationException("Canonical repository identity unavailable.");
 
         using var checks = await ApiAsync(cancellation,
             "repos/" + repository + "/commits/" + head + "/check-runs?per_page=100");
@@ -112,15 +138,41 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         var checkRuns = Member(checkRoot, "check_runs");
         if (checkRoot.GetProperty("total_count").GetInt32() > 100)
             throw new InvalidOperationException("Check list exceeds verified page.");
-        var gathered = new Dictionary<string, PrCheck>(StringComparer.Ordinal);
-        // The most recent check run is authoritative for duplicate run names.
-        foreach (var run in checkRuns.EnumerateArray().OrderByDescending(r =>
-            r.GetProperty("id").GetInt64()))
+        var gathered = new List<PrCheck>();
+        var actionWorkflows = new Dictionary<long, string>();
+        // Keep distinct publishers and workflows. A same-named untrusted or
+        // failing run must not shadow or satisfy the configured trusted run.
+        foreach (var run in checkRuns.EnumerateArray())
         {
             var name = Member(run, "name").GetString() ?? "";
-            gathered.TryAdd(name, new PrCheck(name, head,
+            var isActions = GetString(Member(run, "app"), "slug") == "github-actions";
+            string? workflowId = null;
+            if (isActions)
+            {
+                var runId = GitHubActionsRunId(run, canonicalRepository);
+                if (runId is not null)
+                {
+                    if (!actionWorkflows.TryGetValue(runId.Value, out workflowId))
+                    {
+                        using var detail = await ApiAsync(cancellation, "repos/" +
+                            canonicalRepository + "/actions/runs/" + runId.Value);
+                        if (GetString(detail.RootElement, "head_sha") != head ||
+                            !detail.RootElement.TryGetProperty(
+                                "workflow_id", out var workflow) ||
+                            workflow.ValueKind != JsonValueKind.Number ||
+                            !workflow.TryGetInt64(out var workflowNumber) ||
+                            workflowNumber <= 0)
+                            throw new InvalidOperationException(
+                                "Action workflow identity unavailable.");
+                        workflowId = "workflow:" + workflowNumber;
+                        actionWorkflows.Add(runId.Value, workflowId);
+                    }
+                }
+            }
+            gathered.Add(new PrCheck(name, head,
                 GetString(run, "status") ?? "", GetString(run, "conclusion"),
-                ProducerId(run, "app", "app")));
+                ProducerId(run, "app", "app"), workflowId, isActions,
+                run.GetProperty("id").GetInt64()));
         }
         using var statuses = await ApiAsync(cancellation,
             "repos/" + repository + "/commits/" + head + "/status");
@@ -130,9 +182,12 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
         foreach (var item in statusEntries.EnumerateArray())
         {
             var name = GetString(item, "context") ?? "";
-            gathered.TryAdd(name, new PrCheck(name, head, "completed",
+            gathered.Add(new PrCheck(name, head, "completed",
                 GetString(item, "state") == "success" ? "success" : "failure",
-                ProducerId(item, "creator", "user")));
+                ProducerId(item, "creator", "user"), RunId:
+                    item.TryGetProperty("id", out var statusId) &&
+                    statusId.ValueKind == JsonValueKind.Number
+                        ? statusId.GetInt64() : 0));
         }
 
         using var reviews = await ApiAsync(cancellation, route + "/reviews?per_page=100");
@@ -174,8 +229,17 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             throw new InvalidOperationException("Review threads exceed verified page.");
         var unresolved = Member(threadsRoot, "nodes").EnumerateArray()
             .Count(n => !Member(n, "isResolved").GetBoolean());
-        return new PrSourceStatus(repository, number, head, baseSha, state, author,
-            merged, mergeable, gathered.Values.ToArray(), sourceReviews, unresolved);
+        return new PrSourceStatus(canonicalRepository, number, head, baseSha, state, author,
+            merged, mergeable, gathered.ToArray(), sourceReviews, unresolved);
+    }
+
+    public async Task<string> AuthenticatedPublisherAsync(CancellationToken cancellation)
+    {
+        using var user = await ApiAsync(cancellation, "user");
+        var login = GetString(user.RootElement, "login");
+        if (string.IsNullOrWhiteSpace(login))
+            throw new InvalidOperationException("PR publishing principal unverified.");
+        return login;
     }
 
     public async Task<PrReview> PostReviewAsync(string repository, int number,

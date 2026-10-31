@@ -24,7 +24,8 @@ internal sealed record ChatRecord(
     string Id, string Status, VisibleConversation? History = null,
     DateTimeOffset UpdatedAt = default, string? ProgressTurnId = null,
     PendingTurnEvidence? PendingTurn = null,
-    ReconciliationDecision? LastReconciliation = null);
+    ReconciliationDecision? LastReconciliation = null,
+    int DispatchCount = 0);
 
 /// <summary>Local checkpoint data. Never stored in the repository.</summary>
 internal sealed class ChatJournal

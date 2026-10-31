@@ -110,7 +110,7 @@ internal sealed partial class ChatRuntime : IDisposable
             else if (receipt.Disposition == SendDisposition.Accepted)
             {
                 _journal.Set(new ChatRecord(receipt.ConversationId!, "generating",
-                    ProgressTurnId: feed.TurnId,
+                    ProgressTurnId: feed.TurnId, DispatchCount: 1,
                     PendingTurn: new PendingTurnEvidence(
                         PromptHash(prepared.Message.Text), Array.Empty<string>(),
                         AcceptedSubmission: true,
@@ -171,6 +171,7 @@ internal sealed partial class ChatRuntime : IDisposable
                 _journal.Update(id, latest => latest with {
                     Status="sending",History=upstream,
                     ProgressTurnId=feed.TurnId,
+                    DispatchCount=latest.DispatchCount+1,
                     PendingTurn=new PendingTurnEvidence(PromptHash(prepared.Message.Text),
                         upstream.Messages.Select(message=>message.Id).ToArray(),
                         OperationId: operationId)

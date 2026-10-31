@@ -2,7 +2,8 @@ namespace Neko;
 
 /// <summary>Provider-neutral facts. Source-side reviews and checks must be re-read before merge.</summary>
 public sealed record PrCheck(string Name, string HeadSha, string Status, string? Conclusion,
-    string? ProducerId = null);
+    string? ProducerId = null, string? WorkflowId = null,
+    bool RequiresWorkflowIdentity = false, long RunId = 0);
 public sealed record PrReview(string Url, string Author, string HeadSha, string Verdict,
     bool Substantive, DateTimeOffset SubmittedAt, string? BodySha256 = null);
 public sealed record PrSourceStatus(string Repository, int Number, string HeadSha,
@@ -13,13 +14,16 @@ public sealed record PrReviewPolicy(
     IReadOnlyList<string> RequiredChecks, string AutomatedCheck, string AutomatedReviewer,
     bool RequireNoUnresolvedThreads = true,
     IReadOnlyDictionary<string, string>? TrustedCheckProducers = null,
-    string? AutomatedCheckProducer = null);
+    string? AutomatedCheckProducer = null,
+    IReadOnlyDictionary<string, string>? TrustedCheckWorkflows = null,
+    string? AutomatedCheckWorkflow = null);
 public sealed record PrWorkerEvidence(string ConversationId, string CreatedForHead,
     DateTimeOffset CreatedAt, bool Completed, DateTimeOffset? CompletedAt,
     string? ReviewUrl, string? Verdict, string? ReviewerAccount,
     string? CompletionMessageId = null,
     string? ReviewPostAttemptId = null, string? ReviewPostOutcome = null,
-    string? PostedBodySha256 = null, string? ReviewerVerdict = null);
+    string? PostedBodySha256 = null, string? ReviewerVerdict = null,
+    string? CreationPromptSha256 = null, string? CreationUserMessageId = null);
 public sealed record PrAuditEvent(DateTimeOffset At, string Action, string Detail,
     string? AttemptId = null);
 public sealed record PrWorkflow(string Repository, int Number, string HeadSha, string BaseSha,
@@ -38,6 +42,19 @@ public static class PrReviewGate
 {
     public static bool ValidSha(string? value) =>
         value is { Length: 40 } && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
+
+    // The latest run from the exact trusted producer/workflow wins. A
+    // same-name status from another actor cannot shadow or satisfy it.
+    private static PrCheck? TrustedLatestCheck(IEnumerable<PrCheck> checks,
+        string name, string head, string? producer, string? workflow)
+    {
+        if (string.IsNullOrWhiteSpace(producer)) return null;
+        return checks.Where(c => c.Name == name && c.HeadSha == head &&
+                c.ProducerId == producer &&
+                (!c.RequiresWorkflowIdentity ||
+                    (!string.IsNullOrWhiteSpace(workflow) && c.WorkflowId == workflow)))
+            .OrderByDescending(c => c.RunId).FirstOrDefault();
+    }
 
     public static PrGateDecision Evaluate(PrWorkflow workflow, PrReviewPolicy policy,
         PrSourceStatus source, DateTimeOffset now)
@@ -69,6 +86,10 @@ public static class PrReviewGate
             if (worker.CreatedForHead != workflow.HeadSha ||
                 worker.CreatedAt < workflow.CreatedAt)
                 blockers.Add("reviewer_not_created_for_head");
+            if (worker.CreationPromptSha256 is not { Length: 64 } ||
+                worker.CreationPromptSha256.Any(c =>
+                    c is not (>= '0' and <= '9' or >= 'A' and <= 'F')))
+                blockers.Add("review_creation_turn_unbound");
             if (!worker.Completed || worker.CompletedAt is null ||
                 worker.CompletedAt < worker.CreatedAt || worker.CompletionMessageId is null)
                 blockers.Add("review_worker_not_completed");
@@ -98,11 +119,10 @@ public static class PrReviewGate
         {
             if (string.IsNullOrWhiteSpace(policy.AutomatedCheckProducer))
                 blockers.Add("automated_review_producer_missing");
-            if (!source.Checks.Any(c => c.Name == policy.AutomatedCheck &&
-                c.HeadSha == workflow.HeadSha && c.Status == "completed" &&
-                c.Conclusion == "success" &&
-                c.ProducerId == policy.AutomatedCheckProducer &&
-                !string.IsNullOrWhiteSpace(c.ProducerId)))
+            var automated = TrustedLatestCheck(source.Checks,
+                policy.AutomatedCheck, workflow.HeadSha,
+                policy.AutomatedCheckProducer, policy.AutomatedCheckWorkflow);
+            if (automated is not { Status: "completed", Conclusion: "success" })
                 blockers.Add("automated_review_run_not_successful");
             if (!source.Reviews.Any(r =>
                 StringComparer.OrdinalIgnoreCase.Equals(r.Author, policy.AutomatedReviewer) &&
@@ -120,10 +140,16 @@ public static class PrReviewGate
                     !policy.TrustedCheckProducers.TryGetValue(name, out var producer) ||
                     string.IsNullOrWhiteSpace(producer))
                     blockers.Add("required_check_producer_missing:" + name);
-                else if (!source.Checks.Any(c => c.Name == name &&
-                    c.HeadSha == workflow.HeadSha && c.ProducerId == producer &&
-                    c.Status == "completed" && c.Conclusion == "success"))
-                    blockers.Add("required_check_not_successful:" + name);
+                else
+                {
+                    string? expectedWorkflow = null;
+                    if (policy.TrustedCheckWorkflows is not null)
+                        policy.TrustedCheckWorkflows.TryGetValue(name, out expectedWorkflow);
+                    var latest = TrustedLatestCheck(source.Checks,
+                        name, workflow.HeadSha, producer, expectedWorkflow);
+                    if (latest is not { Status: "completed", Conclusion: "success" })
+                        blockers.Add("required_check_not_successful:" + name);
+                }
             }
         if (policy.RequireNoUnresolvedThreads && source.UnresolvedThreads != 0)
             blockers.Add("unresolved_review_threads:" + source.UnresolvedThreads);

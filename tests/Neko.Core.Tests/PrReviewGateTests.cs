@@ -17,7 +17,8 @@ public sealed class PrReviewGateTests
         Now.AddMinutes(-30), true, Now.AddMinutes(-10), "https://example.org/review/12",
         "approved", "review-account", CompletionMessageId: "worker-result",
         ReviewPostAttemptId: "post-attempt", ReviewPostOutcome: "posted",
-        PostedBodySha256: "verified-body-digest", ReviewerVerdict: "no_blockers");
+        PostedBodySha256: "verified-body-digest", ReviewerVerdict: "no_blockers",
+        CreationPromptSha256: new string('A', 64));
 
     private static PrWorkflow Workflow() => new("sample/project", 12, Head, Base,
         "author-worker", "developer-worker", "manager-worker", Now.AddHours(-1),
@@ -181,6 +182,44 @@ public sealed class PrReviewGateTests
         var result = Evaluate(policy: policy);
         Assert.Contains("automated_review_producer_missing", result.Blockers);
         Assert.Contains("required_check_producer_missing:build", result.Blockers);
+    }
+
+    [Fact]
+    public void SharedActionsAppCannotSpoofTrustedWorkflowOrMaskLatestFailure()
+    {
+        var policy = Policy with {
+            TrustedCheckProducers = new Dictionary<string, string> {
+                ["build"] = "app:15368"
+            },
+            TrustedCheckWorkflows = new Dictionary<string, string> {
+                ["build"] = "workflow:400"
+            }
+        };
+        var trustedFailure = new PrCheck("build", Head, "completed", "failure",
+            "app:15368", "workflow:400", true, 80);
+        var wrongWorkflowSuccess = new PrCheck("build", Head, "completed", "success",
+            "app:15368", "workflow:999", true, 100);
+        var olderTrustedSuccess = new PrCheck("build", Head, "completed", "success",
+            "app:15368", "workflow:400", true, 70);
+        var source = Source() with {
+            Checks = [wrongWorkflowSuccess, trustedFailure, olderTrustedSuccess,
+                Source().Checks[1]]
+        };
+        Assert.Contains("required_check_not_successful:build",
+            Evaluate(source: source, policy: policy).Blockers);
+
+        var latestTrustedSuccess = new PrCheck("build", Head, "completed",
+            "success", "app:15368", "workflow:400", true, 110);
+        var updated = source with {
+            Checks = [..source.Checks, latestTrustedSuccess]
+        };
+        Assert.True(Evaluate(source: updated, policy: policy).Ready);
+
+        var noWorkflowConfiguration = policy with {
+            TrustedCheckWorkflows = null
+        };
+        Assert.Contains("required_check_not_successful:build",
+            Evaluate(source: updated, policy: noWorkflowConfiguration).Blockers);
     }
 
     [Fact]

@@ -22,6 +22,9 @@ Set optional `reviewGate` in the local ignored host configuration. There is
       "build-and-test": "app:23456",
       "static-analysis": "app:34567"
     },
+    "trustedCheckWorkflows": {
+      "build-and-test": "workflow:400010385"
+    },
     "requireNoUnresolvedThreads": true
   }
 }
@@ -55,10 +58,15 @@ authentication protects all routes. The host creates a fresh reviewer worker
 for the recorded head after a durable launch reservation; acceptance is **not**
 completion. The reviewer must provide a substantive terminal response with
 `REVIEW_VERDICT: NO_BLOCKERS` or `REVIEW_VERDICT: BLOCKERS` on its first line.
+Only the original creation turn is eligible: the prompt hash, single user
+message, durable terminal proof, assistant message ID and dispatch count are
+checked. A later conversation follow-up can never change that verdict.
 After observing authoritative completion, the host durably reserves a one-use
 review post and submits the **actual worker response**. The source review
 receipt must match the response's SHA-256 digest, the current head, the
 configured publishing account and the subsequently verified source-side review.
+The host checks the currently authenticated source account **before** reserving
+the post. An ambiguous accepted POST remains blocked until manually reconciled.
 An echoed review URL or an uncertain publication cannot pass. This publisher
 may use the same repository account as the developer; independence comes from
 the distinct provider conversation and its correlated output, not the Git
@@ -70,7 +78,12 @@ authoritative PR state, check runs, posted reviews, and unresolved threads.
 Check policies must include trusted producer IDs such as `app:<numeric-id>`
 or `user:<numeric-id>`, not only the reported check names; those numeric
 identities must be set from verified source metadata. Policy evaluation and
-journal records are service-neutral. Pagination remains deliberately
+journal records are service-neutral. GitHub Actions checks are additionally
+bound to their source workflow IDs from authenticated run metadata and the
+newest run from that exact producer/workflow identity; same-app checks from
+other workflows cannot satisfy the gate. Repository identities use the
+canonical name returned by the source, and the durable PR journal treats
+repository casing aliases as the same identifier. Pagination remains deliberately
 fail-closed: 100 or more statuses, review comments, or reviews are rejected;
 more than 100 check runs or review threads are rejected until exhaustive
 pagination is implemented.
