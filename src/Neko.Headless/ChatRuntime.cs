@@ -228,7 +228,7 @@ internal sealed class ChatRuntime : IDisposable
             if (current is not null)
             {
                 _journal.Update(id, latest => latest with { History = current });
-                return new HistoryReadResult(true, current);
+                return new HistoryReadResult(true, current, ProviderVerified: true);
             }
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }

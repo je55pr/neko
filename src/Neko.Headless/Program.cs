@@ -43,6 +43,7 @@ try
     var journal = new ChatJournal(config.StateDirectory);
     using var hostLease = journal.AcquireHostLease();
     using var runtime = new ChatRuntime(provider, journal);
+    var managers = new ManagerService(new ManagerRegistry(config.StateDirectory), runtime);
 
     var builder = WebApplication.CreateSlimBuilder();
     builder.WebHost.UseUrls($"http://127.0.0.1:{config.Port}");
@@ -65,6 +66,16 @@ try
     });
 
     app.MapGet("/health", () => Results.Json(new { status = "ready" }));
+    app.MapGet("/managers", () => ManagerEndpoints.List(managers));
+    app.MapPost("/managers", (ManagerCreateRequest body, CancellationToken cancellation) =>
+        ManagerEndpoints.CreateAsync(managers, body, cancellation));
+    app.MapGet("/managers/{name}", (string name, CancellationToken cancellation) =>
+        ManagerEndpoints.GetAsync(managers, name, cancellation));
+    app.MapGet("/managers/{name}/history", (string name, CancellationToken cancellation) =>
+        ManagerEndpoints.ReadAsync(managers, name, cancellation));
+    app.MapPost("/managers/{name}/messages", (string name, TextRequest body,
+        CancellationToken cancellation) =>
+        ManagerEndpoints.SendAsync(managers, name, body.Text ?? "", cancellation));
     // Listing is metadata only; full transcripts belong in GET by ID.
     app.MapGet("/conversations", () => Results.Json(runtime.List()
         .Select(record => new {

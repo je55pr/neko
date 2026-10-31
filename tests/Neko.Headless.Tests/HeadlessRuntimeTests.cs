@@ -675,7 +675,14 @@ public sealed partial class HeadlessRuntimeTests
         public Task<SendReceipt> CreateInScopeAsync(
             string scope, PreparedOutboundMessage message, CancellationToken cancellation)
         {
+            Interlocked.Increment(ref ManagerCreationCalls);
             Scope = scope;
+            if (RejectNextManagerCreation)
+            {
+                RejectNextManagerCreation = false;
+                return Task.FromResult(new SendReceipt(SendDisposition.Rejected,
+                    "provider_busy") { Retryable = true });
+            }
             if (UncertainNextCreation)
                 return Task.FromResult(new SendReceipt(SendDisposition.Uncertain, "delivery_unknown"));
             if (PendingCreate is not null)
