@@ -116,8 +116,8 @@ explicit POST may try creation again. An `Uncertain` result cannot be retried
 automatically or by a repeated create request. An accepted remote creation
 without a valid, durably confirmed conversation binding is instead returned as
 `Uncertain`, preserving the logical manager for manual reconciliation.
-A request already cancelled before manager creation reserves an ID throws
-without creating a registry record or receipt. Cancellation while waiting for
+If a request is already cancelled, manager creation throws before reserving
+an ID and creates no registry record or receipt. Cancellation while waiting for
 the local creation gate after reservation instead produces a retryable
 `Rejected` receipt for the same manager ID. Cancellation during send history
 preflight can restore the manager to `idle` with a retryable rejection.

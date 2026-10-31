@@ -673,7 +673,8 @@ public sealed partial class HeadlessRuntimeTests
         private readonly List<VisibleConversationMessage> _messages = [];
         public Task<bool> BelongsToScopeAsync(string scope, string id, CancellationToken cancellation) =>
             Task.FromResult(scope == "scope-a" &&
-                id == (ManagerCreationConversationIdOverride ?? "chat-1") &&
+                id == (ManagerScopeBoundConversationIdOverride ??
+                    ManagerCreationConversationIdOverride ?? "chat-1") &&
                 _messages.Count > 0);
         public Task<SendReceipt> CreateInScopeAsync(
             string scope, PreparedOutboundMessage message, CancellationToken cancellation)

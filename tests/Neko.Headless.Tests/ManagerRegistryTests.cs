@@ -12,6 +12,7 @@ public sealed partial class HeadlessRuntimeTests
     {
         public bool RejectNextManagerCreation { get; set; }
         public string? ManagerCreationConversationIdOverride { get; set; }
+        public string? ManagerScopeBoundConversationIdOverride { get; set; }
     }
 
     [Fact]
@@ -174,6 +175,31 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Equal("manager_not_idle", blocked!.Receipt.Reason);
         Assert.Equal(0, offline.ManagerCreationCalls);
         Assert.Equal(0, offline.SendCalls);
+    }
+
+    [Fact]
+    public async Task AcceptedCreationWithUnverifiedScopeBindingRemainsUncertain()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider {
+            ManagerCreationConversationIdOverride = "chat-unbound",
+            ManagerScopeBoundConversationIdOverride = "chat-other"
+        };
+        using var runtime = ManagerRuntime(folder.Path, provider);
+        var managers = new ManagerService(new ManagerRegistry(folder.Path), runtime);
+
+        var result = await managers.CreateAsync("manager/main", "first", CancellationToken.None);
+        Assert.Equal(SendDisposition.Uncertain, result.Receipt.Disposition);
+        Assert.Equal("scope_not_verified", result.Receipt.Reason);
+        Assert.Equal("uncertain", result.Manager.LifecycleState);
+        Assert.Null(result.Manager.ConversationId);
+        Assert.True(File.Exists(Path.Combine(folder.Path, "creation.pending")));
+        Assert.Null(runtime.Get("chat-unbound"));
+        Assert.Equal(1, provider.ManagerCreationCalls);
+
+        var repeated = await managers.CreateAsync("manager/main", "do not repeat", CancellationToken.None);
+        Assert.Equal("manager_already_exists", repeated.Receipt.Reason);
+        Assert.Equal(1, provider.ManagerCreationCalls);
     }
 
     [Fact]
