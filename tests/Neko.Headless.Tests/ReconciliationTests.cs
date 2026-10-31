@@ -12,7 +12,7 @@ public sealed partial class HeadlessRuntimeTests
         public bool AuthoritativeComplete;
         public bool CorrelateUncertainSend;
         public bool AuthoritativeReadUnavailable;
-        public string? RawInspectionReason;
+        public string? RawInspectionReason { get; set; }
         public bool AuthoritativeThrow;
         public string? CorrelatedUncertainCreationId;
         public int Inspections;
