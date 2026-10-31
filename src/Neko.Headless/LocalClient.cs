@@ -124,6 +124,11 @@ internal static class LocalClient
                 int.TryParse(positional[1], out var statusNumber) && statusNumber > 0:
                 route = PrRoute(positional[0], statusNumber);
                 break;
+            case "pr-refresh" when positional.Count == 2 &&
+                int.TryParse(positional[1], out var refreshNumber) && refreshNumber > 0:
+                route = PrRoute(positional[0], refreshNumber) + "/refresh";
+                method = HttpMethod.Post;
+                break;
             case "pr-reviewer" when positional.Count == 4 &&
                 int.TryParse(positional[1], out var reviewerNumber) && reviewerNumber > 0:
                 route = PrRoute(positional[0], reviewerNumber) + "/reviewer";

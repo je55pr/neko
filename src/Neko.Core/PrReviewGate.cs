@@ -22,6 +22,7 @@ public sealed record PrWorkflow(string Repository, int Number, string HeadSha, s
     PrWorkerEvidence? Reviewer = null, string? MergeAttemptId = null,
     string? MergeOutcome = null, string? MergedSha = null,
     string ReviewLaunchState = "unstarted", DateTimeOffset? ReviewLaunchAt = null,
+    DateTimeOffset? MergeAuthorizedAt = null, string? MergeAuthorizedBy = null,
     IReadOnlyList<PrAuditEvent>? Audit = null);
 public sealed record PrGateDecision(bool Ready, string State,
     IReadOnlyList<string> Blockers, DateTimeOffset CheckedAt);
@@ -50,6 +51,8 @@ public static class PrReviewGate
             blockers.Add("independent_reviewer_missing");
         else
         {
+            if (workflow.ReviewLaunchState != "accepted")
+                blockers.Add("review_worker_creation_unconfirmed");
             if (worker.ConversationId == workflow.CreatorConversationId ||
                 worker.ConversationId == workflow.DeveloperConversationId ||
                 worker.ConversationId == workflow.ManagerConversationId ||

@@ -5,6 +5,13 @@ namespace Neko.Headless.Tests;
 
 public sealed partial class HeadlessRuntimeTests
 {
+    private sealed partial class FakeProvider
+    {
+        public void AddReviewerResult(string text) => _messages.Add(
+            new VisibleConversationMessage(Guid.NewGuid().ToString("N"),
+                VisibleMessageRole.Assistant, text));
+    }
+
     private const string PrHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     private const string PrBase = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     private const string PrChanged = "cccccccccccccccccccccccccccccccccccccccc";
@@ -84,6 +91,8 @@ public sealed partial class HeadlessRuntimeTests
         var persisted = new PrWorkflowStore(folder.Path).Get("sample/project", 7)!;
         Assert.Equal(PrMerged, persisted.MergedSha);
         Assert.Equal("merged", persisted.MergeOutcome);
+        Assert.Equal("manager-chat", persisted.MergeAuthorizedBy);
+        Assert.NotNull(persisted.MergeAuthorizedAt);
         Assert.Contains(persisted.Audit!, e => e.Action == "merge_reserved");
         Assert.Contains(persisted.Audit!, e => e.Action == "merged");
         var restarted = new PrWorkflowService(new PrWorkflowStore(folder.Path),
@@ -212,6 +221,10 @@ public sealed partial class HeadlessRuntimeTests
                 "approved", true, DateTimeOffset.UtcNow.AddSeconds(1)),
                 GoodSource(DateTimeOffset.UtcNow).Reviews[1]]
         };
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.ConfirmReviewAsync("sample/project", 7,
+                PrReviewUrl, "approved", CancellationToken.None));
+        provider.AddReviewerResult("Review posted: " + PrReviewUrl);
         var finished = await service.ConfirmReviewAsync("sample/project", 7,
             PrReviewUrl, "approved", CancellationToken.None);
         Assert.True(finished.Reviewer!.Completed);
@@ -220,4 +233,51 @@ public sealed partial class HeadlessRuntimeTests
             service.LaunchReviewerAsync("sample/project", 7,
                 "repeat", "independent-account", CancellationToken.None));
     }
+
+    [Fact]
+    public async Task ExplicitRevisionRefreshInvalidatesOldWorkerAndPreservesAudit()
+    {
+        using var folder = new TemporaryDirectory();
+        using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
+        var store = new PrWorkflowStore(folder.Path);
+        ReadyRecord(store, DateTimeOffset.UtcNow);
+        source.Current = source.Current with { HeadSha = PrChanged };
+        var service = new PrWorkflowService(store, source, runtime, GatePolicy());
+        var stale = await service.InspectAsync("sample/project", 7, CancellationToken.None);
+        Assert.Contains("head_sha_changed", stale.Gate.Blockers);
+        var fresh = await service.RefreshRevisionAsync(
+            "sample/project", 7, CancellationToken.None);
+        Assert.Equal(PrChanged, fresh.HeadSha);
+        Assert.Null(fresh.Reviewer);
+        Assert.Equal("unstarted", fresh.ReviewLaunchState);
+        Assert.Contains(fresh.Audit!, e => e.Action == "revision_rearmed" &&
+            e.Detail.Contains(PrHead));
+        var restarted = new PrWorkflowService(new PrWorkflowStore(folder.Path),
+            source, runtime, GatePolicy());
+        var inspected = await restarted.InspectAsync(
+            "sample/project", 7, CancellationToken.None);
+        Assert.False(inspected.Gate.Ready);
+        Assert.Contains("independent_reviewer_missing", inspected.Gate.Blockers);
+    }
+
+    [Fact]
+    public async Task UncertainReviewerCreationCannotBeResetByHeadRefresh()
+    {
+        using var folder = new TemporaryDirectory();
+        using var runtime = ManagerRuntime(folder.Path, new FakeProvider());
+        var source = new PrSourceFake(GoodSource(DateTimeOffset.UtcNow));
+        var store = new PrWorkflowStore(folder.Path);
+        ReadyRecord(store, DateTimeOffset.UtcNow);
+        store.Update("sample/project", 7, record => record with {
+            ReviewLaunchState = "uncertain", Reviewer = null
+        });
+        source.Current = source.Current with { HeadSha = PrChanged };
+        var service = new PrWorkflowService(store, source, runtime, GatePolicy());
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.RefreshRevisionAsync("sample/project", 7, CancellationToken.None));
+        Assert.Equal(PrHead, new PrWorkflowStore(folder.Path)
+            .Get("sample/project", 7)!.HeadSha);
+    }
+
 }

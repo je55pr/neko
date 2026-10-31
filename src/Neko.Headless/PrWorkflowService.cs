@@ -61,6 +61,37 @@ internal sealed class PrWorkflowService
             _clock.GetUtcNow()));
     }
 
+    /// <summary>Explicit revision rearm; old evidence is retained only in audit history.</summary>
+    public async Task<PrWorkflow> RefreshRevisionAsync(string repository, int number,
+        CancellationToken cancellation)
+    {
+        var current = _store.Get(repository, number)
+            ?? throw new KeyNotFoundException("Workflow unavailable.");
+        if (current.MergeAttemptId is not null ||
+            current.ReviewLaunchState is "dispatching" or "uncertain")
+            throw new InvalidOperationException("Unresolved external action blocks revision rearm.");
+        var source = await _source.ReadAsync(repository, number, cancellation);
+        if (source.Repository != repository || source.Number != number ||
+            source.State != "open" || source.Merged ||
+            !PrReviewGate.ValidSha(source.HeadSha) || !PrReviewGate.ValidSha(source.BaseSha))
+            throw new InvalidOperationException("Source revision unavailable.");
+        return _store.Update(repository, number, existing =>
+        {
+            if (existing.MergeAttemptId is not null ||
+                existing.ReviewLaunchState is "dispatching" or "uncertain" ||
+                existing.HeadSha != current.HeadSha || existing.BaseSha != current.BaseSha)
+                throw new InvalidOperationException("Revision change was concurrent.");
+            if (existing.HeadSha == source.HeadSha && existing.BaseSha == source.BaseSha)
+                return existing;
+            return _store.Append(existing with {
+                HeadSha = source.HeadSha, BaseSha = source.BaseSha,
+                Reviewer = null, ReviewLaunchState = "unstarted", ReviewLaunchAt = null,
+                State = "awaiting_independent_review"
+            }, "revision_rearmed",
+                "previous_head:" + existing.HeadSha + ";previous_base:" + existing.BaseSha);
+        });
+    }
+
     // The launch reservation is durable BEFORE the provider creation call.
     // An interrupted, unconfirmed launch is never repeated automatically.
     public async Task<PrWorkflow> LaunchReviewerAsync(string repository, int number,
@@ -134,7 +165,7 @@ internal sealed class PrWorkflowService
         if (!history.ProviderVerified || history.History is null ||
             _runtime.Get(worker.ConversationId)?.Status != "idle" ||
             !history.History.Messages.Any(m => m.Role == VisibleMessageRole.Assistant &&
-                !string.IsNullOrWhiteSpace(m.Text)))
+                m.Text.Contains(reviewUrl, StringComparison.Ordinal)))
             throw new InvalidOperationException("Reviewer has not durably completed.");
         var source = await _source.ReadAsync(repository, number, cancellation);
         var match = source.Reviews.Any(r => r.Url == reviewUrl &&
@@ -166,8 +197,11 @@ internal sealed class PrWorkflowService
                     w.BaseSha != checkedReport.Workflow.BaseSha)
                     throw new InvalidOperationException("Merge reservation changed.");
                 return _store.Append(w with {
-                    MergeAttemptId = attemptId, MergeOutcome = "uncertain", State = "blocked"
-                }, "merge_reserved", "expected_head:" + w.HeadSha, attemptId);
+                    MergeAttemptId = attemptId, MergeOutcome = "uncertain", State = "blocked",
+                    MergeAuthorizedAt = _clock.GetUtcNow(),
+                    MergeAuthorizedBy = w.ManagerConversationId
+                }, "merge_reserved", "expected_head:" + w.HeadSha +
+                    ";manager:" + w.ManagerConversationId, attemptId);
             });
             try
             {

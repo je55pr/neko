@@ -36,6 +36,7 @@ developing), the authenticated local CLI exposes:
 ```text
 pr-register <owner/repo> <number> <creator-conversation> <developer-conversation> <manager-conversation>
 pr-status <owner/repo> <number>
+pr-refresh <owner/repo> <number>  # explicit new head/base review cycle
 pr-reviewer <owner/repo> <number> <reviewer-account> <review-task>
 pr-review-proof <owner/repo> <number> <posted-review-url> approved|commented
 pr-merge <owner/repo> <number>
@@ -66,11 +67,12 @@ storage failure before reservation prevents any merge write. Failure to
 persist success after a remote merge leaves the original attempt reservation
 on disk, so subsequent requests cannot repeat the merge.
 
-Changing the head or base closes this workflow's review proof. This stage
-does not offer a hidden override or a human waiver endpoint. An amended
-revision needs a new explicit workflow after authoritative reconciliation;
-existing workflow identities, evidence, and prior ambiguous attempts must
-not be silently rewritten or deleted.
+Changing the head or base closes this workflow's review proof. The explicit
+`pr-refresh` command rebinds the head/base only after fetching their current
+source values, resets reviewer evidence and creation reservation, and retains
+the prior revision in the audit. It refuses if a previous review creation or
+merge attempt is unresolved. This stage does not offer a hidden override or
+a human waiver endpoint.
 
 The durable `stateDirectory/pr-workflows/` journal is local and excluded from
 version control. Each entry includes reviewer binding, terminal proof, source

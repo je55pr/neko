@@ -24,7 +24,7 @@ var configPath = configIndex >= 0 && configIndex + 1 < args.Length
 
 if (command == "help")
 {
-    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry|pr-register|pr-status|pr-reviewer|pr-review-proof|pr-merge [args] [--config path]");
+    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry|pr-register|pr-status|pr-refresh|pr-reviewer|pr-review-proof|pr-merge [args] [--config path]");
     Console.WriteLine("pr-register <repo> <number> <creator> <developer> <manager>; pr-status|pr-merge <repo> <number>");
     Console.WriteLine("pr-reviewer <repo> <number> <reviewer-account> <task>; pr-review-proof <repo> <number> <review-url> <verdict>");
     Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch|reconcile <id>; reconcile-creation; reconcile-manager <manager/name>");
@@ -81,6 +81,9 @@ try
     app.MapGet("/pr-workflows/{owner}/{repo}/{number:int}",
         (string owner, string repo, int number, CancellationToken ct) =>
             PrWorkflowEndpoints.InspectAsync(prWorkflows, owner + "/" + repo, number, ct));
+    app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/refresh",
+        (string owner, string repo, int number, CancellationToken ct) =>
+            PrWorkflowEndpoints.RefreshAsync(prWorkflows, owner + "/" + repo, number, ct));
     app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/reviewer",
         (string owner, string repo, int number, PrReviewerRequest body, CancellationToken ct) =>
             PrWorkflowEndpoints.LaunchAsync(prWorkflows, owner + "/" + repo, number, body, ct));

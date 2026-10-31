@@ -35,6 +35,15 @@ internal static class PrWorkflowEndpoints
         }, statusCode: StatusCodes.Status503ServiceUnavailable); }
     }
 
+    public static async Task<IResult> RefreshAsync(PrWorkflowService service,
+        string repository, int number, CancellationToken cancellation)
+    {
+        if (service.Get(repository, number) is null) return Results.NotFound();
+        try { return Results.Json(await service.RefreshRevisionAsync(
+            repository, number, cancellation)); }
+        catch (Exception) { return Results.Conflict(new { reason = "revision_refresh_blocked" }); }
+    }
+
     public static async Task<IResult> LaunchAsync(PrWorkflowService service,
         string repository, int number, PrReviewerRequest body, CancellationToken cancellation)
     {

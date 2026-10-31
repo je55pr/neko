@@ -56,6 +56,22 @@ public sealed class PrReviewGateTests
     }
 
     [Fact]
+    public void CreatorAccountCannotBeIndependentSourceReviewer()
+    {
+        var workflow = Workflow() with {
+            Reviewer = Worker() with { ReviewerAccount = "author-account" }
+        };
+        Assert.Contains("reviewer_not_independent", Evaluate(workflow).Blockers);
+    }
+
+    [Fact]
+    public void UnconfirmedReviewCreationCannotBePromotedToReady()
+    {
+        var workflow = Workflow() with { ReviewLaunchState = "uncertain" };
+        Assert.Contains("review_worker_creation_unconfirmed", Evaluate(workflow).Blockers);
+    }
+
+    [Fact]
     public void AcceptedButIncompleteWorkerBlocksDespitePostedReview()
     {
         var workflow = Workflow() with {
