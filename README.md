@@ -92,6 +92,65 @@ necessarily remote success; `Fail` and `uncertain` never confirm completion.
 No event contents, credentials, or private reasoning are exposed by the new
 status fields.
 
+## Persistent manager identities
+
+A manager has a stable, caller-chosen **logical ID** such as `manager/main`,
+independent of its underlying conversation ID. The URL uses the name portion
+(`main`); all manager records and responses retain the full logical ID.
+Manager names consist of lowercase letters, digits, underscores and hyphens,
+starting with a letter or digit, up to 64 characters.
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/managers` | POST | `{"id":"manager/main","text":"Initial instructions"}`; durably reserve identity before the remote creation |
+| `/managers` | GET | List persisted manager metadata, without probing the provider |
+| `/managers/main` | GET | Lookup stable identity and probe current provider readability; 404 means unknown |
+| `/managers/main/messages` | POST | `{"text":"Next action"}`; submit through the existing guarded conversation runtime |
+| `/managers/main/history` | GET | Read the mapped transcript; 202 means no readable history yet, 404 means unknown |
+
+Creation returns `manager` metadata and the original `receipt`. Repeating
+creation for an existing or uncertain manager returns 409
+(`manager_already_exists`) without another provider call. A **definitively
+rejected** creation leaves the same manager ID in `rejected`; a new,
+explicit POST may try creation again. An `Uncertain` result cannot be retried
+automatically or by a repeated create request. An accepted remote creation
+without a valid, durably confirmed conversation binding is instead returned as
+`Uncertain`, preserving the logical manager for manual reconciliation.
+If a request is already cancelled, manager creation throws before reserving
+an ID and creates no registry record or receipt. Cancellation while waiting for
+the local creation gate after reservation instead produces a retryable
+`Rejected` receipt for the same manager ID. Cancellation during send history
+preflight can restore the manager to `idle` with a retryable rejection.
+Cancellation after remote dispatch remains `Uncertain`, never an automatic
+retry signal.
+
+Registry records live under the configured, untracked
+`stateDirectory/managers/`, protected by the existing host lease. Each
+contains the logical ID, mapped remote conversation ID when known, last
+locally verified lifecycle status, a relative hashed checkpoint filename
+pointing into the existing conversation journal, an empty reserved array for
+future job references, and creation/update timestamps. No credentials,
+transport settings, or provider implementation details are written. The
+conversation transcript remains in the existing journal, not in the registry.
+
+A manager GET returns `availability: "available"` only after a successful
+provider history read. `temporarily_unavailable` means **not verified by
+this read**; it does not prove the remote conversation is permanently gone.
+`unverified` on list is not a health claim, and `not_bound` means a
+conversation ID has not been safely established. The `lifecycleState`
+describes durable local operation state, not hidden remote progress.
+A temporary read failure never rotates the conversation and never erases its
+mapping. The existing per-conversation history preflight still governs sends.
+
+Interrupted `creating` or `sending` records become `uncertain` on
+restart, with no automatic replay. A crash after successful remote creation
+but before persisting its manager binding can leave an unresolved manager
+alongside a separately journaled conversation; reconciliation requires
+operator evidence, not an automatic guess. Existing conversation endpoints,
+CLI responses, and their at-most-once safeguards are unchanged. No inbox,
+background worker orchestration, rollover, or automatic uncertain recovery
+is implemented by this change.
+
 ## Architecture and reliability
 
 The single WebView2 page supplies the signed-in execution environment. The adapter invokes the site's existing submission function with explicit conversation, parent and scope values. It does not navigate to individual conversations or interact with composer buttons. Read-only network observation captures live response updates. Server history verifies completion.
