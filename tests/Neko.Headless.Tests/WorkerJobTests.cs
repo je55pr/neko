@@ -20,7 +20,8 @@ public sealed partial class HeadlessRuntimeTests
             Status = "idle", PendingTurn = null,
             LastReconciliation = new ReconciliationDecision(
                 DateTimeOffset.UtcNow, "restored", "provider_terminal_observed",
-                "prompt-2", AssistantMessageId: "assistant-2", OperationId: "op-2")
+                "prompt-2", AssistantMessageId: "assistant-2", OperationId: "op-2",
+                TurnId: "turn-2", DispatchCount: 1)
         });
     }
 
@@ -132,6 +133,32 @@ public sealed partial class HeadlessRuntimeTests
         Assert.Single(setup.InboxJournal.List("manager/main"));
         Assert.Contains(registered.Id,
             setup.Registry.Get("manager/main")!.OutstandingJobReferences);
+    }
+
+    [Fact]
+    public async Task StaleRestoredDecisionCannotCertifyDifferentRejectedTurn()
+    {
+        using var folder = new TemporaryDirectory();
+        var clock = new InboxClock();
+        using var runtime = InboxRuntime(folder.Path, new FakeProvider());
+        var managers = await CreateIdleManager(runtime, folder.Path);
+        var chat = new ChatJournal(folder.Path);
+        SeedAcceptedWorker(chat);
+        CompleteWorker(chat);
+        // A rejected later send can leave its new turn token and dispatch
+        // count alongside the previous completion decision. That old proof
+        // must never certify the replacement turn as accepted or finished.
+        chat.Update("worker-2", old => old with {
+            ProgressTurnId = "rejected-turn", DispatchCount = 2
+        });
+        var setup = SetupJobs(folder.Path, runtime, managers, clock);
+        using var jobs = setup.Jobs;
+        using var inbox = setup.Inbox;
+        Assert.Equal("worker_acceptance_unverified",
+            jobs.Register("manager/main",
+                new WorkerJobRegisterRequest("worker-2")).Error);
+        Assert.Empty(setup.Journal.List("manager/main"));
+        Assert.Empty(setup.InboxJournal.List("manager/main"));
     }
 
     [Fact]

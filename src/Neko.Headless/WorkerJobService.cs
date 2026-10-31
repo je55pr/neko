@@ -80,7 +80,10 @@ internal sealed class WorkerJobService : IDisposable
             checkpoint.Status is not ("generating" or "idle" or "uncertain") ||
             (checkpoint.Status == "idle"
                 ? checkpoint.PendingTurn is not null ||
-                  checkpoint.LastReconciliation?.Outcome != "restored"
+                  checkpoint.LastReconciliation is not {
+                      Outcome: "restored" } verified ||
+                  verified.TurnId != checkpoint.ProgressTurnId ||
+                  verified.DispatchCount != checkpoint.DispatchCount
                 : checkpoint.PendingTurn?.AcceptedSubmission != true))
             return (null, "worker_acceptance_unverified");
         var actualOperation = checkpoint.Status == "idle"
@@ -197,7 +200,9 @@ internal sealed class WorkerJobService : IDisposable
                 else if (checkpoint.Status == "idle" &&
                          checkpoint.PendingTurn is null &&
                          checkpoint.LastReconciliation is { Outcome: "restored" } proof &&
-                         proof.OperationId == job.OperationId)
+                         proof.OperationId == job.OperationId &&
+                         proof.TurnId == job.TurnId &&
+                         proof.DispatchCount == job.DispatchCount)
                 {
                     job = job with {
                         State = "completed",
