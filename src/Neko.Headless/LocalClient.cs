@@ -109,6 +109,44 @@ internal static class LocalClient
                 route = $"managers/{ManagerName(positional[0])}/inbox/{Uri.EscapeDataString(positional[1])}/retry";
                 method = HttpMethod.Post;
                 break;
+            case "pr-register" when positional.Count == 5 &&
+                int.TryParse(positional[1], out var newNumber) && newNumber > 0:
+                route = "pr-workflows";
+                method = HttpMethod.Post;
+                body = JsonSerializer.Serialize(new {
+                    repository = positional[0], number = newNumber,
+                    creatorConversationId = positional[2],
+                    developerConversationId = positional[3],
+                    managerConversationId = positional[4]
+                });
+                break;
+            case "pr-status" when positional.Count == 2 &&
+                int.TryParse(positional[1], out var statusNumber) && statusNumber > 0:
+                route = PrRoute(positional[0], statusNumber);
+                break;
+            case "pr-refresh" when positional.Count == 2 &&
+                int.TryParse(positional[1], out var refreshNumber) && refreshNumber > 0:
+                route = PrRoute(positional[0], refreshNumber) + "/refresh";
+                method = HttpMethod.Post;
+                break;
+            case "pr-reviewer" when positional.Count == 4 &&
+                int.TryParse(positional[1], out var reviewerNumber) && reviewerNumber > 0:
+                route = PrRoute(positional[0], reviewerNumber) + "/reviewer";
+                method = HttpMethod.Post;
+                body = JsonSerializer.Serialize(new {
+                    reviewerAccount = positional[2], task = positional[3]
+                });
+                break;
+            case "pr-publish-review" when positional.Count == 2 &&
+                int.TryParse(positional[1], out var reviewNumber) && reviewNumber > 0:
+                route = PrRoute(positional[0], reviewNumber) + "/publish-review";
+                method = HttpMethod.Post;
+                break;
+            case "pr-merge" when positional.Count == 2 &&
+                int.TryParse(positional[1], out var mergeNumber) && mergeNumber > 0:
+                route = PrRoute(positional[0], mergeNumber) + "/merge";
+                method = HttpMethod.Post;
+                break;
             case "watch" when positional.Count == 1:
                 await WatchAsync(client, positional[0]);
                 return 0;
@@ -137,6 +175,15 @@ internal static class LocalClient
             root.TryGetProperty("conversationId", out var property) ? property.GetString() : null;
         if (id is not null) await WatchAsync(client, id);
         return 0;
+    }
+
+    private static string PrRoute(string repository, int number)
+    {
+        var parts = repository.Split('/');
+        if (parts.Length != 2 || !PrWorkflowStore.ValidRepository(repository))
+            throw new ArgumentException("Invalid repository identity.");
+        return "pr-workflows/" + Uri.EscapeDataString(parts[0]) + "/" +
+            Uri.EscapeDataString(parts[1]) + "/" + number;
     }
 
     private static string ManagerName(string id) =>

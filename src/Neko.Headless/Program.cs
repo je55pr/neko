@@ -24,7 +24,9 @@ var configPath = configIndex >= 0 && configIndex + 1 < args.Length
 
 if (command == "help")
 {
-    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry [args] [--wait] [--config path]");
+    Console.WriteLine("neko serve|health|list|create|send|read|status|stop|watch|reconcile|reconcile-creation|reconcile-manager|manager-queue|manager-messages|manager-message|manager-cancel|manager-retry|pr-register|pr-status|pr-refresh|pr-reviewer|pr-publish-review|pr-merge [args] [--config path] [--wait]");
+    Console.WriteLine("pr-register <repo> <number> <creator> <developer> <manager>; pr-status|pr-merge <repo> <number>");
+    Console.WriteLine("pr-reviewer <repo> <number> <reviewer-account> <task>; pr-publish-review <repo> <number>");
     Console.WriteLine("create <text>; send <id> <text>; read|status|stop|watch|reconcile <id>; reconcile-creation; reconcile-manager <manager/name>");
     Console.WriteLine("manager-queue <manager/name> <text> [--key key]; manager-messages <manager/name>; manager-message|manager-cancel|manager-retry <manager/name> <message-id>");
     Console.WriteLine("Stop requires provider support; otherwise it returns Unsupported/stop_not_supported without cancelling.");
@@ -48,6 +50,10 @@ try
     using var inbox = new ManagerInboxService(
         new ManagerInboxJournal(config.StateDirectory), managers, runtime);
     inbox.Start();
+    var reviewPolicy = config.ReviewGate ?? new PrReviewPolicy([], "", "");
+    var prWorkflows = new PrWorkflowService(new PrWorkflowStore(config.StateDirectory),
+        new GhPrSourceAdapter(config.ExternalPrCliExecutable, reviewPolicy), runtime,
+        reviewPolicy);
 
     var builder = WebApplication.CreateSlimBuilder();
     builder.WebHost.UseUrls($"http://127.0.0.1:{config.Port}");
@@ -70,6 +76,24 @@ try
     });
 
     app.MapGet("/health", () => Results.Json(new { status = "ready" }));
+    app.MapGet("/pr-workflows", () => Results.Json(prWorkflows.List()));
+    app.MapPost("/pr-workflows", (PrWorkflowCreateRequest body, CancellationToken ct) =>
+        PrWorkflowEndpoints.CreateAsync(prWorkflows, body, ct));
+    app.MapGet("/pr-workflows/{owner}/{repo}/{number:int}",
+        (string owner, string repo, int number, CancellationToken ct) =>
+            PrWorkflowEndpoints.InspectAsync(prWorkflows, owner + "/" + repo, number, ct));
+    app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/refresh",
+        (string owner, string repo, int number, CancellationToken ct) =>
+            PrWorkflowEndpoints.RefreshAsync(prWorkflows, owner + "/" + repo, number, ct));
+    app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/reviewer",
+        (string owner, string repo, int number, PrReviewerRequest body, CancellationToken ct) =>
+            PrWorkflowEndpoints.LaunchAsync(prWorkflows, owner + "/" + repo, number, body, ct));
+    app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/publish-review",
+        (string owner, string repo, int number, CancellationToken ct) =>
+            PrWorkflowEndpoints.PublishAsync(prWorkflows, owner + "/" + repo, number, ct));
+    app.MapPost("/pr-workflows/{owner}/{repo}/{number:int}/merge",
+        (string owner, string repo, int number, CancellationToken ct) =>
+            PrWorkflowEndpoints.MergeAsync(prWorkflows, owner + "/" + repo, number, ct));
     app.MapGet("/managers", () => ManagerEndpoints.List(managers));
     app.MapPost("/managers", (ManagerCreateRequest body, CancellationToken cancellation) =>
         ManagerEndpoints.CreateAsync(managers, body, cancellation));
