@@ -45,17 +45,20 @@ exact PR head. The automated reviewer must additionally have a substantive
 posted review against that head. An automated review also needs a trusted,
 configured no-findings line as the **first substantive visible status line**
 of the latest bot review body, allowing only initial HTML metadata comments.
-A successful check run does not mean the bot found no problems. Unknown
-body formats, quoted or sample markers, and reviews with actionable findings
-block merge until fixes and a new clear review have been obtained. A bot
-review must be submitted **at or after the latest trusted check run started**,
-including same-head reruns; missing source run-start timestamps block.
-This is a conservative temporal association, not a provider-signed pairing
-of a particular check and review. A deployment needing stronger guarantees
-must use a reviewer with explicit per-run evidence and branch protection.
-The configured marker is a literal line (optionally Markdown-bold), not an
-arbitrary substring. No marker is assumed by default. Skipped, neutral,
-pending, rejected, cancelled, and check-only responses cannot pass.
+A successful check run does not mean the bot found no problems. The
+configured marker must be a **numeric zero-count line**, such as
+`Actionable findings: 0`, not an arbitrary prose claim. Quoted or sample
+markers, repeated or contradictory status lines, severity-labelled findings
+and any source-linked inline review comments block a clear verdict, even
+after those comment threads are resolved. Only an explicit new clean review
+can clear earlier findings. A bot review must be submitted **at or after
+the trusted check run started** and the source must expose that timestamp.
+When multiple trusted automated runs exist for the same head, even if the
+latest passes, Neko cannot prove which run produced a review, so merge stays
+blocked until a new commit or an eventual per-run evidence contract. This is
+an intentional conservative availability limit, not a signed run/review pair.
+No marker is assumed by default. Skipped, neutral, pending, rejected,
+cancelled, and check-only responses cannot pass.
 
 ## Explicit operations
 
@@ -76,9 +79,13 @@ The matching API is `POST /pr-workflows`, `GET
 `/publish-review`, or `/merge` suffixes. The host's existing bearer
 authentication protects all routes. The host creates a fresh reviewer worker
 for the recorded head after a durable launch reservation; acceptance is **not**
-completion. The reviewer must provide a substantive terminal response with
-`REVIEW_VERDICT: NO_BLOCKERS` or `REVIEW_VERDICT: BLOCKERS` on its first line.
-Only the original creation turn is eligible: the prompt hash, single user
+completion. The reviewer must provide a substantive terminal response whose first two
+lines are `REVIEW_VERDICT: NO_BLOCKERS` or `REVIEW_VERDICT: BLOCKERS`, followed
+by `FINDINGS_COUNT: N`. `NO_BLOCKERS` requires zero findings and no P0-P3
+finding headings. `BLOCKERS` requires a positive count matching the number
+of separately labelled P0-P3 headings; inconsistent responses are rejected
+before any remote review submission is reserved. Only the original creation
+turn is eligible: the prompt hash, single user
 message, durable terminal proof, assistant message ID and dispatch count are
 checked. A later conversation follow-up can never change that verdict.
 After observing authoritative completion, the host durably reserves a one-use

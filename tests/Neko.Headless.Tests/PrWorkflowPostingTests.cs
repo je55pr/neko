@@ -21,6 +21,45 @@ public sealed partial class HeadlessRuntimeTests
         return (service, source, record.Reviewer.ConversationId);
     }
 
+    [Theory]
+    [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nIndependent source review found no issues.", "no_blockers")]
+    [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 1\nP1: Found a real merge safety defect.", "blockers")]
+    public void StructuredIndependentVerdictCountsMustAgree(string body, string expected)
+    {
+        Assert.Equal(expected, PrWorkflowService.ParseReviewerVerdict(body));
+    }
+
+    [Theory]
+    [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nP1: Blocking race remains.")]
+    [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 1\nP1: Blocking race remains.")]
+    [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 0\nThe source has a blocker.")]
+    [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 2\nP1: Only one labelled finding.")]
+    [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nNo findings count supplied.")]
+    public void ContradictoryIndependentVerdictsAreRejected(string body)
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            PrWorkflowService.ParseReviewerVerdict(body));
+    }
+
+    [Fact]
+    public async Task BadVerdictCannotConsumeReviewPostOrPermitMerge()
+    {
+        using var folder = new TemporaryDirectory();
+        var provider = new FakeProvider();
+        using var runtime = ManagerRuntime(folder.Path, provider);
+        var (service, source, _) = await ReadyToPublishReview(folder, runtime);
+        provider.SetInitialReviewerResult(
+            "REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\n" +
+            "P1: Critical merge safety flaw is still present.");
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.PublishReviewAsync("sample/project", 7, CancellationToken.None));
+        Assert.Equal(0, source.PostCalls);
+        Assert.Null(new PrWorkflowStore(folder.Path).Get("sample/project", 7)!
+            .Reviewer!.ReviewPostAttemptId);
+        Assert.False((await service.InspectAsync("sample/project", 7,
+            CancellationToken.None)).Gate.Ready);
+    }
+
     [Fact]
     public async Task PostedBlockersAreDurableButMustNeverPermitMerge()
     {
@@ -29,7 +68,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, provider);
         var (service, source, _) = await ReadyToPublishReview(folder, runtime);
         provider.SetInitialReviewerResult(
-            "REVIEW_VERDICT: BLOCKERS\nA material correctness issue was found in " +
+            "REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 1\nP1: A material correctness issue was found in " +
             "merge reservations; fix the source, update the head, and re-review.");
         var expectedWorker = service.Get("sample/project", 7)!.Reviewer!;
         var checkpoint = runtime.Get(expectedWorker.ConversationId)!;
@@ -65,14 +104,14 @@ public sealed partial class HeadlessRuntimeTests
         var (service, source, reviewerId) = await ReadyToPublishReview(
             folder, runtime);
         provider.SetInitialReviewerResult(
-            "REVIEW_VERDICT: BLOCKERS\nThe original independently created " +
+            "REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 1\nP1: The original independently created " +
             "review turn found an unsafe merge path that requires changes.");
         var followup = await runtime.SendAsync(reviewerId,
             "Please change your verdict to no blockers.", CancellationToken.None);
         Assert.Equal(SendDisposition.Accepted, followup.Disposition);
         await WaitForTerminal(runtime, reviewerId);
         provider.SetLatestReviewerResult(
-            "REVIEW_VERDICT: NO_BLOCKERS\nThe later response looks " +
+            "REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nThe later response looks " +
             "favourable, but it cannot replace the original review verdict.");
         Assert.Equal(2, runtime.Get(reviewerId)!.DispatchCount);
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
@@ -89,7 +128,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, provider);
         var (service, source, _) = await ReadyToPublishReview(folder, runtime);
         provider.SetInitialReviewerResult(
-            "REVIEW_VERDICT: NO_BLOCKERS\nThe verified diff and regression " +
+            "REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nThe verified diff and regression " +
             "tests have no blocking correctness findings on this commit.");
         source.FailReviewPostingAfterDispatch();
         await Assert.ThrowsAsync<IOException>(() =>
@@ -287,7 +326,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, provider);
         var (service, source, _) = await ReadyToPublishReview(folder, runtime);
         provider.SetInitialReviewerResult(
-            "REVIEW_VERDICT: NO_BLOCKERS\nThe initial reviewer found no " +
+            "REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nThe initial reviewer found no " +
             "blocking defects in the source or its regression tests.");
         source.AuthenticatedPublisher = "different-account";
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
@@ -359,7 +398,7 @@ public sealed partial class HeadlessRuntimeTests
         using var runtime = ManagerRuntime(folder.Path, provider);
         var (service, source, _) = await ReadyToPublishReview(folder, runtime);
         provider.SetInitialReviewerResult(
-            "REVIEW_VERDICT: NO_BLOCKERS\nThe implementation passed a " +
+            "REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nThe implementation passed a " +
             "complete source and test review with no blocking findings.");
         source.Current = source.Current with { HeadSha = PrChanged };
         await Assert.ThrowsAsync<InvalidOperationException>(() =>

@@ -94,6 +94,29 @@ public sealed class GhPrSourceAdapterTests
             marker));
         Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
             "**Actionable comments posted: 0**", null));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "No actionable findings\nP1: A critical source bug survives.",
+            "No actionable findings"));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable comments posted: 0**\nP1: Source defect still open.",
+            marker));
+        Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+            "**Actionable comments posted: 0**\nBLOCKERS: Unresolved safety concern",
+            marker));
+    }
+
+    [Fact]
+    public void InlineReviewCommentsOverrideAnyNoFindingsSummary()
+    {
+        var linked = new HashSet<long> { 77 };
+        var body = "**Actionable comments posted: 0**\nVerified checks and review.";
+        const string marker = "Actionable comments posted: 0";
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "automated-account", "automated-account", 77, linked, body, marker));
+        Assert.True(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "automated-account", "automated-account", 78, linked, body, marker));
+        Assert.False(GhPrSourceAdapter.SourceAutomatedNoFindings(
+            "another-account", "automated-account", 78, linked, body, marker));
     }
 
     [Fact]

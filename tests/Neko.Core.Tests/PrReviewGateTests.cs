@@ -331,6 +331,37 @@ public sealed class PrReviewGateTests
     }
 
     [Fact]
+    public void OverlappingBotRunsCannotShareAStaleClearReview()
+    {
+        var original = Source();
+        var runA = original.Checks[1] with {
+            RunId = 701, StartedAt = Now.AddMinutes(-15)
+        };
+        var runB = original.Checks[1] with {
+            RunId = 702, StartedAt = Now.AddMinutes(-9)
+        };
+        // A's review is submitted after B began, so timestamp-only
+        // correlation would accept it as B's review.
+        var overlapping = original with {
+            Checks = [original.Checks[0], runA, runB],
+            Reviews = [original.Reviews[0], original.Reviews[1] with {
+                SubmittedAt = Now.AddMinutes(-8)
+            }]
+        };
+        Assert.Contains("automated_review_run_ambiguous",
+            Evaluate(source: overlapping).Blockers);
+        Assert.False(Evaluate(source: overlapping).Ready);
+
+        // An untrusted same-name check is ignored when counting the
+        // authenticated publisher's actual runs.
+        var unrelated = original with {
+            Checks = [original.Checks[0], runA,
+                runB with { ProducerId = "app:untrusted" }]
+        };
+        Assert.True(Evaluate(source: unrelated).Ready);
+    }
+
+    [Fact]
     public void SameSecondReviewChangesUseSourceIdsOrFailClosed()
     {
         var stamp = Now.AddMinutes(-2);

@@ -132,6 +132,19 @@ public static class PrReviewGate
                 policy.AutomatedCheckProducer, policy.AutomatedCheckWorkflow);
             if (automated is not { Status: "completed", Conclusion: "success" })
                 blockers.Add("automated_review_run_not_successful");
+            // Without a trustworthy run ID also present on the submitted
+            // review, multiple same-head runs are ambiguous, including
+            // overlapping runs whose review timestamps can interleave.
+            // Fail closed rather than pairing one run's check to another's
+            // review simply because their timestamps overlap.
+            if (source.Checks.Count(c =>
+                c.Name == policy.AutomatedCheck &&
+                c.HeadSha == workflow.HeadSha &&
+                c.ProducerId == policy.AutomatedCheckProducer &&
+                (string.IsNullOrWhiteSpace(policy.AutomatedCheckWorkflow)
+                    ? !c.RequiresWorkflowIdentity
+                    : c.WorkflowId == policy.AutomatedCheckWorkflow)) != 1)
+                blockers.Add("automated_review_run_ambiguous");
             var botReviews = source.Reviews.Where(r =>
                 StringComparer.OrdinalIgnoreCase.Equals(r.Author, policy.AutomatedReviewer) &&
                 r.HeadSha == workflow.HeadSha && r.Substantive &&

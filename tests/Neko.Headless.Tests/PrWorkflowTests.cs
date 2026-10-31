@@ -282,7 +282,7 @@ public sealed partial class HeadlessRuntimeTests
             service.PublishReviewAsync("sample/project", 7, CancellationToken.None));
         Assert.Equal(0, source.PostCalls);
 
-        provider.SetInitialReviewerResult("REVIEW_VERDICT: NO_BLOCKERS\n\n" +
+        provider.SetInitialReviewerResult("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\n\n" +
             "Independent source, tests, and failure-boundary review found no blockers.");
         var finished = await service.PublishReviewAsync(
             "sample/project", 7, CancellationToken.None);

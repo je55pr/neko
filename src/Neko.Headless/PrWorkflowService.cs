@@ -57,6 +57,42 @@ internal sealed class PrWorkflowService
             ReviewPostOutcome: not "posted"
         };
 
+    // The review's declared verdict must agree with a structured count of
+    // individually labelled findings. Never trust only a first-line claim
+    // of NO_BLOCKERS when the original reviewer reported a P1/P2 defect.
+    internal static string ParseReviewerVerdict(string body)
+    {
+        var lines = body.Split('\n');
+        if (lines.Length < 3 || !lines[1].Trim().StartsWith(
+                "FINDINGS_COUNT: ", StringComparison.Ordinal))
+            throw new InvalidOperationException("Structured reviewer findings count missing.");
+        var verdict = lines[0].Trim() switch {
+            "REVIEW_VERDICT: NO_BLOCKERS" => "no_blockers",
+            "REVIEW_VERDICT: BLOCKERS" => "blockers",
+            _ => throw new InvalidOperationException("Reviewer verdict unknown.")
+        };
+        if (!int.TryParse(lines[1].Trim()["FINDINGS_COUNT: ".Length..],
+                out var declared) || declared is < 0 or > 50)
+            throw new InvalidOperationException("Reviewer findings count invalid.");
+
+        var headings = lines.Skip(2).Count(raw =>
+        {
+            var line = raw.TrimStart(' ', '\t', '#', '-', '*');
+            return line.Length >= 3 && (line[0] is 'P' or 'p') &&
+                line[1] is >= '0' and <= '3' &&
+                line[2] is ':' or ' ' or '-';
+        });
+        if (headings != declared || (verdict == "no_blockers") != (declared == 0))
+            throw new InvalidOperationException("Reviewer verdict contradicts findings count.");
+
+        if (verdict == "no_blockers" &&
+            new[] { "P0:", "P1:", "P2:", "P3:", "BLOCKERS:" }
+                .Any(token => lines.Skip(2).Any(line =>
+                    line.Contains(token, StringComparison.OrdinalIgnoreCase))))
+            throw new InvalidOperationException("Reviewer reported blockers despite clear verdict.");
+        return verdict;
+    }
+
     public async Task<PrWorkflow> CreateAsync(string repository, int number,
         string creator, string developer, string manager, CancellationToken cancellation)
     {
@@ -176,9 +212,13 @@ internal sealed class PrWorkflowService
             throw new InvalidOperationException("Source head/base changed.");
         var assignment = "Independent review assignment for " +
             repository + "#" + number + " at head " + current.HeadSha +
-            ". Do not merge or post a source review yourself. Return a final" +
-            " substantive review starting with exactly REVIEW_VERDICT: NO_BLOCKERS" +
-            " or REVIEW_VERDICT: BLOCKERS, followed by findings. " + task;
+            ". Do not merge or post a source review yourself. Return a" +
+            " substantive review in this strict format: first line exactly" +
+            " REVIEW_VERDICT: NO_BLOCKERS or REVIEW_VERDICT: BLOCKERS;" +
+            " second line FINDINGS_COUNT: N, where N is zero for NO_BLOCKERS" +
+            " and positive for BLOCKERS. Each blocker must have its own" +
+            " P0:/P1:/P2:/P3: heading, matching N. Do not claim NO_BLOCKERS" +
+            " anywhere if you report a blocking finding. " + task;
         var prepared = OutboundMessagePreparation.ForNew(assignment).Message ??
             throw new ArgumentException("Reviewer assignment is invalid.");
         var promptSha = Convert.ToHexString(SHA256.HashData(
@@ -278,14 +318,9 @@ internal sealed class PrWorkflowService
             throw new InvalidOperationException(
                 "Original reviewer turn is not authoritatively completed.");
         var body = response.Text.Trim();
-        if (body.Length is < 50 or > 12000 ||
-            !body.StartsWith("REVIEW_VERDICT: ", StringComparison.Ordinal))
-            throw new InvalidOperationException("Structured reviewer verdict missing.");
-        var verdict = body.Split('\n')[0].Trim() switch {
-            "REVIEW_VERDICT: NO_BLOCKERS" => "no_blockers",
-            "REVIEW_VERDICT: BLOCKERS" => "blockers",
-            _ => throw new InvalidOperationException("Reviewer verdict unknown.")
-        };
+        if (body.Length is < 50 or > 12000)
+            throw new InvalidOperationException("Substantive reviewer verdict missing.");
+        var verdict = ParseReviewerVerdict(body);
         var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
         var source = await _source.ReadAsync(repository, number, cancellation);
         if (source.Repository != repository || source.Number != number ||

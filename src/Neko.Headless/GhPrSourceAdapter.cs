@@ -123,7 +123,9 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     internal static bool VerifiedNoFindingsLine(string body, string? marker)
     {
         if (string.IsNullOrWhiteSpace(marker) || marker.Length > 200 ||
-            marker.Any(char.IsControl))
+            marker.Any(char.IsControl) ||
+            !(marker.EndsWith(": 0", StringComparison.Ordinal) ||
+              marker.EndsWith(" 0", StringComparison.Ordinal)))
             return false;
         bool inComment = false;
         foreach (var raw in body.Split('\n'))
@@ -158,17 +160,34 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             // occurrence of the same status key is ambiguous, even inside a
             // comment or example. Do not accept a contradictory count buried
             // after a positive opening summary.
-            if (marker.EndsWith('0') && marker.Length > 1)
+            var stem = marker[..^1];
+            var allLines = body.Split('\n');
+            if (allLines.Count(other => other.Contains(
+                    stem, StringComparison.OrdinalIgnoreCase)) != 1)
+                return false;
+            // Even if the configured reviewer incorrectly claims zero, do
+            // not accept a source review which explicitly names severity-
+            // labelled findings elsewhere in its body or hidden metadata.
+            foreach (var other in allLines)
             {
-                var stem = marker[..^1];
-                var matchingLines = body.Split('\n').Count(other =>
-                    other.Contains(stem, StringComparison.OrdinalIgnoreCase));
-                if (matchingLines != 1) return false;
+                var candidate = other.TrimStart(' ', '\t', '#', '*', '-', '>');
+                if (candidate.StartsWith("BLOCKERS:", StringComparison.OrdinalIgnoreCase) ||
+                    new[] { "P0", "P1", "P2", "P3" }.Any(code =>
+                        candidate.StartsWith(code + ":", StringComparison.OrdinalIgnoreCase) ||
+                        candidate.StartsWith(code + " ", StringComparison.OrdinalIgnoreCase)))
+                    return false;
             }
             return true;
         }
         return false;
     }
+
+    internal static bool SourceAutomatedNoFindings(
+        string author, string? configuredReviewer, long reviewId,
+        IReadOnlySet<long> reviewsWithInlineComments, string body, string? marker) =>
+        StringComparer.OrdinalIgnoreCase.Equals(author, configuredReviewer) &&
+        !reviewsWithInlineComments.Contains(reviewId) &&
+        VerifiedNoFindingsLine(body, marker);
 
     internal static string BodyDigest(string body) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(body)));
@@ -214,8 +233,7 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     public async Task<PrSourceStatus> ReadAsync(
         string repository, int number, CancellationToken cancellation)
     {
-        if (number < 1)
-            throw new ArgumentException("Invalid external PR identity.");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(number);
         repository = AuthorizedRepository(repository);
         var route = "repos/" + repository + "/pulls/" + number;
         using var pull = await ApiAsync(cancellation, route);
@@ -316,9 +334,11 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             var body = GetString(r, "body") ?? "";
             var reviewId = r.GetProperty("id").GetInt64();
             var authorId = ReviewerIdentity(r);
-            var findingsClear = StringComparer.OrdinalIgnoreCase.Equals(
-                    authorId, _policy?.AutomatedReviewer) &&
-                VerifiedNoFindingsLine(body, _policy?.AutomatedNoFindingsMarker);
+            // Inline comments remain finding evidence even if their threads
+            // were later resolved. A clear body marker cannot override them.
+            var findingsClear = SourceAutomatedNoFindings(authorId,
+                _policy?.AutomatedReviewer, reviewId, reviewComments,
+                body, _policy?.AutomatedNoFindingsMarker);
             sourceReviews.Add(new PrReview(GetString(r, "html_url") ?? "",
                 authorId, GetString(r, "commit_id") ?? "", verdict,
                 !string.IsNullOrWhiteSpace(body) || reviewComments.Contains(reviewId),
@@ -352,7 +372,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     public async Task<PrReview> PostReviewAsync(string repository, int number,
         string expectedHead, string body, CancellationToken cancellation)
     {
-        if (number < 1 || !PrReviewGate.ValidSha(expectedHead) ||
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(number);
+        if (!PrReviewGate.ValidSha(expectedHead) ||
             string.IsNullOrWhiteSpace(body) || body.Length > 12000)
             throw new ArgumentException("Invalid external review post request.");
         repository = AuthorizedRepository(repository);
@@ -375,7 +396,8 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
     public async Task<string> MergeAsync(string repository, int number,
         string expectedHead, CancellationToken cancellation)
     {
-        if (number < 1 || !PrReviewGate.ValidSha(expectedHead))
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(number);
+        if (!PrReviewGate.ValidSha(expectedHead))
             throw new ArgumentException("Invalid merge precondition.");
         repository = AuthorizedRepository(repository);
         // Server-side sha predicate is atomic with merge. No speculative retries.
