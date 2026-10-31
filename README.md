@@ -120,8 +120,12 @@ manager-send main "Next action"        # immediate guarded send; use inbox for q
 ```
 
 `manager-create` accepts `main` or `manager/main`, and never automatically
-retries an uncertain creation. Existing manager identities return a conflict.
-Use `manager-queue` below for durable ordered work while the manager is busy.
+retries an uncertain creation. Existing *non-rejected* manager identities
+return a conflict. A definitively rejected creation can be retried with a
+new explicit request. The `--wait` option is rejected for `manager-create`
+and `manager-send` **before any HTTP request** because accepted manager
+dispatch is not a completed turn. Inspect manager status/history or use
+`manager-queue` for durable ordered work while the manager is busy.
 
 Creation returns `manager` metadata and the original `receipt`. Repeating
 creation for an existing or uncertain manager returns 409

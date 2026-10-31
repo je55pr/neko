@@ -71,6 +71,13 @@ internal static class LocalClient
         }
 
         var wait = args.Contains("--wait");
+        // An accepted manager receipt is not a completed turn. Until manager
+        // terminal watching is implemented, reject the misleading option
+        // BEFORE sending either operation; never silently ignore it.
+        if (wait && command is ("manager-create" or "manager-send"))
+            throw new ArgumentException(
+                "--wait is not supported for manager-create or manager-send; " +
+                "use manager-status/history or durable manager-queue.");
         string route;
         HttpMethod method = HttpMethod.Get;
         string? body = null;

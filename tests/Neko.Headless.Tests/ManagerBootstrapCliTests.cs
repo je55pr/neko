@@ -59,6 +59,24 @@ public sealed class ManagerBootstrapCliTests
         Assert.Null(handler.LastPath);
     }
 
+    [Theory]
+    [InlineData("manager-create")]
+    [InlineData("manager-send")]
+    public async Task UnsupportedManagerWaitFailsBeforeRemoteRequest(
+        string command)
+    {
+        using var handler = new ManagerHandler();
+        using var client = new HttpClient(handler) {
+            BaseAddress = new Uri("http://127.0.0.1:9875/")
+        };
+        var args = new[] { command, "manager/main", "task", "--wait" };
+        var error = await Assert.ThrowsAsync<ArgumentException>(() =>
+            LocalClient.RunCommandAsync(client, command, args,
+                new StringWriter(), new StringWriter()));
+        Assert.Contains("--wait is not supported", error.Message);
+        Assert.Null(handler.LastPath);
+    }
+
     [Fact]
     public async Task AlreadyCanonicalManagerCreateDoesNotDoublePrefix()
     {
