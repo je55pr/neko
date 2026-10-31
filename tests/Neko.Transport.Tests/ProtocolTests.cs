@@ -174,6 +174,99 @@ public sealed class ProtocolTests
 
 
     [Fact]
+    public void CorrelatedNativeCreation429IsRetryableButAmbiguousDispatchIsNot()
+    {
+        // This is the actual result type returned by NativeDispatchSender for
+        // a correlated HTTP rejection, not a fabricated provider receipt.
+        var rejected=new NativeDispatchSender.Result("http_rejected",
+            Dispatched:true,SseAccepted:false,HttpStatus:429,
+            ObservedPosts:1,CorrelatedPosts:1);
+        var receipt=ProjectProvider.ConfirmedNative429Receipt(rejected,60);
+        Assert.NotNull(receipt);
+        Assert.Equal(SendDisposition.Rejected,receipt.Disposition);
+        Assert.Equal("http_rejected",receipt.Reason);
+        Assert.True(receipt.Retryable);
+        Assert.Equal(60,receipt.RetryAfterSeconds);
+        Assert.Null(receipt.ConversationId);
+
+        // A known rejection with unknown cooldown stays honestly unknown.
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            rejected,null)!.RetryAfterSeconds);
+        // A timeout or lost response might have submitted: never mark safe.
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            new NativeDispatchSender.Result("submission_uncertain",true,false),60));
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            new NativeDispatchSender.Result("http_rejected",true,false,503),60));
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            new NativeDispatchSender.Result("sse_accepted",true,true,200),60));
+        Assert.Null(ProjectProvider.ConfirmedNative429Receipt(
+            new NativeDispatchSender.Result("dispatcher_unavailable",false,false),60));
+    }
+
+    [Theory]
+    [InlineData(429,true,"rejected")]
+    [InlineData(null,true,"submission_uncertain")]
+    [InlineData(503,true,"submission_uncertain")]
+    [InlineData(429,false,"rejected")]
+    public void SendFinalizationArchivesConfirmed429ButNotAmbiguousDelivery(
+        int? httpStatus,bool dispatched,string expectedOutcome)
+    {
+        var result=new NativeDispatchSender.Result("native_result",
+            Dispatched:dispatched,SseAccepted:false,HttpStatus:httpStatus,
+            ObservedPosts:dispatched?1:0,CorrelatedPosts:dispatched?1:0);
+        var throttled=ProjectProvider.ConfirmedNative429Receipt(result,60);
+        Assert.Equal(dispatched && httpStatus==429,throttled is not null);
+        if(throttled is not null)
+        {
+            Assert.Equal(SendDisposition.Rejected,throttled.Disposition);
+            Assert.True(throttled.Retryable);
+        }
+
+        var folder=Path.Combine(Path.GetTempPath(),
+            "neko-send-terminal-"+Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var conversationId=Guid.NewGuid().ToString("D");
+            using var attempt=new NativeLiveStreamHub.Attempt(
+                Guid.NewGuid().ToString("D"),conversationId,null,"send test",folder);
+            // SendAsync's finally uses this exact classifier, then live
+            // capture calls Attempt.Finish to persist the terminal record.
+            attempt.Finish(ProjectProvider.SendArchiveOutcome(
+                result.Dispatched,throttled is not null),conversationId);
+
+            var human=File.ReadAllText(attempt.Archive.TextPath);
+            Assert.Contains("END "+expectedOutcome+" | conversation "+conversationId,human);
+            using var terminal=JsonDocument.Parse(
+                File.ReadLines(attempt.Archive.JsonlPath).Last());
+            Assert.Equal("terminal",terminal.RootElement.GetProperty("type").GetString());
+            Assert.Equal(expectedOutcome,
+                terminal.RootElement.GetProperty("operation").GetString());
+            Assert.Equal(conversationId,
+                terminal.RootElement.GetProperty("conversationId").GetString());
+            Assert.Equal(2,File.ReadLines(attempt.Archive.JsonlPath).Count());
+            var aggregate=File.ReadAllText(
+                Path.Combine(folder,"conversation-"+conversationId+".txt"));
+            Assert.Contains("END "+expectedOutcome,aggregate);
+        }
+        finally {Directory.Delete(folder,true);}
+    }
+
+    [Fact]
+    public void RemainingCooldownIsRoundedBoundedAndNeverInventedAfterExpiry()
+    {
+        var now=new DateTimeOffset(2026,10,30,12,0,0,TimeSpan.Zero);
+        Assert.Equal(90,ProjectProvider.RemainingCooldownSeconds(now.AddSeconds(90),now));
+        Assert.Equal(1,ProjectProvider.RemainingCooldownSeconds(now.AddMilliseconds(1),now));
+        Assert.Equal(600,ProjectProvider.RemainingCooldownSeconds(now.AddSeconds(900),now));
+        Assert.Null(ProjectProvider.RemainingCooldownSeconds(now,now));
+        Assert.Null(ProjectProvider.RemainingCooldownSeconds(now.AddSeconds(-2),now));
+        // The browser projects seconds or RFC date Retry-After without exposing headers.
+        Assert.Contains("Date.parse(trimmed)",BrowserSession.ReadScript,StringComparison.Ordinal);
+        Assert.Contains("Math.min(600,Number(trimmed))",BrowserSession.ReadScript,StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void RepeatedRateLimitsNeverShortenAnExistingCooldown()
     {
         var now=new DateTimeOffset(2026,10,30,12,0,0,TimeSpan.Zero);

@@ -125,7 +125,14 @@ internal sealed class ChatRuntime : IDisposable
             {
                 // A read can fail transiently (e.g. rate limiting). No send
                 // occurred, so keep the chat idle for a later guarded attempt.
-                return new SendReceipt(SendDisposition.Rejected, "provider_history_unavailable");
+                return new SendReceipt(SendDisposition.Rejected, "provider_history_unavailable")
+                {
+                    // History preflight failed before any submission. A later
+                    // explicit attempt is safe, but never submit without a fresh read.
+                    Retryable = true,
+                    RetryAfterSeconds = (_provider as IProviderRateLimitStatus)?
+                        .RateLimitRetryAfterSeconds
+                };
             }
             // Bind the new stream before making "sending" observable, so
             // watchers cannot replay a terminal event from the previous turn.
@@ -211,22 +218,24 @@ internal sealed class ChatRuntime : IDisposable
         finally { gate.Release(); }
     }
 
-    public async Task<VisibleConversation?> ReadAsync(string id, CancellationToken cancellation)
+    internal async Task<HistoryReadResult> ReadAsync(string id, CancellationToken cancellation)
     {
-        var record = _journal.Get(id);
-        if (record is null) return null;
+        // Local registration, not provider availability, determines whether an ID is known.
+        if (_journal.Get(id) is null) return new HistoryReadResult(false, null);
         try
         {
             var current = await _provider.ReadAsync(id, cancellation);
             if (current is not null)
             {
                 _journal.Update(id, latest => latest with { History = current });
-                return current;
+                return new HistoryReadResult(true, current);
             }
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { throw; }
-        catch (Exception) { /* Return the most recent local checkpoint. */ }
-        return record.History;
+        catch (Exception) { /* Preserve the most recent local checkpoint. */ }
+        // Re-read after awaiting the provider: the stream pump may have saved
+        // a transcript while this request was waiting for an unavailable read.
+        return new HistoryReadResult(true, _journal.Get(id)?.History);
     }
 
     public async IAsyncEnumerable<PublicConversationUpdate> WatchAsync(

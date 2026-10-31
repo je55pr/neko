@@ -42,51 +42,14 @@ The server binds to `127.0.0.1` on the configured port. Every endpoint requires 
 | `/health` | GET | Health check |
 | `/conversations` | GET | Locally tracked conversations |
 | `/conversations` | POST | Create a conversation in the configured scope |
-| `/conversations/{id}` | GET | Latest saved history, with server refresh |
+| `/conversations/{id}` | GET | 200: transcript (refreshed from provider, or last saved checkpoint); 202: known ID but no history yet; 404: unknown ID |
 | `/conversations/{id}/status` | GET | Current local operation status and public-event progress metadata |
 | `/conversations/{id}/messages` | POST | Continue an existing conversation |
 | `/conversations/{id}/events` | GET | Server-sent incremental text updates |
 | `/conversations/{id}/stop` | POST | Returns `Unsupported` / `stop_not_supported` without changing conversation state; remote stop is **not implemented** |
 
-### Observing long-running generations
-
-`neko status <conversation-id>` prints the same JSON as authenticated
-`GET /conversations/{id}/status`. Existing `id`, `status`, and `updatedAt`
-fields are unchanged. Additive fields:
-
-| Field | Meaning |
-| --- | --- |
-| `startedAt` | UTC time when this host started tracking the current local turn attempt (for follow-ups, includes the `sending` phase) |
-| `elapsedMilliseconds` | Monotonic duration since `startedAt`, frozen when the public feed terminates |
-| `lastPublicUpdateAt` | UTC time the host most recently published a public update |
-| `publicEventCount` | Number of accepted public-feed events this process observed for this turn, including a host-generated terminal `Fail` when a stream ends unexpectedly |
-| `lastPublicUpdateType` | Public event kind and operation, e.g. `Final.Append` or `Activity.Start`; no text, title, message ID, or tool details |
-| `isTerminal` | Whether the public event feed ended with `Final.Complete` or `Final.Fail` |
-| `terminalOperation` | `Complete` or `Fail` when such a terminal update was published |
-
-For a live turn with **zero public events**, `publicEventCount` is `0`;
-the last-update fields are `null`, and elapsed time still increases.
-After a host restart, no in-memory event feed remains: progress fields are
-`null`, **not** an invented count of zero, even if the journal retains the
-conversation's lifecycle status. Each accepted new turn resets the metrics;
-a follow-up's `sending` attempt starts a fresh feed before remote submission.
-A rejected or unconfirmed send may therefore have a locally terminal `Fail`
-while the journal separately reports `idle` or `uncertain`.
-If terminal journal persistence fails, Neko closes the public feed with
-`Final.Fail` instead of falsely acknowledging a durable completion. The
-journal is then marked `uncertain` when possible; if storage remains unavailable,
-the persisted `status` may be stale even though `isTerminal=true` reports that
-the local public feed has ended. Operators must reconcile the remote outcome
-before retrying.
-
-These metrics describe **only public updates that Neko has received and
-published**, plus explicit local failure signals. They cannot determine
-whether the upstream model is thinking, using unseen tools, stalled, or
-making progress when no public events arrive. No extra upstream polling is
-performed. `isTerminal=true` means the **local public feed** ended, not
-necessarily remote success; `Fail` and `uncertain` never confirm completion.
-No event contents, credentials, or private reasoning are exposed by the new
-status fields.
+| `/conversations/{id}` | GET | 200: transcript (refreshed from provider, or last saved checkpoint); 202: known ID but no history yet; 404: unknown ID |
+| `/conversations/{id}/status` | GET | Current local operation status and public-event progress metadata |
 
 ## Architecture and reliability
 
