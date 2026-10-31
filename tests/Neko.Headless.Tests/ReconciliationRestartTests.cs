@@ -95,7 +95,7 @@ public sealed partial class HeadlessRuntimeTests
     }
 
     [Fact]
-    public async Task UntrustedProviderReasonIsNeverPersistedOrReturned()
+    public async Task ThrottledAndUnavailableHistoryNeverReleasesUncertainGuard()
     {
         using var folder = new TemporaryDirectory();
         var provider = new FakeProvider();
@@ -103,17 +103,32 @@ public sealed partial class HeadlessRuntimeTests
             new ScopedConversationProvider(provider, "scope-a"),
             new ChatJournal(folder.Path)))
             await PrepareAcceptedTimeout(first, provider);
-        provider.RawInspectionReason = "remote key secret/private-endpoint token";
-        using var recovered = new ChatRuntime(
+
+        provider.AuthoritativeComplete = true;
+        provider.RateLimitRetryAfterSeconds = 75;
+        using (var recovered = new ChatRuntime(
+            new ScopedConversationProvider(provider, "scope-a"),
+            new ChatJournal(folder.Path)))
+        {
+            var blocked = await recovered.ReconcileAsync("chat-1", CancellationToken.None);
+            Assert.Equal("blocked", blocked.Outcome);
+            Assert.Equal("provider_rate_limited", blocked.Reason);
+            Assert.Equal(75, blocked.RetryAfterSeconds);
+            Assert.Equal("uncertain", recovered.Get("chat-1")!.Status);
+        }
+        using var restarted = new ChatRuntime(
             new ScopedConversationProvider(provider, "scope-a"),
             new ChatJournal(folder.Path));
-        var result = await recovered.ReconcileAsync("chat-1", CancellationToken.None);
-        Assert.Equal("verification_unavailable", result.Reason);
-        Assert.Equal("verification_unavailable",
-            recovered.Get("chat-1")!.LastReconciliation!.Reason);
-        Assert.DoesNotContain("private-endpoint",
-            File.ReadAllText(Path.Combine(folder.Path,
-                ManagerRegistry.CheckpointFor("chat-1"))));
+        Assert.Equal("provider_rate_limited",
+            restarted.Get("chat-1")!.LastReconciliation!.Reason);
+        provider.RateLimitRetryAfterSeconds = null;
+        provider.AuthoritativeReadUnavailable = true;
+        Assert.Equal("history_unavailable",
+            (await restarted.ReconcileAsync("chat-1", CancellationToken.None)).Reason);
+        provider.AuthoritativeReadUnavailable = false;
+        Assert.Equal("restored",
+            (await restarted.ReconcileAsync("chat-1", CancellationToken.None)).Outcome);
+        Assert.Equal(1, provider.SendCalls);
     }
 
     [Fact]
