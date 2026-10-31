@@ -230,6 +230,10 @@ internal sealed class HostSupervisor
 
     public async Task<int> RunAsync(CancellationToken token)
     {
+        // A mutable state directory nested inside a pinned binary output
+        // would make status.json change the execution image before startup.
+        SupervisorControls.RejectStateNestedInExecutionImage(
+            _assembly, _config);
         Directory.CreateDirectory(_config.StateDirectory);
         // Separate from host.lock: two logon/interactive supervisors cannot launch two children.
         using var owner = SupervisorIdentity.TryLock(

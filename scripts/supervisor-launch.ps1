@@ -2,9 +2,9 @@
 # user app-data, with its content digest pinned in the user's registry.
 param([Parameter(Mandatory = $true)][string]$Key)
 $ErrorActionPreference = 'Stop'
-# Hidden logon startup has no console. Record only a fixed lifecycle marker,
+# Hidden logon startup has no console. Record only fixed lifecycle markers,
 # never an exception string, configuration path, token or provider output.
-trap {
+function Write-LauncherFailure([string]$Marker) {
     try {
         if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
             $logDir = Join-Path $env:LOCALAPPDATA 'Neko\Supervision'
@@ -12,10 +12,13 @@ trap {
                 $null = New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop
             }
             Add-Content -LiteralPath (Join-Path $logDir 'launcher-failures.log') -Value (
-                [DateTimeOffset]::UtcNow.ToString('o') + ' startup_integrity_or_launch_failed'
+                [DateTimeOffset]::UtcNow.ToString('o') + ' ' + $Marker
             ) -ErrorAction SilentlyContinue
         }
     } catch { }
+}
+trap {
+    Write-LauncherFailure 'startup_integrity_or_launch_failed'
     exit 1
 }
 if ($Key -cnotmatch '^[A-F0-9]{16}$') { throw 'Invalid supervisor registration key.' }
@@ -54,7 +57,12 @@ $pinned = @{}
 foreach ($file in $entries) {
     $path = [string]$file.Name
     $digest = [string]$file.Value
-    if (-not [IO.Path]::IsPathFullyQualified($path) -or
+    # Windows PowerShell 5.1 runs on .NET Framework, which does not
+    # expose Path.IsPathFullyQualified. Reject drive-relative (C:foo) and
+    # rooted-relative (\foo) forms using the fully qualified root length.
+    $pathRoot = [IO.Path]::GetPathRoot($path)
+    if (-not [IO.Path]::IsPathRooted($path) -or
+        $pathRoot.Length -lt 3 -or
         $digest -cnotmatch '^[A-F0-9]{64}$') {
         throw 'Malformed pinned execution manifest.'
     }
@@ -69,24 +77,55 @@ if (-not $pinned.ContainsKey($runtime) -or -not $pinned.ContainsKey($assembly)) 
 # files present at installation. Newly added DLLs/native modules fail closed.
 $directories = @($manifest.pinnedDirectories)
 if ($directories.Count -eq 0) { throw 'Pinned dependency directories missing.' }
-foreach ($directory in $directories) {
-    $dir = [string]$directory
-    if (-not [IO.Path]::IsPathFullyQualified($dir) -or
-        -not (Test-Path -LiteralPath $dir -PathType Container)) {
-        throw 'Pinned dependency directory unavailable.'
-    }
-    foreach ($candidate in Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction Stop) {
-        $extension = [IO.Path]::GetExtension($candidate.FullName).ToLowerInvariant()
-        if (@('.dll','.exe','.json','.so','.dylib') -contains $extension) {
-            if (-not $pinned.ContainsKey([IO.Path]::GetFullPath($candidate.FullName))) {
-                throw 'Unregistered executable dependency detected.'
+# Keep this check in one function so Windows PowerShell tests can execute
+# the real startup inventory logic without touching the user's registry.
+function Assert-PinnedDirectoryInventory(
+    [string[]]$Directories, [hashtable]$Pinned
+) {
+    foreach ($directory in $Directories) {
+        $dir = [string]$directory
+        $directoryRoot = [IO.Path]::GetPathRoot($dir)
+        if (-not [IO.Path]::IsPathRooted($dir) -or
+            $directoryRoot.Length -lt 3 -or
+            -not (Test-Path -LiteralPath $dir -PathType Container)) {
+            throw 'Pinned dependency directory unavailable.'
+        }
+        # Explicit traversal with -Force includes hidden/system files. Never
+        # follow junctions or symlinks: reject any reparse point before execution.
+        $pending = New-Object 'System.Collections.Generic.Stack[string]'
+        $pending.Push($dir)
+        while ($pending.Count -gt 0) {
+            $current = $pending.Pop()
+            $currentInfo = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if (($currentInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Reparse point in pinned execution image.'
+            }
+            foreach ($candidate in Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop) {
+                if (($candidate.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw 'Reparse point in pinned execution image.'
+                }
+                if ($candidate.PSIsContainer) {
+                    $pending.Push([string]$candidate.FullName)
+                    continue
+                }
+                $extension = [IO.Path]::GetExtension($candidate.FullName).ToLowerInvariant()
+                if (@('.dll','.exe','.json','.so','.dylib') -contains $extension) {
+                    if (-not $Pinned.ContainsKey([IO.Path]::GetFullPath($candidate.FullName))) {
+                        throw 'Unregistered executable dependency detected.'
+                    }
+                }
             }
         }
     }
 }
+Assert-PinnedDirectoryInventory -Directories $directories -Pinned $pinned
 if ([IO.Path]::GetFileNameWithoutExtension($runtime) -ieq 'dotnet') {
     & $runtime $assembly supervise --config $configPath --expected-instance $expected
 } else {
     & $runtime supervise --config $configPath --expected-instance $expected
 }
-exit $LASTEXITCODE
+$code = $LASTEXITCODE
+if ($code -ne 0) {
+    Write-LauncherFailure ('supervisor_exited_code_' + [string]$code)
+}
+exit $code

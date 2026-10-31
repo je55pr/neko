@@ -70,6 +70,56 @@ internal static class SupervisorControls
             .ToArray();
     }
 
+    // Mutable state inside an executable output directory would invalidate
+    // its own pinned JSON files as soon as supervision writes status.json.
+    // Refuse this layout BEFORE creating any state or installing startup.
+    internal static void RejectStateNestedInExecutionImage(
+        string assembly, HostConfiguration config)
+    {
+        var state = Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(config.StateDirectory));
+        foreach (var directory in PinnedRuntimeDirectories(assembly, config))
+        {
+            var root = Path.TrimEndingDirectorySeparator(directory);
+            var prefix = Path.EndsInDirectorySeparator(root)
+                ? root : root + Path.DirectorySeparatorChar;
+            if (StringComparer.OrdinalIgnoreCase.Equals(state, root) ||
+                state.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    "Supervision state directory must be outside executable " +
+                    "and provider output directories.");
+        }
+    }
+
+    // Explicit recursion sees hidden/system dependencies. Reject reparse-point
+    // directories and files instead of following mutable junction/symlink
+    // targets that could redirect execution around the installed pinset.
+    private static IEnumerable<string> EnumerateImageFiles(string root)
+    {
+        var pending = new Stack<string>();
+        pending.Push(Path.GetFullPath(root));
+        var options = new EnumerationOptions {
+            RecurseSubdirectories = false, AttributesToSkip = 0,
+            IgnoreInaccessible = false
+        };
+        while (pending.Count > 0)
+        {
+            var directory = pending.Pop();
+            if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException(
+                    "Execution image contains a directory reparse point.");
+            foreach (var path in Directory.EnumerateFiles(directory, "*", options))
+            {
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidOperationException(
+                        "Execution image contains a file reparse point.");
+                if (LoadableFile(path)) yield return Path.GetFullPath(path);
+            }
+            foreach (var child in Directory.EnumerateDirectories(directory, "*", options))
+                pending.Push(child);
+        }
+    }
+
     internal static IReadOnlyDictionary<string, string> PinnedRuntimeFiles(
         string runtime, string assembly, HostConfiguration config)
     {
@@ -78,20 +128,10 @@ internal static class SupervisorControls
         // Provider implementations may be built into a *different* output
         // directory, with native and managed sidecar dependencies. Pin both
         // dependency closures, not just the provider's primary assembly.
+        RejectStateNestedInExecutionImage(assembly, config);
         foreach (var directory in PinnedRuntimeDirectories(assembly, config))
-        {
-            foreach (var path in Directory.EnumerateFiles(directory, "*",
-                         SearchOption.AllDirectories))
-            {
-                var extension = Path.GetExtension(path);
-                if (extension.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
-                    extension.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
-                    extension.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
-                    extension.Equals(".so", StringComparison.OrdinalIgnoreCase) ||
-                    extension.Equals(".dylib", StringComparison.OrdinalIgnoreCase))
-                    files[Path.GetFullPath(path)] = ManifestDigest(path);
-            }
-        }
+            foreach (var path in EnumerateImageFiles(directory))
+                files[path] = ManifestDigest(path);
         foreach (var path in new[] { runtime, assembly, config.ProviderAssembly,
                      config.ProviderSettings })
             files[Path.GetFullPath(path)] = ManifestDigest(path);
@@ -137,15 +177,15 @@ internal static class SupervisorControls
             {
                 if (!Path.IsPathFullyQualified(root) ||
                     !Directory.Exists(root)) return false;
-                foreach (var path in Directory.EnumerateFiles(root, "*",
-                             SearchOption.AllDirectories).Where(LoadableFile))
-                    if (!pinned.ContainsKey(Path.GetFullPath(path)))
+                foreach (var path in EnumerateImageFiles(root))
+                    if (!pinned.ContainsKey(path))
                         return false;
             }
             return true;
         }
         catch (Exception error) when (error is IOException or
-            UnauthorizedAccessException or ArgumentException)
+            UnauthorizedAccessException or ArgumentException or
+            InvalidOperationException)
         { return false; }
     }
 
@@ -287,6 +327,8 @@ internal static class SupervisorControls
         var executable = Environment.ProcessPath
             ?? throw new InvalidOperationException("Cannot resolve host executable.");
         var assembly = Assembly.GetExecutingAssembly().Location;
+        if (command is "supervise" or "supervisor-install")
+            RejectStateNestedInExecutionImage(assembly, config);
 
         if (command == "supervise")
         {

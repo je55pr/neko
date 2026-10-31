@@ -41,10 +41,17 @@ before startup, and the supervisor validates the same registered image
 **before every child launch**, including restarts after a crash.
 Changing any such file requires explicit reinstallation. .NET runtime or SDK
 servicing may change a pinned `dotnet.exe` and require reinstallation.
+Hidden/system loadable files are included, and directory junctions or file
+reparse points in the execution image are rejected rather than followed.
 This does not claim security against malware already running as the same
 user, which can also modify that user's registry or race validation. Windows limits Run-key commands to 260 characters;
 installation fails safely if the private launcher path makes even this short
 entry too long. Installation does **not** start, stop, restart or inspect a live host.
+The mutable `stateDirectory` must be outside both the host and provider output
+directories. Installation and interactive supervision refuse nested state
+layouts before writing status files, preventing ever-changing supervision JSON
+from invalidating the installed binary image.
+
 The launcher runs at the next supported interactive user logon. A hidden
 launcher failure records a fixed `startup_integrity_or_launch_failed` event
 without exception text or secrets in

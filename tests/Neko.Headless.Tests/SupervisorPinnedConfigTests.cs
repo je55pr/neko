@@ -13,7 +13,7 @@ public sealed class SupervisorPinnedConfigTests
         try
         {
             var config = new HostConfiguration(
-                Path.Combine(folder, "unused.dll"), "Unused.Factory",
+                Path.Combine(folder, "provider-image", "unused.dll"), "Unused.Factory",
                 Path.Combine(folder, "unused.json"), "scope",
                 new string('a', 32), Path.Combine(folder, "new-state"), 8765);
             var result = await SupervisorControls.ExecuteAsync(

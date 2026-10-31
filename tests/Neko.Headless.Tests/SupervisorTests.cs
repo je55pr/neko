@@ -503,10 +503,16 @@ public sealed class SupervisorTests
         return file;
     }
 
-    private static HostConfiguration Config(string stateDirectory) =>
-        new(Path.Combine(stateDirectory, "not-installed.dll"), "Unused.Factory",
+    private static HostConfiguration Config(string stateDirectory)
+    {
+        // Test-only provider output is distinct from mutable supervisor logs.
+        var providerImage = Path.Combine(stateDirectory, "_provider-image");
+        Directory.CreateDirectory(providerImage);
+        return new(Path.Combine(providerImage, "not-installed.dll"),
+            "Unused.Factory",
             Path.Combine(stateDirectory, "not-installed.json"), "scope-test",
             new string('s', 32), stateDirectory, FreePort());
+    }
 
     private static string SaveConfig(string folder, HostConfiguration config)
     {
