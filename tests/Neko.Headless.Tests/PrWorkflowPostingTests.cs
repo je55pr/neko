@@ -24,6 +24,7 @@ public sealed partial class HeadlessRuntimeTests
     [Theory]
     [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nIndependent source review found no issues.", "no_blockers")]
     [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 1\nP1: Found a real merge safety defect.", "blockers")]
+    [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 1\n### [P1] Found a real merge safety defect.", "blockers")]
     public void StructuredIndependentVerdictCountsMustAgree(string body, string expected)
     {
         Assert.Equal(expected, PrWorkflowService.ParseReviewerVerdict(body));
@@ -31,9 +32,12 @@ public sealed partial class HeadlessRuntimeTests
 
     [Theory]
     [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nP1: Blocking race remains.")]
+    [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\n### [P1] Blocking race remains.")]
+    [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 0\nA hidden [P2] finding remains.")]
     [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nFINDINGS_COUNT: 1\nP1: Blocking race remains.")]
     [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 0\nThe source has a blocker.")]
     [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 2\nP1: Only one labelled finding.")]
+    [InlineData("REVIEW_VERDICT: BLOCKERS\nFINDINGS_COUNT: 2\n### [P1] Only one labelled finding.")]
     [InlineData("REVIEW_VERDICT: NO_BLOCKERS\nNo findings count supplied.")]
     public void ContradictoryIndependentVerdictsAreRejected(string body)
     {

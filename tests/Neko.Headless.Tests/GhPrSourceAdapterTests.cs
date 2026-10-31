@@ -106,6 +106,29 @@ public sealed class GhPrSourceAdapterTests
     }
 
     [Fact]
+    public void BotClearMarkerRejectsMarkdownBracketedSeverityFindings()
+    {
+        const string marker = "Actionable comments posted: 0";
+        foreach (var finding in new[] {
+            "### [P1] Unsafe merge path",
+            "- **[P2]** Unverified review provenance",
+            "> [P0] Critical authentication bypass",
+            "### [p3]: Missing test for restart"
+        })
+            Assert.False(GhPrSourceAdapter.VerifiedNoFindingsLine(
+                "**Actionable comments posted: 0**\n" + finding, marker));
+    }
+
+    [Fact]
+    public void CheckRunSnapshotRequestsAllSameHeadRuns()
+    {
+        const string sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        Assert.Equal("repos/sample/project/commits/" + sha +
+            "/check-runs?per_page=100&filter=all",
+            GhPrSourceAdapter.CompleteCheckRunsRoute("sample/project", sha));
+    }
+
+    [Fact]
     public void InlineReviewCommentsOverrideAnyNoFindingsSummary()
     {
         var linked = new HashSet<long> { 77 };

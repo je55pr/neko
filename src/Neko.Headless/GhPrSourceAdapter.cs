@@ -165,19 +165,9 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             if (allLines.Count(other => other.Contains(
                     stem, StringComparison.OrdinalIgnoreCase)) != 1)
                 return false;
-            // Even if the configured reviewer incorrectly claims zero, do
-            // not accept a source review which explicitly names severity-
-            // labelled findings elsewhere in its body or hidden metadata.
-            foreach (var other in allLines)
-            {
-                var candidate = other.TrimStart(' ', '\t', '#', '*', '-', '>');
-                if (candidate.StartsWith("BLOCKERS:", StringComparison.OrdinalIgnoreCase) ||
-                    new[] { "P0", "P1", "P2", "P3" }.Any(code =>
-                        candidate.StartsWith(code + ":", StringComparison.OrdinalIgnoreCase) ||
-                        candidate.StartsWith(code + " ", StringComparison.OrdinalIgnoreCase)))
-                    return false;
-            }
-            return true;
+            // Shared parser covers both plain and Markdown-bracketed
+            // severity headings, including [P1] and ### [P1] findings.
+            return !PrReviewGate.ContainsSeverityFinding(body);
         }
         return false;
     }
@@ -230,6 +220,10 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             .Select(value => value!.Value)
             .ToHashSet();
 
+    internal static string CompleteCheckRunsRoute(string repository, string head) =>
+        "repos/" + repository + "/commits/" + head +
+        "/check-runs?per_page=100&filter=all";
+
     public async Task<PrSourceStatus> ReadAsync(
         string repository, int number, CancellationToken cancellation)
     {
@@ -252,8 +246,10 @@ internal sealed class GhPrSourceAdapter : IPrSourceAdapter
             !StringComparer.OrdinalIgnoreCase.Equals(canonicalRepository, repository))
             throw new InvalidOperationException("Canonical repository identity unavailable.");
 
+        // GitHub defaults to filter=latest and hides superseded check runs.
+        // Request every run so same-head reruns can be detected and blocked.
         using var checks = await ApiAsync(cancellation,
-            "repos/" + repository + "/commits/" + head + "/check-runs?per_page=100");
+            CompleteCheckRunsRoute(repository, head));
         var checkRoot = checks.RootElement;
         var checkRuns = Member(checkRoot, "check_runs");
         if (checkRoot.GetProperty("total_count").GetInt32() > 100)

@@ -47,6 +47,36 @@ public static class PrReviewGate
     public static bool ValidSha(string? value) =>
         value is { Length: 40 } && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
 
+    // Recognize common Markdown headings such as "### [P1] Bug",
+    // "**P1:** Bug", and "P1: Bug". A zero-findings verdict may never
+    // override a source review containing one of these headings.
+    public static bool SeverityHeading(string raw)
+    {
+        var line = raw.TrimStart(' ', '\t', '#', '-', '*', '_', '>');
+        if (line.Length >= 4 && line[0] == '[' &&
+            line[1] is 'P' or 'p' && line[2] is >= '0' and <= '3' &&
+            line[3] == ']')
+            return line.Length == 4 || line[4] is ':' or ' ' or '-' or '*';
+        return line.Length >= 3 &&
+            line[0] is 'P' or 'p' && line[1] is >= '0' and <= '3' &&
+            line[2] is ':' or ' ' or '-' or '*';
+    }
+
+    public static bool ContainsSeverityFinding(string body)
+    {
+        foreach (var line in body.Split('\n'))
+        {
+            if (SeverityHeading(line) ||
+                line.Contains("BLOCKERS:", StringComparison.OrdinalIgnoreCase))
+                return true;
+            for (var i = 0; i + 3 < line.Length; i++)
+                if (line[i] == '[' && line[i + 1] is 'P' or 'p' &&
+                    line[i + 2] is >= '0' and <= '3' && line[i + 3] == ']')
+                    return true;
+        }
+        return false;
+    }
+
     // The latest run from the exact trusted producer/workflow wins. A
     // same-name status from another actor cannot shadow or satisfy it.
     private static PrCheck? TrustedLatestCheck(IEnumerable<PrCheck> checks,

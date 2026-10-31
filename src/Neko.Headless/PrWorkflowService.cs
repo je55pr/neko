@@ -75,20 +75,12 @@ internal sealed class PrWorkflowService
                 out var declared) || declared is < 0 or > 50)
             throw new InvalidOperationException("Reviewer findings count invalid.");
 
-        var headings = lines.Skip(2).Count(raw =>
-        {
-            var line = raw.TrimStart(' ', '\t', '#', '-', '*');
-            return line.Length >= 3 && (line[0] is 'P' or 'p') &&
-                line[1] is >= '0' and <= '3' &&
-                line[2] is ':' or ' ' or '-';
-        });
+        var headings = lines.Skip(2).Count(PrReviewGate.SeverityHeading);
         if (headings != declared || (verdict == "no_blockers") != (declared == 0))
             throw new InvalidOperationException("Reviewer verdict contradicts findings count.");
 
         if (verdict == "no_blockers" &&
-            new[] { "P0:", "P1:", "P2:", "P3:", "BLOCKERS:" }
-                .Any(token => lines.Skip(2).Any(line =>
-                    line.Contains(token, StringComparison.OrdinalIgnoreCase))))
+            PrReviewGate.ContainsSeverityFinding(string.Join("\n", lines.Skip(2))))
             throw new InvalidOperationException("Reviewer reported blockers despite clear verdict.");
         return verdict;
     }
